@@ -625,7 +625,19 @@ fn scheduler() -> Option<&'static Scheduler> {
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        // Below the title's threads that record frames: a
+                        // worker per logical processor at normal priority
+                        // took the processor from them while it decoded.
+                        #[cfg(windows)]
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::*;
+                            let _ =
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
