@@ -8154,19 +8154,21 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
-                // M0 indexes the source (movrels), the destination (movreld)
-                // or both, from the encoded register up to the program's
-                // VGPR count (the registers the instruction reads or writes).
+                // M0[7:0] indexes the source (movrels), the destination
+                // (movreld) or both, from the encoded register up to the
+                // program's VGPR count (the registers the instruction reads or
+                // writes).
                 let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
-                let (
-                    Some(&Operand::Vector { reg: sreg, .. }),
-                    Some(Operand::Vector { reg: dreg, .. }),
-                ) = (v.src.first(), v.dst)
-                else {
+                let low8 = self.s.m.i32(0xFF);
+                let m0 = self.s.m.bin(c, Bin::And, m0, low8);
+                let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
                     return Err("an M0-relative move");
                 };
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
+                    let Some(&Operand::Vector { reg: sreg, .. }) = v.src.first() else {
+                        return Err("an M0-relative move");
+                    };
                     let mut r = self.s.m.i32(0);
                     for k in 0..=255u8.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
@@ -8183,6 +8185,9 @@ impl<'a> Lower<'a> {
                 };
                 if name == "v_movrels_b32" {
                     return int(self, value);
+                }
+                if v.clamp || v.omod != 0 {
+                    return Err("integer output modifiers");
                 }
                 for k in 0..=255u8.saturating_sub(dreg) {
                     let Some(_) = inst.write(Reg::V(dreg + k)) else {
