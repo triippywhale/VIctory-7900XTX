@@ -3949,6 +3949,8 @@ fn make_twinned(
     let host = host()?;
     let device = &host.device;
     match view {
+        // make_at and the mirror path write a typed null for this view.
+        View::Constant(0, _) => None,
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
