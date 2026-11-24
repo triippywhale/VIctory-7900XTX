@@ -5880,6 +5880,11 @@ impl<'a> Lower<'a> {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let sel = if name == "s_sext_i32_i8" { 0 } else { 4 };
+                (self.select_bits(a, sel, true), None)
+            }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
                 let r = self

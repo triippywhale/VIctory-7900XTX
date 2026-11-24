@@ -2331,3 +2331,49 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         }
     }
 }
+    }
+
+#[test]
+fn scalar_sign_extension_preserves_scc() {
+    for (opcode, byte) in [(0x19, true), (0x1a, false)] {
+        let shader = build_valu_cs(&[
+            0xbf06_8001,               // s_cmp_eq_u32 s1, 0
+            0xbe86_0000 | opcode << 8, // sign-extend s0 into s6
+            sop2(0x0a, 7, 6, 2),       // s_cselect_b32 s7, s6, s2
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        let mut cases = Vec::new();
+        for input in [
+            0,
+            0xffff_007f,
+            0x1234_0080,
+            0xaaaa_7fff,
+            0x5555_8000,
+            u32::MAX,
+        ] {
+            for flag_input in [0, 1] {
+                cases.push([input, flag_input, 0x1234_5678, 0]);
+            }
+        }
+        run_cases(
+            &shader,
+            &cases,
+            |backend, _, [input, flag_input, fallback, _], got| {
+                let extended = if byte {
+                    i32::from(input as i8)
+                } else {
+                    i32::from(input as i16)
+                };
+                assert_eq!(
+                    got,
+                    if flag_input == 0 {
+                        extended as u32
+                    } else {
+                        fallback
+                    },
+                    "{backend}"
+                );
+            },
+        );
+    }
+}
