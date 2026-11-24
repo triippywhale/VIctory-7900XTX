@@ -575,9 +575,11 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
+                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -587,6 +589,10 @@ impl Shader {
                 if !used {
                     self.flags &= !flag;
                 }
+            }
+            let input_usage = self.m.input_usage(self.inputs.len());
+            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
+                e.usage = mask;
             }
         }
         // Unordered views outside pixel and compute programs (memory by
