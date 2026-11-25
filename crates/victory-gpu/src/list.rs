@@ -1212,7 +1212,10 @@ fn read_back(
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
     // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
+    let bytes = pitch
+        .checked_mul(rows - 1)
+        .and_then(|n| n.checked_add(row))
+        .ok_or("footprint size overflows")?;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
@@ -1261,6 +1264,17 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Dimensions (width, height) of subresource sub of a texture whose mip 0
+/// is width x height with mip_levels mips per array slice.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn subresource_size(width: u64, height: u32, mip_levels: u16, sub: u32) -> (u64, u32) {
+    let mips = u32::from(mip_levels).max(1);
+    let mip = (sub % mips).min(63);
+    let w = (width >> mip).max(1);
+    let h = (u64::from(height) >> mip).max(1) as u32;
+    (w, h)
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -1301,7 +1315,10 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            // The levels resolved, not level 0, decide the path and the region.
+            let (aw, ah) = subresource_size(a.Width, a.Height, a.MipLevels, dst_sub);
+            let (bw, bh) = subresource_size(b.Width, b.Height, b.MipLevels, src_sub);
+            if (aw, ah) == (bw, bh) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1309,8 +1326,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: aw.min(bw).min(i32::MAX as u64) as i32,
+                    bottom: ah.min(bh).min(i32::MAX as u32) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -2376,6 +2393,18 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn subresource_size_tracks_mips_and_array_slices() {
+        assert_eq!(subresource_size(1024, 512, 10, 0), (1024, 512));
+        assert_eq!(subresource_size(1024, 512, 10, 1), (512, 256));
+        assert_eq!(subresource_size(1024, 512, 10, 2), (256, 128));
+        // Array slice 1, mip 1 (subresource = 1 * 10 + 1 = 11).
+        assert_eq!(subresource_size(1024, 512, 10, 11), (512, 256));
+        // Clamped at 1x1 on deep mips and safe when mip_levels == 0.
+        assert_eq!(subresource_size(1024, 512, 11, 10), (1, 1));
+        assert_eq!(subresource_size(64, 32, 0, 5), (64, 32));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
