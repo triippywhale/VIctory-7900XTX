@@ -30,11 +30,13 @@ use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
+const WSAEFAULT: i32 = 10014;
 const WSAEINVAL: i32 = 10022;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
 const WSASERVICE_NOT_FOUND: i32 = 10108;
 const WSAHOST_NOT_FOUND: i32 = 11001;
+const MAX_CONNECT_LIST_ADDRESSES: usize = 64;
 const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
 const ERROR_WINHTTP_AUTODETECTION_FAILED: u32 = 12180;
 const AF_INET: u16 = 2;
@@ -97,18 +99,62 @@ fn wide(text: *const u16) -> Option<String> {
     })
 }
 
+/// Whether `[addr, addr + len)` lies in committed, readable memory.
+fn readable_bytes(addr: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if addr.is_null() {
+        return false;
+    }
+    let Some(end) = (addr as usize).checked_add(len) else {
+        return false;
+    };
+    let mut at = addr as usize;
+    while at < end {
+        // SAFETY: zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries virtual-memory metadata without dereferencing `at`.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return false;
+        }
+        if info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || (info.Protect & 0xff) == PAGE_EXECUTE
+        {
+            return false;
+        }
+        let Some(region_end) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if region_end <= at {
+            return false;
+        }
+        at = region_end;
+    }
+    true
+}
+
 /// An IPv4 or IPv6 `sockaddr` of `len` bytes.
 fn socket_addr(addr: *const u8, len: i32) -> Option<SocketAddr> {
     let len = usize::try_from(len).ok()?;
-    if addr.is_null() || len < 4 {
+    if len < 4 || !readable_bytes(addr, 4) {
         return None;
     }
-    // SAFETY: the title passes `len` readable bytes.
-    let b = unsafe { std::slice::from_raw_parts(addr, len) };
-    let port = u16::from_be_bytes([b[2], b[3]]);
-    match u16::from_le_bytes([b[0], b[1]]) {
-        AF_INET if len >= 16 => Some((<[u8; 4]>::try_from(&b[4..8]).ok()?, port).into()),
-        AF_INET6 if len >= 28 => Some((<[u8; 16]>::try_from(&b[8..24]).ok()?, port).into()),
+    // SAFETY: 4 bytes at `addr` were checked readable above.
+    let head = unsafe { addr.cast::<[u8; 4]>().read_unaligned() };
+    let port = u16::from_be_bytes([head[2], head[3]]);
+    match u16::from_le_bytes([head[0], head[1]]) {
+        AF_INET if len >= 16 && readable_bytes(addr, 16) => {
+            // SAFETY: 16 bytes at `addr` were checked readable above.
+            let ip = unsafe { addr.add(4).cast::<[u8; 4]>().read_unaligned() };
+            Some((ip, port).into())
+        }
+        AF_INET6 if len >= 28 && readable_bytes(addr, 28) => {
+            // SAFETY: 28 bytes at `addr` were checked readable above.
+            let ip = unsafe { addr.add(8).cast::<[u8; 16]>().read_unaligned() };
+            Some((ip, port).into())
+        }
         _ => None,
     }
 }
@@ -307,17 +353,42 @@ pub extern "system" fn WSAConnectByList(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
+    const LIST_HEADER: usize = align_of::<SocketAddress>();
     if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
-        };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
+        if !readable_bytes(list, LIST_HEADER) {
+            wsa_error(WSAEFAULT);
             return 0;
+        }
+        // SAFETY: `LIST_HEADER` (>= 4) bytes at `list` were checked readable above.
+        let raw_count = unsafe { list.cast::<i32>().read_unaligned() };
+        let Ok(count) = usize::try_from(raw_count) else {
+            wsa_error(WSAEINVAL);
+            return 0;
+        };
+        if count == 0 || count > MAX_CONNECT_LIST_ADDRESSES {
+            wsa_error(WSAEINVAL);
+            return 0;
+        }
+        for i in 0..count {
+            let Some(offset) = i
+                .checked_mul(size_of::<SocketAddress>())
+                .and_then(|n| LIST_HEADER.checked_add(n))
+            else {
+                wsa_error(WSAEINVAL);
+                return 0;
+            };
+            // SAFETY: `readable_bytes` checks the candidate address range before any read;
+            // `wrapping_add` avoids out-of-bounds pointer provenance UB before the check.
+            let at = list.wrapping_add(offset);
+            if !readable_bytes(at, size_of::<SocketAddress>()) {
+                wsa_error(WSAEFAULT);
+                return 0;
+            }
+            // SAFETY: `size_of::<SocketAddress>()` bytes at `at` were checked readable above.
+            let entry = unsafe { at.cast::<SocketAddress>().read_unaligned() };
+            if !reachable("network connect blocked", entry.addr, entry.len) {
+                return 0;
+            }
         }
     }
     host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
@@ -519,13 +590,17 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
         Some(a) if loopback(a.ip()) => host_bind(s, name, len),
         Some(a) if a.ip().is_unspecified() => {
             once("network bind narrowed to loopback", a.to_string());
-            // SAFETY: `socket_addr` checked `len` readable bytes.
-            let mut local = unsafe { std::slice::from_raw_parts(name, len as usize) }.to_vec();
+            let size = match a {
+                SocketAddr::V4(_) => 16,
+                SocketAddr::V6(_) => 28,
+            };
+            // SAFETY: `socket_addr` checked `size` readable bytes at `name`.
+            let mut local = unsafe { std::slice::from_raw_parts(name, size) }.to_vec();
             match a {
                 SocketAddr::V4(_) => local[4..8].copy_from_slice(&[127, 0, 0, 1]),
                 SocketAddr::V6(_) => local[23] = 1,
             }
-            host_bind(s, local.as_ptr(), len)
+            host_bind(s, local.as_ptr(), size as i32)
         }
         a => {
             once("network bind blocked", shown(a));
@@ -1118,5 +1193,104 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn connect_by_list_validates_count_and_bounds() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let null = std::ptr::null_mut::<c_void>();
+        let n = null.cast();
+
+        let call =
+            |s: Socket, list: *const u8| WSAConnectByList(s, list, n, null, n, null, null, null);
+        let pack_one = |count: i32, addr: *const u8, len: i32| -> [u8; 24] {
+            let mut buf = [0u8; 24];
+            buf[..4].copy_from_slice(&count.to_le_bytes());
+            buf[8..16].copy_from_slice(&(addr as usize).to_ne_bytes());
+            buf[16..20].copy_from_slice(&len.to_le_bytes());
+            buf
+        };
+
+        let s = socket(2, 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+        let home = v4(HOME, port);
+        let away = v4(AWAY, 80);
+
+        // Huge, zero, negative, and over-ceiling counts are rejected without reading past the buffer.
+        for bad_count in [
+            i32::MAX,
+            0,
+            -1,
+            i32::MIN,
+            (MAX_CONNECT_LIST_ADDRESSES + 1) as i32,
+        ] {
+            let one = pack_one(bad_count, home.as_ptr(), 16);
+            assert_eq!(call(s, one.as_ptr()), 0, "count {bad_count}");
+            assert_eq!(last_error(), WSAEINVAL, "count {bad_count}");
+        }
+
+        // Two-page guard fixture: second page is PAGE_NOACCESS, so any over-read faults.
+        // SAFETY: allocates two private pages, protects the second as inaccessible, and frees them below.
+        unsafe {
+            let pages = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!pages.is_null());
+            let guard = pages.add(0x1000);
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(guard.cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                0
+            );
+
+            // Header + 1 entry right at the end of page 0, claiming count = 2 (entry 1 in guard page).
+            let one_at_edge = pages.add(0x1000 - 24);
+            let two_claimed = pack_one(2, home.as_ptr(), 16);
+            one_at_edge.copy_from_nonoverlapping(two_claimed.as_ptr(), 24);
+            assert_eq!(call(s, one_at_edge), 0);
+            assert_eq!(last_error(), WSAEFAULT);
+
+            // Unreadable list header itself.
+            assert_eq!(call(s, guard), 0);
+            assert_eq!(last_error(), WSAEFAULT);
+
+            // Readable entry whose sockaddr pointer points into the guard page.
+            let bad_sockaddr = pack_one(1, guard, 16);
+            assert_eq!(call(s, bad_sockaddr.as_ptr()), 0);
+            assert_eq!(last_error(), WSAENETUNREACH);
+
+            VirtualFree(pages.cast(), 0, MEM_RELEASE);
+        }
+
+        // Unaligned list with [HOME, AWAY] is still blocked on the non-loopback candidate.
+        let mut unaligned = [0u8; 1 + 8 + 32];
+        unaligned[1..5].copy_from_slice(&2i32.to_le_bytes());
+        unaligned[9..17].copy_from_slice(&(home.as_ptr() as usize).to_ne_bytes());
+        unaligned[17..21].copy_from_slice(&16i32.to_le_bytes());
+        unaligned[25..33].copy_from_slice(&(away.as_ptr() as usize).to_ne_bytes());
+        unaligned[33..37].copy_from_slice(&16i32.to_le_bytes());
+        assert_eq!(call(s, unaligned[1..].as_ptr()), 0);
+        assert_eq!(last_error(), WSAENETUNREACH);
+
+        // A valid loopback list succeeds against our loopback listener.
+        #[repr(C, align(8))]
+        struct Aligned([u8; 24]);
+        let ok_list = Aligned(pack_one(1, home.as_ptr(), 16));
+        assert_ne!(call(s, ok_list.0.as_ptr()), 0);
+        listener.accept().unwrap();
+        close(s);
     }
 }
