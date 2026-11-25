@@ -72,6 +72,11 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Creations the host compiler refused with `E_OUTOFMEMORY` and that were
+/// tried again (see [`retry_out_of_memory`]), and of those the ones a later
+/// attempt made.
+pub(crate) static OOM_RETRIED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static OOM_RECOVERED: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -512,17 +517,67 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// How often a creation refused with `E_OUTOFMEMORY` is tried again: once
+/// at once, then this many times one at a time (see [`retry_out_of_memory`]).
+const OOM_SERIAL_ATTEMPTS: u32 = 2;
+
+/// The outcome of `create`, tried again while it fails with `E_OUTOFMEMORY`.
+///
+/// A driver's shader compiler sometimes faults inside itself on a compile
+/// its cache does not hold (NVIDIA's reports a null read it catches as
+/// `E_OUTOFMEMORY`), on any pipeline worker, and the same pipeline then
+/// builds on a later attempt. So a creation refused that way is tried once
+/// more at once, then up to [`OOM_SERIAL_ATTEMPTS`] times holding `serial`,
+/// so that no other retried compile runs beside it. Any other error, and
+/// the last attempt's, is returned as it is.
+fn retry_out_of_memory<T>(
+    serial: &Mutex<()>,
+    mut create: impl FnMut() -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    let out_of_memory =
+        |r: &windows::core::Result<T>| matches!(r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
+    let mut made = create();
+    if !out_of_memory(&made) {
+        return made;
+    }
+    OOM_RETRIED.fetch_add(1, Ordering::Relaxed);
+    let mut attempts = 1;
+    made = create();
+    while out_of_memory(&made) && attempts <= OOM_SERIAL_ATTEMPTS {
+        let _one = serial.lock().unwrap_or_else(|e| e.into_inner());
+        made = create();
+        attempts += 1;
+    }
+    match &made {
+        Ok(_) => {
+            OOM_RECOVERED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(attempts = attempts + 1, "host pipeline made after the compiler ran out of memory");
+        }
+        Err(e) => tracing::warn!(error = %e, attempts = attempts + 1, "host pipeline still refused when tried again"),
+    }
+    made
+}
+
+/// `create` through [`retry_out_of_memory`], one retried compile at a time
+/// across all pipeline workers.
+fn create_retrying(
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    retry_out_of_memory(&SERIAL, create)
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create_retrying(create);
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -548,7 +603,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        create_retrying(create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -644,6 +699,8 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            retried_out_of_memory = OOM_RETRIED.load(Ordering::Relaxed),
+            recovered_out_of_memory = OOM_RECOVERED.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -783,6 +840,50 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn out_of_memory() -> windows::core::Error {
+        windows::Win32::Foundation::E_OUTOFMEMORY.into()
+    }
+
+    /// A creation refused with `E_OUTOFMEMORY` is tried again until one
+    /// attempt makes it; a first success is not repeated.
+    #[test]
+    fn out_of_memory_is_tried_again() {
+        let serial = Mutex::new(());
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || {
+            calls += 1;
+            if calls < 3 { Err(out_of_memory()) } else { Ok(calls) }
+        });
+        assert_eq!(made.unwrap(), 3);
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || {
+            calls += 1;
+            Ok::<_, windows::core::Error>(calls)
+        });
+        assert_eq!(made.unwrap(), 1);
+    }
+
+    /// Retries stop after the immediate one and the serial ones; other
+    /// errors are not retried at all.
+    #[test]
+    fn retries_are_bounded_and_only_for_out_of_memory() {
+        let serial = Mutex::new(());
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || -> windows::core::Result<()> {
+            calls += 1;
+            Err(out_of_memory())
+        });
+        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_OUTOFMEMORY);
+        assert_eq!(calls, 2 + OOM_SERIAL_ATTEMPTS);
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || -> windows::core::Result<()> {
+            calls += 1;
+            Err(windows::Win32::Foundation::E_INVALIDARG.into())
+        });
+        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
