@@ -96,6 +96,8 @@ mod own_bits;
 mod permlane_tests;
 mod rect;
 mod sampler;
+#[cfg(all(test, windows))]
+mod image_lod_tests;
 mod shader;
 mod threading;
 #[cfg(windows)]
