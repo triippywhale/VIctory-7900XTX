@@ -1288,10 +1288,11 @@ impl<'a> Lanes<'a> {
                     }
                 }
                 // `s_bcnt1` of a mask every running lane sees alike (EXEC under a scalar
-                // condition, or EXEC itself): its SCC, "some lane is set", is each lane's own
-                // bit. A branch on it then reads no ballot.
+                // condition, or EXEC itself): its SCC, "some lane is set", is `m` itself
+                // (`finish` simplifies `given(when, cond[b])` when EXEC matches block reach,
+                // while preserving narrowed EXEC for both exits and `scc_some`).
                 if takes_mask
-                    && name.starts_with("s_bcnt1_i32_b")
+                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
                     && let Some(scc) = inst.write(Reg::Scc)
                     && let [a] = &src[..]
                     && let Some((m, true)) = self.operand(inst, a)
@@ -1301,7 +1302,7 @@ impl<'a> Lanes<'a> {
                     if self.b.implies(m, e)
                         && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
                     {
-                        self.scc_lane.insert(scc, own);
+                        self.scc_lane.insert(scc, m);
                     }
                 }
             }
@@ -1967,6 +1968,96 @@ mod tests {
                 .iter()
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_preserves_narrowed_exec_in_exits_and_scc_some() {
+        // Wave32: narrow EXEC inside block 0, count active lanes with s_bcnt1_i32_b32,
+        // restore EXEC, and branch on SCC == 0.
+        let p = build(
+            &[
+                0x7D84_0080, // 0: v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_3C6A, // 4: s_and_saveexec_b32 s0, vcc_lo
+                0xBE81_0F7E, // 8: s_bcnt1_i32_b32 s1, exec_lo
+                0xBEFE_0300, // 12: s_mov_b32 exec_lo, s0
+                0xBF84_0001, // 16: s_cbranch_scc0 +1 -> 24
+                0x7E02_0280, // 20: v_mov_b32 v1, 0
+                S_ENDPGM,    // 24: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let bcnt_scc = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .expect("s_bcnt1 writes SCC");
+        let &scc_bool = s.scc_some.get(&bcnt_scc).expect("s_bcnt1 tracked in scc_some");
+        assert_ne!(scc_bool, Bool::TRUE, "scc_some must not collapse narrowed EXEC to TRUE");
+        assert!(
+            matches!(s.bools.support(scc_bool)[..], [Atom::Lane(_)]),
+            "scc_some must preserve the narrowed lane predicate: {:?}",
+            s.bools.support(scc_bool)
+        );
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("expected branch exit on block 0");
+        };
+        assert_ne!(when, Bool::FALSE, "s_cbranch_scc0 must not become dead (FALSE)");
+        assert!(
+            matches!(s.bools.support(when)[..], [Atom::Lane(_)]),
+            "branch condition must depend on narrowed EXEC lane predicate: {:?}",
+            s.bools.support(when)
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_ignores_mismatched_wave_width() {
+        // Wave32 running s_bcnt1_i32_b64 (counts both s[2:3], wider than wave32).
+        let p32 = build(
+            &[
+                0xBE82_037E, // s_mov_b32 s2, exec_lo
+                0xBE83_0381, // s_mov_b32 s3, 1
+                0xBE81_1002, // s_bcnt1_i32_b64 s1, s[2:3]
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s32 = structure(&p32).unwrap();
+        let bcnt64_scc = p32.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b64")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s32.scc_some.contains_key(&bcnt64_scc),
+            "wave32 must not treat s_bcnt1_i32_b64 as a wave32 lane-mask test"
+        );
+
+        // Wave64 running s_bcnt1_i32_b32 (counts only low 32 lanes of exec).
+        let p64 = build(
+            &[
+                0xBE81_0F7E, // s_bcnt1_i32_b32 s1, exec_lo
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s64 = structure(&p64).unwrap();
+        let bcnt32_scc = p64.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s64.scc_some.contains_key(&bcnt32_scc),
+            "wave64 must not treat s_bcnt1_i32_b32 as a full wave64 lane-mask test"
         );
     }
 }
