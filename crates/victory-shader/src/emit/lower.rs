@@ -5995,9 +5995,19 @@ impl<'a> Lower<'a> {
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let shift = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(shift);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                // SCC is the 32-bit unsigned carry-out of `(a << shift) + b`:
+                // either non-zero bits were shifted out of `a`, or `t + b` wrapped.
+                let hi_shift = self.s.m.i32(32 - shift);
+                let hi = self.s.m.bin(c, Bin::LShr, a, hi_shift);
+                let z = self.s.m.i32(0);
+                let shift_ov = self.s.m.cmp(c, pred::NE, hi, z);
+                let add_ov = self.s.m.cmp(c, pred::IULT, r, t);
+                let carry = self.s.m.bin(c, Bin::Or, shift_ov, add_ov);
+                (r, Some(carry))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
