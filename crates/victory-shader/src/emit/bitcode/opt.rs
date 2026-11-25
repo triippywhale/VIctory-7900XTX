@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 
 use super::{
-    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
-    successors,
+    Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Tag, Term, Ty, TypeDef, V, for_each_operand,
+    pred, successors,
 };
 
 /// Dead-code elimination.
@@ -901,8 +901,18 @@ impl Module {
                     continue;
                 }
                 let class = self.class(&effects, i);
+                // The translation's own index clamps stay one per handle:
+                // two heap handles of different kinds (a byte-address and a
+                // structured view of one buffer) made from one clamped index
+                // make AMD's compiler (`amdxc64.dll`, drivers 26.10.1 and
+                // 26.11.2) read a null pointer and end the process; with a
+                // clamp each, it compiles them. 68 of the title's compute
+                // programs had such a pair after this pass (ped materials'
+                // `CS_RaytracingResolve`, tree skinning). The compiler joins
+                // the clamps itself afterwards.
                 if passes & REUSE != 0
                     && class == Effect::Pure
+                    && self.tags.get(&i) != Some(&Tag::Clamp)
                     && let Some(key) = self.key(i)
                 {
                     if let Some(&first) = known.get(&key) {
