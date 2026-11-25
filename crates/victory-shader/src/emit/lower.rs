@@ -2589,6 +2589,13 @@ impl<'a> Lower<'a> {
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
+            Input::SampleCoverage => {
+                let i32t = self.s.t.i32;
+                let v = self
+                    .s
+                    .op(self.s.entry, "coverage.i32", Attr::ReadNone, i32t, 91, &[]);
+                return Val::I32(v);
+            }
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
