@@ -558,6 +558,118 @@ fn retry_out_of_memory<T>(
     made
 }
 
+/// Pipelines an AMD driver's compiler crashed on, one name a line, in the
+/// cache folder ([`compiler_crashed`]).
+const CRASHED_FILE: &str = "crashed-pipelines.txt";
+
+/// Whether the driver's compiler crashes are survived: on AMD adapters
+/// only (their compiler faults on a few of the world's compute shaders;
+/// belobug/victory-belobug-amd 0d2f6a62), NVIDIA and Intel unchanged.
+/// `VICTORY_COMPILER_CRASH_GUARD=0` turns it off there too.
+fn crash_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        const AMD: u32 = 0x1002;
+        std::env::var_os("VICTORY_COMPILER_CRASH_GUARD").is_none_or(|v| v != "0")
+            && crate::host::host().and_then(|h| h.vendor_id()) == Some(AMD)
+    })
+}
+
+/// Whether the driver's compiler crashed making the pipeline `name` in an
+/// earlier run (or this one): it is left out.
+fn crashed_before(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    crash_guard()
+        && NAMES
+            .get_or_init(|| {
+                DIR.get()
+                    .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                    .map(|t| t.lines().map(str::to_owned).collect())
+                    .unwrap_or_default()
+            })
+            .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver is making on this thread, if guarded.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes pipeline `name` on this thread while this lives.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Option<Making> {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        if !crash_guard() {
+            return None;
+        }
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Some(Making)
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+/// An access violation near address 0 on a thread making a pipeline
+/// ([`Making`]) is the driver's compiler crashing (AMD's does on a few
+/// compute shaders): the pipeline is noted in [`CRASHED_FILE`] and left out
+/// from then on, and the thread parked for good, so that the other workers
+/// and the title go on instead of the process ending. Any other fault is
+/// not ours (the write guards' are at title addresses). Port of
+/// belobug/victory-belobug-amd 0d2f6a62
+/// (<https://github.com/belobug/victory-belobug-amd>).
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const CONTINUE_SEARCH: i32 = 0;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    if record.ExceptionCode != ACCESS_VIOLATION || name.is_empty() || record.ExceptionInformation[1] >= 0x10000 {
+        return CONTINUE_SEARCH;
+    }
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out, its worker parked");
+    if let Some(dir) = DIR.get() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+        if let Ok(mut f) = file {
+            let _ = writeln!(f, "{name}");
+        }
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// [`create_retrying`] for the pipeline `name`, guarded against the
+/// driver's compiler crashing ([`compiler_crashed`]); a pipeline it crashed
+/// on before is refused (E_FAIL) without a compile.
+fn create_guarded(
+    name: &str,
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    if crashed_before(name) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(name, "a pipeline the driver's compiler crashed on is left out"));
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+    }
+    let _making = Making::new(name);
+    create_retrying(create)
+}
+
 /// `create` through [`retry_out_of_memory`], one retried compile at a time
 /// across all pipeline workers.
 fn create_retrying(
@@ -577,7 +689,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create_retrying(create);
+        return create_guarded(name, create);
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -603,7 +715,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create_retrying(create)?
+        create_guarded(name, create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {

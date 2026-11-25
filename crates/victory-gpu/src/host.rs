@@ -9044,6 +9044,14 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The PCI vendor of the adapter the device is on (0x1002 for AMD), if
+    /// known.
+    pub(crate) fn vendor_id(&self) -> Option<u32> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: a plain query of a live adapter.
+        unsafe { adapter.GetDesc1() }.ok().map(|d| d.VendorId)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
