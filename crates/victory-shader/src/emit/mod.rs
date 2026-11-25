@@ -90,6 +90,8 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_order_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
