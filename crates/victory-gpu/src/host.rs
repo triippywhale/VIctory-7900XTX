@@ -3795,15 +3795,26 @@ fn read_backs(list: &HostList) {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        if *rows == 0 || *row == 0 {
+            continue;
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        // run. Title memory is written through `write_mapped` after the
+        // watch is told, so a page unmapped or guarded while the list flew
+        // is skipped instead of faulting (PalmVIDev 2ef001c8, from
+        // fxceless/victory-fork#565).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                let src_pitch = row.next_multiple_of(256);
+                let span = (rows - 1).saturating_mul(*pitch).saturating_add(*row);
+                crate::watch::writing(*at, span);
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    let Some(dst) = line.checked_mul(*pitch).and_then(|off| at.checked_add(off)) else {
+                        break;
+                    };
+                    write_mapped(dst as *mut u8, from.add(line * src_pitch), *row);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
