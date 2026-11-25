@@ -585,6 +585,7 @@ struct Job {
     seq: u64,
     request: Request,
     note: Note,
+    file: FileHold,
     staging: u64,
 }
 
@@ -846,7 +847,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -861,6 +862,9 @@ fn work(scheduler: &'static Scheduler) {
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // The file's reference (and its handle, if the last) goes before the
+        // title sees the read complete.
+        job.file.release();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -916,14 +920,15 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (seq, front) = lane.reads.front()?;
+        let seq = *seq;
+        let staging = staging_bytes(&front.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (_, Read { request, note, file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -936,6 +941,7 @@ impl Lanes {
             seq,
             request,
             note,
+            file,
             staging,
         })
     }
@@ -1111,10 +1117,49 @@ enum Command {
 }
 
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
 struct Read {
     request: Request,
     note: Note,
+    file: FileHold,
+}
+
+impl Read {
+    fn new(request: Request, note: Note) -> Self {
+        Self { request, note, file: FileHold::new(&request) }
+    }
+}
+
+/// A COM reference on the `File` a read comes from, so that the title may
+/// release its `IDStorageFile` right after `EnqueueRequest`: held from the
+/// enqueue until the read is done.
+struct FileHold(Option<*mut Instance<File>>);
+
+impl FileHold {
+    fn new(request: &Request) -> Self {
+        const SUPPORTED: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
+        Self(
+            (request.options & !SUPPORTED == 0
+                && request.options & MEMORY_SOURCE == 0
+                && !request.source.is_null())
+            .then(|| {
+                let file = request.source as *mut Instance<File>;
+                add_ref_instance(file);
+                file
+            }),
+        )
+    }
+
+    fn release(&mut self) {
+        if let Some(file) = self.0.take() {
+            release(file);
+        }
+    }
+}
+
+impl Drop for FileHold {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1341,7 +1386,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(this, Command::Read(Read::new(request, note)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1684,7 +1729,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the read holds a reference on it.
     let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .files;
@@ -2365,7 +2410,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read::new(r, note)));
     }
 
     #[test]
@@ -2689,5 +2734,66 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn releasing_file_after_enqueue_keeps_it_alive_until_read_completes() {
+        let plain = pattern(8192);
+        let packed = compress_zlib(&plain);
+        let mut contents = plain.clone();
+        contents.extend_from_slice(&packed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released.bin");
+        std::fs::write(&path, &contents).unwrap();
+        let file = open(&path);
+
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut raw = vec![0u8; 512];
+        let mut inflated = vec![0u8; plain.len()];
+        enqueue(
+            queue,
+            &request(0, raw.as_mut_ptr().cast(), raw.len(), file, 128, raw.len()),
+        );
+        enqueue(
+            queue,
+            &request(
+                ZLIB,
+                inflated.as_mut_ptr().cast(),
+                inflated.len(),
+                file,
+                plain.len() as u64,
+                packed.len(),
+            ),
+        );
+        // Title releases the file immediately after EnqueueRequest, before Submit.
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(rel(file), 2, "two queued reads retain the file");
+
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(raw, plain[128..128 + 512]);
+        assert_eq!(inflated, plain);
+        // The OS file handle must already be closed once completion is visible.
+        std::fs::remove_file(&path).expect("file handle released before completion");
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn closing_queue_with_unsubmitted_file_read_releases_file_ref() {
+        let (_dir, file) = file_with(&pattern(256));
+        let queue = new_queue(0);
+        let mut buf = [0u8; 64];
+        enqueue(
+            queue,
+            &request(0, buf.as_mut_ptr().cast(), buf.len(), file, 0, buf.len()),
+        );
+        let add: extern "system" fn(*mut c_void) -> u32 = call(file, 0x08);
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(add(file), 3);
+        assert_eq!(rel(file), 2);
+        // Close without submitting: unsubmitted read drops and releases its ref.
+        void(queue, 0x40);
+        assert_eq!(rel(file), 0, "file refcount returns cleanly to 0");
     }
 }
