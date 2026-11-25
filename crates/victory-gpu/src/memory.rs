@@ -1273,9 +1273,52 @@ mod dump {
     }
 }
 
+/// Evicts cached descriptor-run state for `heap` when its owning `Heap` is
+/// dropped so a later `Heap` allocated at the same address cannot reuse stale
+/// `(base, made)` slot offsets.
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_view_heap_evicts_its_memory_heaps_entry() {
+        use crate::descriptor::{HeapDesc, create_heap, heap};
+        use crate::object::{S_OK, This, guid};
+        if crate::host::host().is_none() {
+            return;
+        }
+        let iid = guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let desc = HeapDesc { kind: 0, count: 64, flags: 1, nodes: 1 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create_heap(std::ptr::null(), &desc, &iid, &mut h), S_OK);
+        let host_heap = heap(h).host().expect("host view heap");
+        let key = std::ptr::from_ref(host_heap) as usize;
+        // A run made for it, as a draw's `ready` makes one.
+        {
+            let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Memory::new();
+            }
+            guard.as_mut().unwrap().heaps.insert(key, (0, 0));
+        }
+        // Release the title heap (COM vtable slot 2): `Heap::drop` must evict `key`.
+        // SAFETY: `h` is a live COM object from `create_heap`.
+        let release: extern "system" fn(This) -> u32 =
+            unsafe { std::mem::transmute(*(*(h as *const *const *const ())).add(2)) };
+        assert_eq!(release(h), 0);
+        let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !guard.as_ref().unwrap().heaps.contains_key(&key),
+            "MEMORY.heaps retained dropped HostHeap key {key:#x}"
+        );
+    }
 
     #[test]
     fn a_piece_takes_what_changed() {
