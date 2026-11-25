@@ -1395,6 +1395,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         }
         let size = request.source_size as usize;
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+            .or_else(|hr| copy_through_buffer(request, size, hr))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -1531,6 +1532,73 @@ static READING: AtomicU64 = AtomicU64::new(0);
 const READ_RETRIES: u32 = 8;
 
 /// Fills `out` (the source size) from the request's file or memory.
+/// A plain read into a title address that the kernel refused because the
+/// destination was read-only when it wrote (`ERROR_INVALID_USER_BUFFER` or
+/// `ERROR_NOACCESS`): the GPU side's write guard can protect a block again
+/// between `kernel_will_write` opening it and the read landing. Read into
+/// our own buffer instead and store the bytes with plain writes, which
+/// fault into the guard's handler like the title's own. Only for committed,
+/// accessible destinations; anything else keeps the kernel's error.
+fn copy_through_buffer(request: &Request, size: usize, hr: HRESULT) -> Result<(), HRESULT> {
+    const INVALID_USER_BUFFER: u32 = 0x8007_06F8;
+    const NOACCESS: u32 = 0x8007_03E6;
+    if request.options & (PAGE_DESTINATION | MEMORY_SOURCE) != 0
+        || !matches!(hr as u32, INVALID_USER_BUFFER | NOACCESS)
+        || !committed(request.destination as usize, size)
+    {
+        return Err(hr);
+    }
+    let mut data = vec![0u8; size];
+    read_into(request, &mut data)?;
+    // SAFETY: the title's destination holds `destination_size` bytes, at
+    // least `size`, committed (checked above) and written by nothing else
+    // until completion; a guarded block faults into the guard's handler.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), size);
+    }
+    static RETRIED: AtomicU32 = AtomicU32::new(0);
+    let n = RETRIED.fetch_add(1, Ordering::Relaxed);
+    if n.is_power_of_two() || n == 0 {
+        tracing::info!(
+            retried = n + 1,
+            offset = request.offset,
+            size,
+            hr = format_args!("{:#010x}", hr as u32),
+            "dstorage: a read the kernel refused into guarded title memory was copied through a buffer"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `[at, at + len)` is committed memory that is not `PAGE_NOACCESS`
+/// or a guard page.
+fn committed(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = at.saturating_add(len);
+    let mut next = at;
+    while next < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(next as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || info.Protect == 0
+        {
+            return false;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if region_end <= next {
+            return false;
+        }
+        next = region_end;
+    }
+    true
+}
+
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
