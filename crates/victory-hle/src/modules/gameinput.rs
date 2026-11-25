@@ -108,16 +108,12 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    fn keys(&mut self, looks: u64) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
-
-/// How many current readings the title has taken: what a [`Latch`] counts
-/// its looks by.
-static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A press is reported until the title has taken this many current readings
 /// since it began: one would let the poll between a pad reading and a
@@ -143,7 +139,7 @@ struct Latch {
 
 impl Latch {
     /// What to report as down: `down` now, plus presses the title has not
-    /// seen yet. `looks` is [`LOOKS`] now.
+    /// seen yet. `looks` counts successful reads from this input source.
     fn report(&mut self, down: &[u32], looks: u64, now: Instant) -> Vec<u32> {
         self.held.retain(|&(id, at, since)| {
             down.contains(&id) || (looks < at + LATCH_LOOKS && now.duration_since(since) < LATCH_MAX)
@@ -403,6 +399,9 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// Successful current readings per input source. The stand-in pad and
+    /// keyboard are two views of the same sampled keys.
+    looks: [AtomicU64; DEVICES],
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -435,6 +434,7 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            looks: Default::default(),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -474,8 +474,9 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let pads: [_; PADS] =
+                std::array::from_fn(|i| source.pad(i, self.looks[i].load(Ordering::Relaxed)));
+            (pads, source.keys(self.looks[KEYBOARD].load(Ordering::Relaxed)))
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
@@ -597,10 +598,10 @@ fn host() -> Box<dyn Source> {
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize, _: u64) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -670,7 +671,6 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    LOOKS.fetch_add(1, Ordering::Relaxed);
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -678,12 +678,13 @@ extern "system" fn current_reading(
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
+            .map(|r| (i, r))
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
             .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .max_by_key(|(_, r)| r.timestamp)
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
@@ -694,10 +695,15 @@ extern "system" fn current_reading(
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.map(|(_, r)| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let hr = hand(out, found.map(|(_, r)| r));
+    if hr == S_OK && let Some((i, _)) = found {
+        let source = if i == FALLBACK { KEYBOARD } else { i };
+        hub.looks[source].fetch_add(1, Ordering::Relaxed);
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -1009,7 +1015,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
+            if source.pad(slot, device.hub().looks[slot].load(Ordering::Relaxed)).is_some() {
                 source.rumble(slot, speed(low), speed(high));
             }
         }
@@ -1229,7 +1235,7 @@ mod host {
     }
 
     impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1245,7 +1251,6 @@ mod host {
             // A button tapped between two of the title's looks stays down
             // until it has looked.
             let down: Vec<u32> = (0..32).filter(|bit| pad.buttons & (1 << bit) != 0).collect();
-            let looks = LOOKS.load(Ordering::Relaxed);
             pad.buttons = self.buttons[slot]
                 .report(&down, looks, Instant::now())
                 .into_iter()
@@ -1265,7 +1270,7 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, looks: u64) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1281,7 +1286,6 @@ mod host {
                 // A key tapped between two of the title's looks stays down
                 // until it has looked.
                 let held: Vec<u32> = held.into_iter().map(u32::from).collect();
-                let looks = LOOKS.load(Ordering::Relaxed);
                 let latched = self.keys.report(&held, looks, Instant::now());
                 for vk in latched.into_iter().map(|vk| vk as u8) {
                     if !down.contains(&vk) {
@@ -1406,10 +1410,10 @@ mod tests {
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, _: u64) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1544,6 +1548,28 @@ mod tests {
             Some(Provenance::Hle)
         );
         assert_eq!(r.classify("GameInput.dll", &ImportSymbol::Ordinal(2)), None);
+    }
+
+    #[test]
+    fn only_successful_reads_from_the_input_source_count_toward_a_tap() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let mut latch = Latch::default();
+        let keyboard_reads = || hub.looks[KEYBOARD].load(Ordering::Relaxed);
+        let now = Instant::now();
+        assert_eq!(latch.report(&[27], keyboard_reads(), now), [27]);
+        for _ in 0..2 {
+            assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+            release(current(hub, GAMEPAD_KIND, 1).unwrap());
+        }
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        release(current(hub, GAMEPAD_KIND, FALLBACK).unwrap());
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        release(current(hub, KEYBOARD_KIND, KEYBOARD).unwrap());
+        assert!(latch.report(&[], keyboard_reads(), now + POLL * 2).is_empty());
     }
 
     #[test]
