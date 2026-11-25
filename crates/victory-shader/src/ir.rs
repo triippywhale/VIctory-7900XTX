@@ -2704,6 +2704,9 @@ mod tests {
         assert_eq!(p.inputs.len(), 1);
         assert_eq!(p.inputs[0].0, Reg::S(0));
         assert_eq!(p.blocks[0].insts[0].read(Reg::S(0)), Some(p.inputs[0].1));
+    }
+
+    #[test]
     fn operand_reads_includes_implicit_destination_reads_for_rmw_and_partial_writes() {
         let words: &[u32] = &[
             0x560A_0401, // 0: v_fmac_f32 v5, s1, v2 (reads accumulator v5)

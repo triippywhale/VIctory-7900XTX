@@ -65,7 +65,14 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether depth and stencil are tested before the program runs.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` (AMD's register headers, as in
+/// Linux's `gc_10_3_0_sh_mask.h`).
+const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
 
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
@@ -1392,6 +1399,20 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // The console tests depth and stencil before a pixel program its
+        // compiler marked `[earlydepthstencil]`
+        // (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`), so the program runs
+        // only for pixels that pass. The host must too (Marvisak/VIctory
+        // #2085): without the flag it runs a program that writes unordered
+        // views before the depth test, for hidden pixels as well, and keeps
+        // what they wrote.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = &x.native.io
+            && db_shader_control & DEPTH_BEFORE_SHADER != 0
+        {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2456,6 +2477,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -13466,6 +13489,91 @@ mod tests {
         assert_eq!(at(3, 7), None);
         // A row no element holds gives nothing, as before.
         assert_eq!(packed_half(&sig, &[(8, None)], 8, 0), None);
+    }
+
+    fn validate_dxil(dxil: &[u8]) {
+        #[cfg(windows)]
+        {
+            use super::super::validator::Validator;
+            let mut v = Validator::load(Validator::default_path().as_deref())
+                .expect("dxil.dll validator must load");
+            let mut copy = dxil.to_vec();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        #[cfg(not(windows))]
+        let _ = dxil;
+    }
+
+    /// A pixel program storing 1.0 to its target, with this
+    /// `DB_SHADER_CONTROL`.
+    fn pixel_with_depth_control(db_shader_control: u32) -> Lowered {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0xF800_180F,
+            0x0000_0000, // exp mrt0 v0, v0, v0, v0 done vm
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = super::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![target],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    /// A pixel program the console tests depth before
+    /// (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12) keeps that order on
+    /// the host (`ForceEarlyDepthStencil`); a program without the bit is as
+    /// it was. Port of Marvisak/VIctory #2085.
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_forces_early_depth() {
+        let flagged = pixel_with_depth_control(1 << 12);
+        assert!(flagged.early_depth);
+        // The ordered-section bit beside it is another matter.
+        let plain = pixel_with_depth_control(1 << 16);
+        assert!(!plain.early_depth);
+        assert!(!pixel_with_depth_control(0).early_depth);
+        // dxil.dll takes the flag: it is not one the validator derives from
+        // the code.
+        validate_dxil(&flagged.dxil);
     }
 
     /// Whether a synthetic compute program translates with these input registers.
