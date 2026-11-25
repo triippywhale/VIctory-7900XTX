@@ -115,6 +115,48 @@ trait Source: Send {
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
 
+/// How many current readings the title has taken: what a [`Latch`] counts
+/// its looks by.
+static LOOKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A press is reported until the title has taken this many current readings
+/// since it began: one would let the poll between a pad reading and a
+/// keyboard reading of the same frame drop it.
+const LATCH_LOOKS: u64 = 2;
+/// ... or this long, for a title that is not reading at all.
+const LATCH_MAX: Duration = Duration::from_secs(2);
+
+/// Presses kept until the title has looked.
+///
+/// The host is polled every [`POLL`] and the title takes the current reading
+/// once a frame. At a few frames a second a tap falls between two frames:
+/// the key or button is down and up again before the title looks, and the
+/// press is lost (seen in the world at about 350 ms a frame: three 60 ms
+/// taps of the menu key did nothing, a 1.5 s hold opened the menu). A press
+/// is therefore reported from when it begins until the title has looked
+/// [`LATCH_LOOKS`] times, even if it was released meanwhile.
+#[derive(Default)]
+struct Latch {
+    /// (key or button, looks when the press began, when it began)
+    held: Vec<(u32, u64, Instant)>,
+}
+
+impl Latch {
+    /// What to report as down: `down` now, plus presses the title has not
+    /// seen yet. `looks` is [`LOOKS`] now.
+    fn report(&mut self, down: &[u32], looks: u64, now: Instant) -> Vec<u32> {
+        self.held.retain(|&(id, at, since)| {
+            down.contains(&id) || (looks < at + LATCH_LOOKS && now.duration_since(since) < LATCH_MAX)
+        });
+        for &id in down {
+            if !self.held.iter().any(|h| h.0 == id) {
+                self.held.push((id, looks, now));
+            }
+        }
+        self.held.iter().map(|h| h.0).collect()
+    }
+}
+
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -628,6 +670,7 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    LOOKS.fetch_add(1, Ordering::Relaxed);
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -1179,6 +1222,10 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Key presses the title has not seen yet ([`Latch`]).
+        keys: Latch,
+        /// Button presses, per pad.
+        buttons: [Latch; PADS],
     }
 
     impl Source for Host {
@@ -1195,6 +1242,14 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // A button tapped between two of the title's looks stays down
+            // until it has looked.
+            let down: Vec<u32> = (0..32).filter(|bit| pad.buttons & (1 << bit) != 0).collect();
+            let looks = LOOKS.load(Ordering::Relaxed);
+            pad.buttons = self.buttons[slot]
+                .report(&down, looks, Instant::now())
+                .into_iter()
+                .fold(0, |all, bit| all | (1 << bit));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1223,7 +1278,16 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
+                // A key tapped between two of the title's looks stays down
+                // until it has looked.
+                let held: Vec<u32> = held.into_iter().map(u32::from).collect();
+                let looks = LOOKS.load(Ordering::Relaxed);
+                let latched = self.keys.report(&held, looks, Instant::now());
+                for vk in latched.into_iter().map(|vk| vk as u8) {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1718,5 +1782,55 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+
+    /// A tap that ends before the title looks is still reported, until the
+    /// title has looked [`LATCH_LOOKS`] times.
+    #[test]
+    fn a_tap_between_two_looks_is_kept_until_the_title_has_looked() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        // Down at look 10, up 8 ms later with the title not having looked.
+        assert_eq!(latch.report(&[27], 10, t), [27]);
+        assert_eq!(latch.report(&[], 10, t + POLL), [27]);
+        // One look: still down (a second reading of the same frame may follow).
+        assert_eq!(latch.report(&[], 11, t + POLL * 2), [27]);
+        // Two looks: released.
+        assert!(latch.report(&[], 12, t + POLL * 3).is_empty());
+    }
+
+    /// A held key stays down however often the title looks, and is released
+    /// as soon as it is let go once the title has seen it.
+    #[test]
+    fn a_held_key_is_down_while_held_and_no_longer() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[65], 0, t), [65]);
+        assert_eq!(latch.report(&[65], 50, t + Duration::from_secs(5)), [65]);
+        assert!(latch.report(&[], 50, t + Duration::from_secs(5) + POLL).is_empty());
+    }
+
+    /// With a title that does not look, a tap is not held for ever.
+    #[test]
+    fn a_tap_is_dropped_after_a_while_without_looks() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[13], 3, t), [13]);
+        assert_eq!(latch.report(&[], 3, t + LATCH_MAX / 2), [13]);
+        assert!(latch.report(&[], 3, t + LATCH_MAX + POLL).is_empty());
+    }
+
+    /// Presses are kept apart: one tap ending does not end another key's hold.
+    #[test]
+    fn keys_are_latched_one_by_one() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[1, 2], 0, t), [1, 2]);
+        assert_eq!(latch.report(&[2], 2, t + POLL), [2]);
     }
 }
