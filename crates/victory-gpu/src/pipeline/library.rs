@@ -726,14 +726,97 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
+    // A save holds the library alone while it serialises it (seconds to
+    // minutes for a library of gigabytes): the store waits for after it
+    // instead of the worker ([`DEFERRED`]).
+    let _stores = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            defer_store(wide, &pso);
+            return Ok(pso);
+        }
+    };
+    {
+        let _call = call("store", name);
+        store(library, &wide, &pso);
+    }
+    store_deferred(library);
+    Ok(pso)
+}
+
+/// Stores `pso` under `name`, with the library's store lock held (shared);
+/// whether the library took it.
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) -> bool {
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    let stored = unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok();
+    if stored {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+    stored
+}
+
+/// A pipeline made while a save held the library, to be stored after it.
+struct Deferred(HSTRING, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Deferred {}
+
+/// At most this many stores wait for a save; past it a pipeline is not
+/// stored (the next run compiles it again), so that a save that never ends
+/// does not hold host pipelines without bound.
+const DEFERRED_MAX: usize = 4096;
+
+/// Stores that found a save holding the library (PalmVIDev #255). A save
+/// of a 7 GB library took over three minutes on a world run (RTX 4090,
+/// little physical memory free), and every pipeline worker waited for it
+/// in its store with its pipeline already made: 16 of 16 workers "busy"
+/// at 0.2 processors, and the frame's queued pipelines made a few a
+/// minute. Now the worker hands its pipeline on at once and the store
+/// waits here.
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+
+/// Stores deferred while a save held the library, since the start.
+static DEFERRED_STORES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a list of `len` deferred stores has room for one more.
+fn defer_room(len: usize) -> bool {
+    len < DEFERRED_MAX
+}
+
+/// Keeps `pso` for a store after the save in progress.
+fn defer_store(name: HSTRING, pso: &ID3D12PipelineState) {
+    let mut deferred = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+    if defer_room(deferred.len()) {
+        deferred.push(Deferred(name, pso.clone()));
+        DEFERRED_STORES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stores the deferred pipelines; the caller holds the store lock (shared).
+fn store_deferred(library: &Library) {
+    let waiting = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    if waiting.is_empty() {
+        return;
+    }
+    let _call = call("store", "pipelines made during a save");
+    for Deferred(name, pso) in &waiting {
+        store(library, name, pso);
+    }
+}
+
+/// After a save: stores what waited for it, unless another save holds the
+/// library already (that one stores them after itself).
+fn store_deferred_after_save(library: &Library) {
+    let _all = one_call();
+    let held = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    store_deferred(library);
+    drop(held);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -782,6 +865,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    store_deferred_after_save(library);
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
@@ -813,6 +897,7 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             retried_out_of_memory = OOM_RETRIED.load(Ordering::Relaxed),
             recovered_out_of_memory = OOM_RECOVERED.load(Ordering::Relaxed),
+            deferred_stores = DEFERRED_STORES.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -952,6 +1037,21 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store never waits for a save: while one holds the library alone,
+    /// the store lock cannot be had shared without waiting, which is what
+    /// sends a store to the deferred list (bounded).
+    #[test]
+    fn a_store_during_a_save_does_not_wait() {
+        let saving = RwLock::new(());
+        let alone = saving.write().unwrap();
+        assert!(matches!(saving.try_read(), Err(std::sync::TryLockError::WouldBlock)));
+        drop(alone);
+        assert!(saving.try_read().is_ok());
+        assert!(defer_room(0));
+        assert!(defer_room(DEFERRED_MAX - 1));
+        assert!(!defer_room(DEFERRED_MAX));
+    }
 
     fn out_of_memory() -> windows::core::Error {
         windows::Win32::Foundation::E_OUTOFMEMORY.into()

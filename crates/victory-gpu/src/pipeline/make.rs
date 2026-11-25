@@ -171,11 +171,14 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Makes `p` on this thread if it is not made yet (waiting for a worker
-/// that is making it); whether it has a host pipeline.
-pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    p.make();
-    p.made.get().is_some_and(|made| made.is_some())
+/// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
+/// if it was refused, `None` while it is being made (asked for now, ahead
+/// of everything no draw or dispatch asked for).
+pub(crate) fn poll(p: &Arc<Pending>) -> Option<bool> {
+    if p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
+    p.made.get().map(Option::is_some)
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

@@ -243,9 +243,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). While one cannot be made the builder
+/// has created has a host pipeline; the first builder dispatch asks the
+/// workers for them all (ahead of the rest) and the builder does not run,
+/// none of its stages, until none is still being made (a stage "still being
+/// made" would be a dropped stage). It no longer makes them on the spot:
+/// that held the title's recording thread for minutes (PalmVIDev #255). While one cannot be made the builder
 /// is off; it is looked at again when the title creates another. A stage
 /// that could not be bound stops the stages after it for the rest of that
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
@@ -264,6 +266,8 @@ struct Builder {
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+    /// It waited for pipelines being made since it last ran.
+    waited: bool,
 }
 
 #[cfg(windows)]
@@ -272,6 +276,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     whole: false,
     off: 0,
     rests: 0,
+    waited: false,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -337,7 +342,32 @@ pub(crate) fn builder_runs() -> bool {
     if b.whole {
         return true;
     }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
+    // Asked for and not waited for (PalmVIDev #255): making them all here,
+    // on the title's recording thread under this lock, froze a world run's
+    // frame for 5 minutes (53 programs, seconds of driver compile each). The
+    // workers make them ahead of the rest; the builder stays off, all of it,
+    // until none is being made, and starts at the next frame so that no
+    // frame runs its later stages without its earlier ones.
+    let states: Vec<Option<bool>> = b.pipelines.iter().map(make::poll).collect();
+    if builder_waits(&states) {
+        b.waited = true;
+        static WAITING: std::sync::Once = std::sync::Once::new();
+        WAITING.call_once(|| {
+            tracing::info!(
+                pipelines = states.len(),
+                making = states.iter().filter(|s| s.is_none()).count(),
+                "the ray-tracing structure builder waits for its programs' host pipelines (made by the workers, ahead of the rest)"
+            );
+        });
+        return false;
+    }
+    let missing: Vec<String> = b
+        .pipelines
+        .iter()
+        .zip(&states)
+        .filter(|(_, s)| **s != Some(true))
+        .map(|(p, _)| make::hashes(p))
+        .collect();
     if !missing.is_empty() {
         b.off = b.pipelines.len();
         tracing::warn!(
@@ -354,7 +384,19 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    if std::mem::take(&mut b.waited) {
+        b.rests = crate::frame::current() + 1;
+        return false;
+    }
     true
+}
+
+/// Whether the builder waits for its pipelines ([`make::poll`] of each):
+/// some are still being made. Refused ones do not count: those decide
+/// whether it runs at all.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn builder_waits(states: &[Option<bool>]) -> bool {
+    states.iter().any(Option::is_none)
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -790,6 +832,17 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The builder waits (does not run, and is not turned off) while any of
+    /// its pipelines is still being made; made and refused ones decide.
+    #[test]
+    fn the_builder_waits_for_pipelines_being_made() {
+        assert!(super::builder_waits(&[Some(true), None, Some(true)]));
+        assert!(super::builder_waits(&[None, Some(false)]));
+        assert!(!super::builder_waits(&[Some(true), Some(true)]));
+        assert!(!super::builder_waits(&[Some(true), Some(false)]));
+        assert!(!super::builder_waits(&[]));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
