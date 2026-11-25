@@ -2378,14 +2378,23 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
-    // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
-    // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
-        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
-        return Some(Moved::Const(((1u32 << w) - 1) << at));
+    // A bit-field mask of two immediates (an immediate sampler's word, as
+    // the upscaler's compiler and the precompiled pipelines' code make it):
+    // `((1 << count) - 1) << shift`.
+    if inst.name() == "s_bfm_b32" && k == 0 {
+        let imm = |op: &Operand| match *op {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let (count, shift) = (imm(src.first()?)? & 31, imm(src.get(1)?)? & 31);
+        return Some(Moved::Const(((1u32 << count) - 1) << shift));
     }
     let src = src.first()?;
     match (inst.name(), *src) {
+        // A 64-bit move of a literal with its sign bit clear: the high
+        // dword is 0 whichever way the literal is extended.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => Some(Moved::Const(if k == 0 { x } else { 0 })),
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
