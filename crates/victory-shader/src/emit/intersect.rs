@@ -431,14 +431,18 @@ impl<'a> Lower<'a> {
             let leave = self.binary(36, far[0], far[1]);
             let leave = self.binary(36, leave, far[2]);
             let from = self.binary(35, enter, fzero);
-            // Ordered compares: a NaN anywhere is a miss.
+            // Every axis must be ordered (`min <= max`): ordered compares reject
+            // both inverted/empty boxes (`min > max`) and any NaN in any of the
+            // six coordinates (which FMin/FMax would otherwise drop).
             let through = self.s.m.cmp(c, pred::OGE, leave, from);
             let before = self.s.m.cmp(c, pred::OLT, enter, ray.extent);
-            let off = self.is_nan_f32(bx[0]);
-            let on = self.s.m.bool(true);
-            let on = self.s.m.bin(c, Bin::Xor, off, on);
+            let ok_x = self.s.m.cmp(c, pred::OLE, bx[0], bx[3]);
+            let ok_y = self.s.m.cmp(c, pred::OLE, bx[1], bx[4]);
+            let ok_z = self.s.m.cmp(c, pred::OLE, bx[2], bx[5]);
+            let valid = self.s.m.bin(c, Bin::And, ok_x, ok_y);
+            let valid = self.s.m.bin(c, Bin::And, valid, ok_z);
             let hit = self.s.m.bin(c, Bin::And, through, before);
-            let hit = self.s.m.bin(c, Bin::And, hit, on);
+            let hit = self.s.m.bin(c, Bin::And, hit, valid);
             let child = self.s.m.cmp(c, pred::NE, children[n], none);
             let hit = self.s.m.bin(c, Bin::And, hit, child);
             let hit = match there {
