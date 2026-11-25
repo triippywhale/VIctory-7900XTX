@@ -84,19 +84,22 @@ fn modrm_len(b: &[u8]) -> Option<usize> {
     (b.len() >= len).then_some(len)
 }
 
+/// Maximum architectural x86-64 instruction length in bytes.
+const MAX_INSN_LEN: usize = 15;
+
 /// The console-only instruction at the start of `code` and its length.
 pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     let mut i = 0;
-    // `rep`: the last of F2 / F3, which decides between them (and over 66) for SSE4a
-    let (mut p66, mut pf3, mut rep, mut rex) = (false, false, 0u8, 0u8);
+    // `rep`: the last of F2 / F3, which decides between them (and overrides 66)
+    let (mut p66, mut rep, mut rex) = (false, 0u8, 0u8);
     while let Some(&b) = code.get(i) {
+        if i >= MAX_INSN_LEN {
+            return None;
+        }
         match b {
             0x66 => p66 = true,
             0xF2 => rep = 0xF2,
-            0xF3 => {
-                pf3 = true;
-                rep = 0xF3;
-            }
+            0xF3 => rep = 0xF3,
             0x2E | 0x3E | 0x26 | 0x36 | 0x64 | 0x65 | 0x67 => {}
             // REX counts only right before the opcode: one before a legacy prefix is ignored
             0x40..=0x4F => {
@@ -112,7 +115,7 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     if *code.get(i)? != 0x0F {
         return None;
     }
-    match (*code.get(i + 1)?, code.get(i + 2).copied()) {
+    let decoded = match (*code.get(i + 1)?, code.get(i + 2).copied()) {
         (0x01, Some(0xFC)) => {
             // clzero (0F 01 FC); add rax, 0x40 (48 83 C0 40); cmp rax, <reg> ([48|4C] 39 modrm); jb -12 (72 F4)
             // (not after an 0x67: that CLZERO is at EAX, and the jb goes back to the 0F, past the
@@ -151,12 +154,23 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 _ => None,
             }
         }
-        // 66 0F AE /6 with a memory operand (without 66 it is xsaveopt)
-        (0xAE, Some(m)) if p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?)),
-        // F3 0F C7 /7 with a register operand
-        (0xC7, Some(m)) if pf3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3)),
+        // 66 0F AE /6 with a memory operand (no F2/F3; without 66 it is xsaveopt)
+        (0xAE, Some(m)) if rep == 0 && p66 && (m >> 3) & 7 == 6 && m >> 6 != 3 => {
+            Some((ConsoleOnly::Clwb, i + 2 + modrm_len(&code[i + 2..])?))
+        }
+        // F3 0F C7 /7 with a register operand (F2 after F3 overrides F3 and is #UD)
+        (0xC7, Some(m)) if rep == 0xF3 && (m >> 3) & 7 == 7 && m >> 6 == 3 => {
+            Some((ConsoleOnly::Rdpid((m & 7) | (rex & 1) << 3), i + 3))
+        }
         _ => None,
-    }
+    }?;
+    // Enforce the 15-byte x86-64 architectural instruction length limit on the
+    // decoded instruction itself (for `ClzeroLoop`, the leading `clzero` is `i + 3` bytes).
+    let single_len = match decoded.0 {
+        ConsoleOnly::ClzeroLoop { .. } => i + 3,
+        _ => decoded.1,
+    };
+    (single_len <= MAX_INSN_LEN).then_some(decoded)
 }
 
 
@@ -229,5 +243,38 @@ mod tests {
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24]), None);
         assert_eq!(decode(&[0x0F]), None);
+    }
+
+    #[test]
+    fn rejects_conflicting_rep_prefixes_and_overlong_instructions() {
+        // CLWB requires mandatory 66 without F2/F3 (F2/F3 override 66 -> #UD).
+        for bad_clwb in [
+            [0xF3, 0x66, 0x0F, 0xAE, 0x30],
+            [0x66, 0xF3, 0x0F, 0xAE, 0x30],
+            [0xF2, 0x66, 0x0F, 0xAE, 0x30],
+            [0x66, 0xF2, 0x0F, 0xAE, 0x30],
+        ] {
+            assert_eq!(decode(&bad_clwb), None, "conflicting CLWB prefix {bad_clwb:02x?}");
+        }
+        // RDPID uses the last of F2/F3: F3 F2 is #UD, while F2 F3 still decodes as RDPID.
+        assert_eq!(decode(&[0xF3, 0xF2, 0x0F, 0xC7, 0xF8]), None);
+        assert_eq!(
+            decode(&[0xF2, 0xF3, 0x0F, 0xC7, 0xF8]),
+            Some((ConsoleOnly::Rdpid(0), 5))
+        );
+
+        // x86-64 architectural maximum instruction length is 15 bytes.
+        let mut exact_15 = vec![0x66; 12];
+        exact_15.extend_from_slice(&[0x0F, 0x01, 0xFC]); // 12 + 3 = 15 bytes
+        assert_eq!(decode(&exact_15), Some((ConsoleOnly::Clzero, 15)));
+
+        let mut over_15 = vec![0x66; 13];
+        over_15.extend_from_slice(&[0x0F, 0x01, 0xFC]); // 13 + 3 = 16 bytes -> #UD
+        assert_eq!(decode(&over_15), None);
+
+        // CLWB with 10 prefixes + 2-byte opcode + ModRM + SIB + disp32 = 18 bytes -> #UD.
+        let mut over_clwb = vec![0x66; 10];
+        over_clwb.extend_from_slice(&[0x0F, 0xAE, 0xB4, 0x24, 1, 2, 3, 4]);
+        assert_eq!(decode(&over_clwb), None);
     }
 }
