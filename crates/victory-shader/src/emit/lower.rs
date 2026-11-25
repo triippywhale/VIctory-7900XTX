@@ -751,13 +751,14 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                 firsts.extend(mask);
                 Wave::Plain
             }
-            ("v_add_nc_u32" | "s_add_i32", [a, b]) => match (*a, *b) {
+            // (A clamped add or subtract saturates: not the idiom.)
+            ("v_add_nc_u32" | "s_add_i32", [a, b]) if !matches!(&inst.fields, Fields::Valu(v) if v.clamp) => match (*a, *b) {
                 (Wave::Prefix, Wave::Base) | (Wave::Base, Wave::Prefix) => Wave::Base,
                 (Wave::Prefix, Wave::Plain | Wave::Prefix) | (Wave::Plain, Wave::Prefix) => Wave::Prefix,
                 (x, y) if sum(x) && sum(y) => x,
                 _ => return Err(why(w)),
             },
-            ("v_sub_nc_u32" | "s_sub_i32", [a, b]) => match (*a, *b) {
+            ("v_sub_nc_u32" | "s_sub_i32", [a, b]) if !matches!(&inst.fields, Fields::Valu(v) if v.clamp) => match (*a, *b) {
                 (Wave::Base, Wave::Prefix) => Wave::Base,
                 (Wave::Prefix, Wave::Plain) => Wave::Prefix,
                 (Wave::Plain, y) if sum(y) && matches!(ops[0], Operand::Const(128)) => y,
@@ -4482,7 +4483,19 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.clamp {
+            return Err("integer output modifiers");
+        }
+        self.write_i_clamped(inst, x, guard)
+    }
+
+    /// [`Lower::write_i`] for a result whose clamp the caller has applied
+    /// already (unsigned VOP3 add and subtract saturate).
+    fn write_i_clamped(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -8862,8 +8875,15 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                // clamp: an unsigned add saturates at all ones, a subtract
+                // at zero (fxceless/victory-fork#948, upstream #1398).
+                if v.clamp {
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    r = self.s.m.select(c, carry, limit, r);
+                }
+                self.write_i_clamped(inst, r, guard)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -9090,6 +9110,25 @@ impl<'a> Lower<'a> {
                 // wave reads leave helpers out, so a waterfall loop would never let them go.
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
+            }
+            // clamp on the unsigned adds and subtracts without a carry out:
+            // saturated at all ones or zero (fxceless/victory-fork#948).
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add3_u32" if v.clamp => {
+                let add = name.starts_with("v_add");
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let (mut r, mut overflow) = self.add_sub_carry(c, add, a, b, None);
+                if name == "v_add3_u32" {
+                    let d = s(self, 2)?;
+                    let (sum, carry) = self.add_sub_carry(c, true, r, d, None);
+                    r = sum;
+                    overflow = self.s.m.bin(c, Bin::Or, overflow, carry);
+                }
+                let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                let r = self.s.m.select(c, overflow, limit, r);
+                self.write_i_clamped(inst, r, guard)
             }
             _ => {
                 let r = self.integer(inst, name)?;

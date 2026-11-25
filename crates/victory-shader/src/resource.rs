@@ -837,6 +837,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1034,6 +1035,7 @@ impl<'a> Tracer<'a> {
                     return false;
                 };
                 inst.name() == "v_add_co_ci_u32"
+                    && !f.clamp
                     && f.src[..2.min(f.src.len())]
                         .iter()
                         .any(|o| self.vterm(inst, o).is_some_and(high_of))
@@ -1052,6 +1054,7 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
+            && !f.clamp
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
