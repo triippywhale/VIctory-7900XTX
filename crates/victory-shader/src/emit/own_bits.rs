@@ -694,18 +694,49 @@ impl Ctx<'_> {
             }
         }
         // ---- no mask that depends on the test outlives its round ----
+        let phi_block: HashMap<Value, usize> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, blk)| blk.phis.iter().map(move |phi| (phi.value, b)))
+            .collect();
         let mut dep: HashSet<Atom> = tests.iter().map(|t| t.0).collect();
         let mut changed = true;
         while changed {
             changed = false;
             for (&id, edges) in &st.phi_masks {
-                if !dep.contains(&Atom::Phi(id))
-                    && edges.iter().any(|&e| st.bools.support(e).iter().any(|a| dep.contains(a)))
-                {
+                if dep.contains(&Atom::Phi(id)) {
+                    continue;
+                }
+                let data_dep = edges
+                    .iter()
+                    .any(|&e| st.bools.support(e).iter().any(|a| dep.contains(a)));
+                // When incoming edges carry different mask values, the phi's value
+                // also depends on which predecessor edge a lane took (e.g. a mask
+                // written inside the own-bit body whose `given(m, edge)` folded to
+                // a constant `TRUE`/`FALSE`).
+                let ctrl_dep = edges.first().is_some_and(|first| edges.iter().any(|e| e != first))
+                    && phi_block.get(&id).is_some_and(|&pb| {
+                        p.blocks[pb].preds.iter().any(|&q| {
+                            st.bools.support(st.reach[q]).iter().any(|a| dep.contains(a))
+                                || matches!(st.exits[q], LaneExit::Branch { when, .. }
+                                    if st.bools.support(when).iter().any(|a| dep.contains(a)))
+                        })
+                    });
+                if data_dep || ctrl_dep {
                     dep.insert(Atom::Phi(id));
                     changed = true;
                 }
             }
+        }
+        // A mask phi at the loop header `h` carries a value across rounds of `lp`,
+        // so it must not depend on the own-bit test.
+        if p.blocks[h]
+            .phis
+            .iter()
+            .any(|phi| dep.contains(&Atom::Phi(phi.value)))
+        {
+            return Err((head, STALE));
         }
         let mut seen: HashMap<Bool, bool> = HashMap::new();
         let mut tainted = |b: Bool| -> bool {
@@ -713,13 +744,23 @@ impl Ctx<'_> {
                 .entry(b)
                 .or_insert_with(|| st.bools.support(b).iter().any(|a| dep.contains(a)))
         };
+        let after_test_inst = |b: usize, i: usize| {
+            lp[b]
+                && tests
+                    .iter()
+                    .any(|&(_, tb, ti)| b == tb && i > ti || b != tb && self.dominates(tb, b))
+        };
+        let after_test_block =
+            |b: usize| lp[b] && tests.iter().any(|&(_, tb, _)| self.dominates(tb, b));
         for b in 0..n {
-            if lp[b] && tests.iter().any(|&(_, tb, _)| self.dominates(tb, b)) {
-                continue;
+            for (i, guard) in st.guards[b].iter().enumerate() {
+                if !after_test_inst(b, i) && guard.is_some_and(&mut tainted) {
+                    return Err((self.at((b, i)), STALE));
+                }
             }
-            let stale = st.guards[b].iter().flatten().any(|&g| tainted(g))
-                || matches!(st.exits[b], LaneExit::Branch { when, .. } if tainted(when));
-            if stale {
+            if !after_test_block(b)
+                && matches!(st.exits[b], LaneExit::Branch { when, .. } if tainted(when))
+            {
                 return Err((p.blocks[b].offset, STALE));
             }
         }
@@ -729,8 +770,10 @@ impl Ctx<'_> {
             }
             for user in self.users.get(&v).into_iter().flatten() {
                 let outside = match *user {
-                    User::Inst(b2, _) => !lp[b2],
-                    User::Phi(b2, k2) => !lp[b2] && self.live.contains(&p.blocks[b2].phis[k2].value),
+                    User::Inst(b2, i2) => !after_test_inst(b2, i2),
+                    User::Phi(b2, k2) => {
+                        (!lp[b2] || b2 == h) && self.live.contains(&p.blocks[b2].phis[k2].value)
+                    }
                 };
                 if outside {
                     return Err((head, STALE));
@@ -910,5 +953,133 @@ mod tests {
         let p = light_loop(true, &[ADD_BIT_NUMBER], &[0xD834_0000, 0x0000_0505], &[]);
         assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_write_b32"));
         assert!(found(&p).totals.is_empty());
+    }
+
+    #[test]
+    fn a_test_dependent_mask_carried_across_rounds_is_stale() {
+        // Initialize s[14:15] = 0 before the loop, consume it via v_cndmask_b32 in the
+        // body, and overwrite s[14:15] with the body's test-dependent EXEC so the next
+        // round reads a mask from the previous round (STALE).
+        let cnd = 128 | (261 << 9) | (14 << 18); // 0, v5, s[14:15]
+        let body = [
+            0xD501_0005,
+            cnd,         // v_cndmask_b32 v5, 0, v5, s[14:15]
+            0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        ];
+        let mut w = vec![0xBE8E_0480]; // s_mov_b64 s[14:15], 0
+        w.extend_from_slice(&WAVE_OR_V7_TO_S7);
+        let test = [
+            0x3608_0E0B, // v_and_b32 v4, s11, v7
+            0xBE8C_047E, // s_mov_b64 s[12:13], exec
+            0x7DAA_0880, // v_cmpx_ne_u32 exec, 0, v4
+        ];
+        let head = 3 + test.len() + 1 + body.len() + 1 + 3;
+        w.extend_from_slice(&[
+            0xBF06_8007,                     // s_cmp_eq_u32 s7, 0
+            0xBF85_0000 | (3 + head) as u32, // s_cbranch_scc1 past the loop
+            0x7E06_0207,                     // v_mov_b32 v3, s7
+            0xBF82_0001,                     // s_branch to the loop's head
+            0x7E06_0209,                     // again: v_mov_b32 v3, s9
+            0x7E10_0503,                     // head: v_readfirstlane_b32 s8, v3
+            0xBE8A_1308,                     // s_ff1_i32_b32 s10, s8
+            0x8F0B_0A81,                     // s_lshl_b32 s11, 1, s10
+        ]);
+        w.extend_from_slice(&test);
+        w.push(0xBF88_0000 | body.len() as u32); // s_cbranch_execz past the body
+        w.extend_from_slice(&body);
+        w.extend_from_slice(&[
+            0xBEFE_040C,                                // s_mov_b64 exec, s[12:13]
+            0x8909_080B,                                // s_xor_b32 s9, s11, s8
+            0xBF06_0B08,                                // s_cmp_eq_u32 s8, s11
+            0xBF84_0000 | (0x1_0000 - head - 1) as u32, // s_cbranch_scc0 again
+            0xBF81_0000,                                // s_endpgm
+        ]);
+        let code: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        // Verify the loop header actually has a mask phi for s[14:15] in st.phi_masks.
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.phis)
+                .any(|phi| phi.reg == Reg::S(14) && st.phi_masks.contains_key(&phi.value)),
+            "expected loop-carried mask phi for s[14:15]"
+        );
+        assert!(find(&p, &st, false).totals.is_empty());
+
+        // Control-dependent mask set inside the body (s_mov_b64 s[14:15], -1) and
+        // read after the loop via v_cndmask_b32 also depends on the own-bit test.
+        let mut w2 = vec![0xBE8E_0480]; // s_mov_b64 s[14:15], 0
+        w2.extend_from_slice(&WAVE_OR_V7_TO_S7);
+        let body2 = [ADD_BIT_NUMBER, 0xBE8E_04C1]; // v_add_nc_u32; s_mov_b64 s[14:15], -1
+        let head2 = 3 + test.len() + 1 + body2.len() + 1 + 3;
+        w2.extend_from_slice(&[
+            0xBF06_8007,
+            0xBF85_0000 | (3 + head2) as u32,
+            0x7E06_0207,
+            0xBF82_0001,
+            0x7E06_0209,
+            0x7E10_0503,
+            0xBE8A_1308,
+            0x8F0B_0A81,
+        ]);
+        w2.extend_from_slice(&test);
+        w2.push(0xBF88_0000 | body2.len() as u32);
+        w2.extend_from_slice(&body2);
+        w2.extend_from_slice(&[
+            0xBEFE_040C,
+            0x8909_080B,
+            0xBF06_0B08,
+            0xBF84_0000 | (0x1_0000 - head2 - 1) as u32,
+            0xD501_0005,
+            cnd, // v_cndmask_b32 v5, 0, v5, s[14:15] after the loop
+            0xBF81_0000,
+        ]);
+        let code2: Vec<u8> = w2.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let p2 = crate::ir::build(&code2, true, 256).unwrap();
+        assert!(found(&p2).totals.is_empty());
+
+        // Direct data-dependent loop-carried mask (v_cmp_ne_u32 vcc, 0, v4 in header,
+        // accumulated into s[14:15] in the latch, consumed in the body).
+        let mut w3 = vec![0xBE8E_0480]; // s_mov_b64 s[14:15], 0
+        w3.extend_from_slice(&WAVE_OR_V7_TO_S7);
+        let test3 = [
+            0x3608_0E0B, // v_and_b32 v4, s11, v7
+            0x7D8A_0880, // v_cmp_ne_u32 vcc, 0, v4
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        ];
+        let body3 = [0xD501_0005, cnd]; // v_cndmask_b32 v5, 0, v5, s[14:15]
+        let latch3 = [0x888E_6A0E]; // s_or_b64 s[14:15], s[14:15], vcc
+        let head3 = 3 + test3.len() + 1 + body3.len() + 1 + latch3.len() + 3;
+        w3.extend_from_slice(&[
+            0xBF06_8007,
+            0xBF85_0000 | (3 + head3) as u32,
+            0x7E06_0207,
+            0xBF82_0001,
+            0x7E06_0209,
+            0x7E10_0503,
+            0xBE8A_1308,
+            0x8F0B_0A81,
+        ]);
+        w3.extend_from_slice(&test3);
+        w3.push(0xBF88_0000 | body3.len() as u32);
+        w3.extend_from_slice(&body3);
+        w3.push(0xBEFE_040C);
+        w3.extend_from_slice(&latch3);
+        w3.extend_from_slice(&[
+            0x8909_080B,
+            0xBF06_0B08,
+            0xBF84_0000 | (0x1_0000 - head3 - 1) as u32,
+            0xBF81_0000,
+        ]);
+        let code3: Vec<u8> = w3.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let p3 = crate::ir::build(&code3, true, 256).unwrap();
+        assert!(
+            p3.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_or_b64")
+        );
+        assert!(found(&p3).totals.is_empty());
     }
 }
