@@ -319,10 +319,15 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
+        let aligned = if attributes >> ALIGNMENT_SHIFT & 0x1f == 21 {
+            PAGES_2M
+        } else {
+            0
+        };
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
-            MEM_RESERVE | MEM_COMMIT,
+            MEM_RESERVE | MEM_COMMIT | aligned,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
@@ -1930,6 +1935,16 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn alloc_32bit_honours_2mib_alignment() {
+        let attributes = (0x15 << ALIGNMENT_SHIFT) | ALLOC_32BIT;
+        let p = XMemAllocDefault(4096, attributes);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % (2 * MIB), 0);
+        assert!((p as usize) < 1 << 32);
+        XMemFreeDefault(p, attributes);
     }
 
     #[test]
