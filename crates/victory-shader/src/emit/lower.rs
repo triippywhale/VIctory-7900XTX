@@ -8305,6 +8305,60 @@ impl<'a> Lower<'a> {
                 let r = self.fmad(a, bb, cc);
                 float(self, r)
             }
+            "v_ldexp_f32" => {
+                // `src0 * 2^src1` (RDNA2 VOP3 0x362).
+                // Follows the default f32 flush-to-zero (FTZ) denormal mode
+                // used by the console and D3D12/DXIL: subnormal inputs
+                // (`exp == 0`) and underflowing results (`exp + delta <= 0`)
+                // flush to signed zero, while `±inf` and NaNs pass through
+                // (with sNaNs quieted).
+                let (x_f, delta) = (f(self, 0)?, s(self, 1)?);
+                let x = self.as_int(x_f);
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (zero, k23, k255, k512, k_neg512) = (
+                    k(self, 0),
+                    k(self, 23),
+                    k(self, 0xFF),
+                    k(self, 512),
+                    k(self, (-512i32) as u32),
+                );
+                let (sign_mask, mant_mask, inf_mask, quiet_bit) = (
+                    k(self, 0x8000_0000),
+                    k(self, 0x007F_FFFF),
+                    k(self, 0x7F80_0000),
+                    k(self, 0x0040_0000),
+                );
+                let sign = self.s.m.bin(c, Bin::And, x, sign_mask);
+                let exp = self.s.m.bin(c, Bin::LShr, x, k23);
+                let exp = self.s.m.bin(c, Bin::And, exp, k255);
+                let mant = self.s.m.bin(c, Bin::And, x, mant_mask);
+
+                // Clamp `delta` to [-512, 512] so `exp + delta` never wraps in i32.
+                let hi = self.s.m.cmp(c, pred::SGT, delta, k512);
+                let d = self.s.m.select(c, hi, k512, delta);
+                let lo = self.s.m.cmp(c, pred::SLT, d, k_neg512);
+                let d = self.s.m.select(c, lo, k_neg512, d);
+                let new_exp = self.s.m.bin(c, Bin::Add, exp, d);
+
+                let underflow = self.s.m.cmp(c, pred::SLE, new_exp, zero);
+                let overflow = self.s.m.cmp(c, pred::SGE, new_exp, k255);
+                let shifted = self.s.m.bin(c, Bin::Shl, new_exp, k23);
+                let normal = self.s.m.bin(c, Bin::Or, sign, shifted);
+                let normal = self.s.m.bin(c, Bin::Or, normal, mant);
+                let signed_inf = self.s.m.bin(c, Bin::Or, sign, inf_mask);
+                let scaled = self.s.m.select(c, underflow, sign, normal);
+                let scaled = self.s.m.select(c, overflow, signed_inf, scaled);
+
+                let is_zero_or_denorm = self.s.m.cmp(c, pred::EQ, exp, zero);
+                let is_inf_or_nan = self.s.m.cmp(c, pred::EQ, exp, k255);
+                let is_nan_mant = self.s.m.cmp(c, pred::NE, mant, zero);
+                let quiet_x = self.s.m.bin(c, Bin::Or, x, quiet_bit);
+                let inf_or_nan = self.s.m.select(c, is_nan_mant, quiet_x, x);
+                let r = self.s.m.select(c, is_zero_or_denorm, sign, scaled);
+                let r = self.s.m.select(c, is_inf_or_nan, inf_or_nan, r);
+                let rf = self.as_float(r);
+                float(self, rf)
+            }
             "v_div_scale_f32" => {
                 // RDNA2 ISA: src0 = value to scale, src1 = denominator, src2 = numerator.
                 let (a, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
