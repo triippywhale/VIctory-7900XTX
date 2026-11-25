@@ -211,20 +211,29 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
-            let mut loaded = vec![
-                (Reg::V(0), Input::VertexId),
-                (Reg::V(2), Input::PrimitiveId),
-                (Reg::V(3), Input::InstanceId),
-            ];
+            // The fetch shader runs before the VS body and overwrites
+            // hardware-initialized VGPRs (v0..v3) when VertexId/InstanceId are
+            // not needed after fetch, so register fetched attributes ahead of
+            // the hardware fallbacks.
+            let mut loaded = Vec::new();
             for i in inputs {
                 for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let vgpr = i
+                        .vgpr
+                        .checked_add(channel)
+                        .ok_or(ShaderError::Malformed("vertex input VGPR out of range"))?;
                     let input = Input::Attribute {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    loaded.push((Reg::V(vgpr), input));
                 }
             }
+            loaded.extend([
+                (Reg::V(0), Input::VertexId),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::InstanceId),
+            ]);
             (loaded, &[][..], &outputs[..])
         }
         // Compute: thread ids in v0-v2, group ids and the group info in the
@@ -915,5 +924,100 @@ mod tests {
                 (3, Input::Position(1)),
             ]
         );
+    }
+
+    #[test]
+    fn vs_fetched_attributes_in_v0_to_v3_override_hardware_ids_and_reject_vgpr_overflow() {
+        use crate::native::VsInput;
+
+        // `exp pos0, v0, v1, v2, v3 done; s_endpgm`
+        let words: &[u32] = &[0xF800_08CF, 0x0302_0100, S_ENDPGM];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+
+        let make_vs = |inputs: Vec<VsInput>| NativeProgram {
+            stage: HwStage::Vs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs,
+                outputs: vec![],
+            },
+            code: code.clone(),
+        };
+
+        // Fetched 4-channel attribute placed at v0..v3 must shadow VertexId,
+        // PrimitiveId, and InstanceId rather than miscompiling them.
+        let io = raise(
+            &p,
+            &make_vs(vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                vgpr: 0,
+            }]),
+        )
+        .unwrap();
+        let mapped: Vec<(Reg, Input)> = p
+            .inputs
+            .iter()
+            .filter_map(|&(r, v)| io.inputs.iter().find(|&&(iv, _)| iv == v).map(|&(_, inp)| (r, inp)))
+            .collect();
+        assert_eq!(
+            mapped,
+            vec![
+                (Reg::V(0), Input::Attribute { row: 0, channel: 0 }),
+                (Reg::V(1), Input::Attribute { row: 0, channel: 1 }),
+                (Reg::V(2), Input::Attribute { row: 0, channel: 2 }),
+                (Reg::V(3), Input::Attribute { row: 0, channel: 3 }),
+            ]
+        );
+
+        // Unclaimed v0/v2/v3 still fall back to VertexId/PrimitiveId/InstanceId.
+        let io_fallback = raise(
+            &p,
+            &make_vs(vec![VsInput {
+                usage: Usage::Generic,
+                row: 1,
+                mask: 0b0001,
+                vgpr: 1,
+            }]),
+        )
+        .unwrap();
+        let mapped_fb: Vec<(Reg, Input)> = p
+            .inputs
+            .iter()
+            .filter_map(|&(r, v)| {
+                io_fallback
+                    .inputs
+                    .iter()
+                    .find(|&&(iv, _)| iv == v)
+                    .map(|&(_, inp)| (r, inp))
+            })
+            .collect();
+        assert_eq!(
+            mapped_fb,
+            vec![
+                (Reg::V(0), Input::VertexId),
+                (Reg::V(1), Input::Attribute { row: 1, channel: 0 }),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::InstanceId),
+            ]
+        );
+
+        // Malformed VGPR >= 253 with upper channel bit set must error instead of overflowing u8.
+        let err = raise(
+            &p,
+            &make_vs(vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                vgpr: 254,
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(err, ShaderError::Malformed("vertex input VGPR out of range"));
     }
 }

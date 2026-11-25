@@ -342,7 +342,7 @@ impl ComputeIo {
 
     /// Thread id components in v0, v1, v2 (1 to 3).
     pub fn thread_id_vgprs(&self) -> u8 {
-        (self.rsrc2 >> 11 & 3) as u8 + 1
+        ((self.rsrc2 >> 11 & 3) as u8).min(2) + 1
     }
 
     /// LDS bytes per thread group (512-byte granules).
@@ -1250,5 +1250,16 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    #[test]
+    fn compute_thread_id_vgprs_is_clamped_to_three_dimensions() {
+        for (field, expected) in [(0u32, 1u8), (1, 2), (2, 3), (3, 3)] {
+            let cs = ComputeIo {
+                threads: [1, 1, 1],
+                rsrc2: field << 11,
+            };
+            assert_eq!(cs.thread_id_vgprs(), expected, "TIDIG_COMP_CNT={field}");
+        }
     }
 }
