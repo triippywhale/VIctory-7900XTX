@@ -2498,6 +2498,14 @@ impl Drop for Shadow {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
+            // The heap goes once the submissions running now have finished
+            // (`crate::host::retire`), not in the same breath as the copy:
+            // one of them may still read through it (HailLucifer666,
+            // fxceless/victory-fork#943). The buffer placed in it is a field,
+            // dropped after this returns, so it goes first.
+            if let Some((heap, _bias)) = self.place.take() {
+                crate::host::retire(heap);
+            }
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
