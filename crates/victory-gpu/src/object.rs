@@ -68,14 +68,22 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    let refs = &unsafe { &*this }.refs;
+    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        Ok(n) => n + 1,
+        Err(n) => n,
+    }
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
-    let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
-    refs.load(Ordering::Relaxed)
+    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        (n != u32::MAX).then(|| n.checked_sub(1)).flatten()
+    }) {
+        Ok(n) => n - 1,
+        Err(n) => n,
+    }
 }
 
 /// Answers an interface query (or any call handing out an object): a new
@@ -134,7 +142,9 @@ pub(crate) fn hand_out<T>(
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
-    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
+    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n != u32::MAX).then(|| n.checked_sub(1)).flatten()
+    }) {
         Ok(1) => {
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
@@ -151,7 +161,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
             0
         }
         Ok(n) => n - 1,
-        Err(_) => 0,
+        Err(n) => n,
     }
 }
 
@@ -560,5 +570,103 @@ mod tests {
         );
         assert!(found.is_null());
         slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    #[test]
+    fn add_ref_saturates_at_u32_max_without_wrapping() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[repr(C)]
+        struct Tracked {
+            object: Object,
+            dropped: Rc<Cell<usize>>,
+        }
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.dropped.set(self.dropped.get() + 1);
+            }
+        }
+
+        extern "system" fn release_tracked(this: This) -> u32 {
+            release_boxed::<Tracked>(this)
+        }
+
+        static BOXED_TABLE: Table<3> = {
+            let mut f = missing_table::<DEVICE, 3>();
+            f[2] = release_tracked as *const ();
+            Table(f)
+        };
+        static STATIC_TABLE: Table<3> = Table(missing_table::<DEVICE, 3>());
+
+        let dropped = Rc::new(Cell::new(0));
+        let mut boxed = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                DEVICE,
+                Box::new(Tracked {
+                    object: Object::new(&BOXED_TABLE),
+                    dropped: dropped.clone(),
+                }),
+                &TAG,
+                &[TAG],
+                &mut boxed,
+            ),
+            S_OK
+        );
+
+        let add = slot::<extern "system" fn(This) -> u32>(boxed, 0x08);
+        let rel = slot::<extern "system" fn(This) -> u32>(boxed, 0x10);
+
+        // Normal add/release below saturation, then sticky saturation at `u32::MAX`
+        // (including `answer` handing out an interface reference while saturated).
+        // SAFETY: `boxed` is the live `Tracked` header created above.
+        let refs = &unsafe { &*boxed }.refs;
+        refs.store(u32::MAX - 2, Ordering::Relaxed);
+        assert_eq!(add(boxed), u32::MAX - 1);
+        assert_eq!(rel(boxed), u32::MAX - 2);
+        assert_eq!(add(boxed), u32::MAX - 1);
+        assert_eq!(add(boxed), u32::MAX);
+        let mut queried = std::ptr::null();
+        assert_eq!(answer(DEVICE, &TAG, Some(boxed), &mut queried), S_OK);
+        assert_eq!(queried, boxed);
+        assert_eq!(add(boxed), u32::MAX);
+        assert_eq!(rel(queried), u32::MAX);
+        assert_eq!(rel(boxed), u32::MAX);
+        assert_eq!(dropped.get(), 0);
+
+        // Ordinary final release on a non-saturated boxed object frees it.
+        let mut mortal = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                DEVICE,
+                Box::new(Tracked {
+                    object: Object::new(&BOXED_TABLE),
+                    dropped: dropped.clone(),
+                }),
+                &TAG,
+                &[TAG],
+                &mut mortal,
+            ),
+            S_OK
+        );
+        assert_eq!(rel(mortal), 0);
+        assert_eq!(dropped.get(), 1);
+        // Clean up the intentionally leaked saturated allocation in the test.
+        // SAFETY: `boxed` was never freed because saturation is sticky.
+        drop(unsafe { Box::from_raw(boxed.cast_mut().cast::<Tracked>()) });
+        assert_eq!(dropped.get(), 2);
+
+        // Static object path (`release` floors at zero and stays sticky at `u32::MAX`).
+        let fixed = Object::new(&STATIC_TABLE);
+        let fixed_ptr: This = &raw const fixed;
+        let fixed_add = slot::<extern "system" fn(This) -> u32>(fixed_ptr, 0x08);
+        let fixed_rel = slot::<extern "system" fn(This) -> u32>(fixed_ptr, 0x10);
+        assert_eq!(fixed_rel(fixed_ptr), 0);
+        fixed.refs.store(u32::MAX - 1, Ordering::Relaxed);
+        assert_eq!(fixed_add(fixed_ptr), u32::MAX);
+        assert_eq!(fixed_add(fixed_ptr), u32::MAX);
+        assert_eq!(fixed_rel(fixed_ptr), u32::MAX);
     }
 }
