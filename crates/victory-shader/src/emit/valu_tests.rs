@@ -2492,6 +2492,115 @@ fn movrel_masks_m0_to_8_bits_and_allows_non_vgpr_src0() {
             got, want,
             "{backend}: v_movrelsd_b32(m0={:#010x}, read={:#010x}) = {got:#x}, want {want:#x}",
             inp[0], inp[3],
+/// SOPK `op sdst, simm16`.
+const fn sopk(op: u8, sdst: u8, simm16: i16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | (simm16 as u16) as u32
+}
+
+#[test]
+fn signed_scalar_add_sub_scc_matches_rdna2() {
+    // s_add_i32 s6, s0, s1 (SOP2 0x02); s_cselect_b32 s7, 1, 0 (SOP2 0x0A); v_mov_b32 v0, s7
+    let add_scc = build_valu_cs(&[
+        sop2(0x02, 6, 0, 1),
+        sop2(0x0A, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    // s_sub_i32 s6, s0, s1 (SOP2 0x03); s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7
+    let sub_scc = build_valu_cs(&[
+        sop2(0x03, 6, 0, 1),
+        sop2(0x0A, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    // s_mov_b32 s6, s0; s_addk_i32 s6, +1 (SOPK 0x0F); s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7
+    let addk_pos1 = build_valu_cs(&[
+        s_mov_b32(6, 0),
+        sopk(0x0F, 6, 1),
+        sop2(0x0A, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    // s_mov_b32 s6, s0; s_addk_i32 s6, -32768 (SOPK 0x0F); s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7
+    let addk_neg_min = build_valu_cs(&[
+        s_mov_b32(6, 0),
+        sopk(0x0F, 6, i16::MIN),
+        sop2(0x0A, 7, 0x81, 0x80),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+
+    let add_cases: &[(i32, i32)] = &[
+        (0, 0),
+        (10, 20),
+        (-1, 1), // unsigned carry, no signed overflow
+        (i32::MAX, 0),
+        (i32::MAX, 1),        // positive overflow
+        (i32::MAX, i32::MAX), // positive overflow
+        (i32::MIN, 0),
+        (i32::MIN, -1),       // negative overflow
+        (i32::MIN, i32::MIN), // negative overflow (result 0)
+        (i32::MIN, i32::MAX), // -1, no overflow
+    ];
+    let add_in: Vec<[u32; 4]> = add_cases
+        .iter()
+        .map(|&(a, b)| [a as u32, b as u32, 0, 0])
+        .collect();
+    run_cases(&add_scc, &add_in, |backend, i, _, got| {
+        let (a, b) = add_cases[i];
+        let want = u32::from(a.overflowing_add(b).1);
+        assert_eq!(
+            got, want,
+            "{backend}: s_add_i32({a}, {b}) SCC = {got}, want {want}",
+        );
+    });
+
+    let sub_cases: &[(i32, i32)] = &[
+        (0, 0),
+        (0, 1),        // unsigned borrow, no signed overflow
+        (0, i32::MIN), // 0 - (-2^31) overflows i32
+        (i32::MIN, 0),
+        (i32::MIN, 1),        // negative overflow
+        (i32::MIN, i32::MIN), // 0, no overflow
+        (i32::MAX, -1),       // positive overflow
+        (i32::MAX, i32::MIN), // positive overflow
+        (-5, -3),             // -2, no overflow
+        (-1, i32::MAX),       // -2^31 (i32::MIN), no overflow
+    ];
+    let sub_in: Vec<[u32; 4]> = sub_cases
+        .iter()
+        .map(|&(a, b)| [a as u32, b as u32, 0, 0])
+        .collect();
+    run_cases(&sub_scc, &sub_in, |backend, i, _, got| {
+        let (a, b) = sub_cases[i];
+        let want = u32::from(a.overflowing_sub(b).1);
+        assert_eq!(
+            got, want,
+            "{backend}: s_sub_i32({a}, {b}) SCC = {got}, want {want}",
+        );
+    });
+
+    let addk_pos_cases: &[i32] = &[0, -1, i32::MAX - 1, i32::MAX, i32::MIN];
+    let addk_pos_in: Vec<[u32; 4]> = addk_pos_cases
+        .iter()
+        .map(|&a| [a as u32, 0, 0, 0])
+        .collect();
+    run_cases(&addk_pos1, &addk_pos_in, |backend, i, _, got| {
+        let a = addk_pos_cases[i];
+        let want = u32::from(a.overflowing_add(1).1);
+        assert_eq!(
+            got, want,
+            "{backend}: s_addk_i32({a}, +1) SCC = {got}, want {want}",
+        );
+    });
+
+    let addk_neg_cases: &[i32] = &[0, i32::MAX, i32::MIN + 32768, i32::MIN + 32767, i32::MIN];
+    let addk_neg_in: Vec<[u32; 4]> = addk_neg_cases
+        .iter()
+        .map(|&a| [a as u32, 0, 0, 0])
+        .collect();
+    run_cases(&addk_neg_min, &addk_neg_in, |backend, i, _, got| {
+        let a = addk_neg_cases[i];
+        let want = u32::from(a.overflowing_add(i32::from(i16::MIN)).1);
+        assert_eq!(
+            got, want,
+            "{backend}: s_addk_i32({a}, -32768) SCC = {got}, want {want}",
         );
     });
 }
