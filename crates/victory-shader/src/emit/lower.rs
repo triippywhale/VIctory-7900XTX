@@ -5783,6 +5783,16 @@ impl<'a> Lower<'a> {
                 l.s.m.cmp(c, pred::NE, o, z)
             };
             return match name {
+                "s_wqm_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let low = self.expand_quads(a);
+                    let high = self.expand_quads(b);
+                    self.set(lo, Val::I32(low));
+                    self.set(hi, Val::I32(high));
+                    let s = nonzero(self, low, high);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
                 "s_quadmask_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let low = self.quad_mask(a);
@@ -5922,6 +5932,10 @@ impl<'a> Lower<'a> {
         let (r, carry): (V, Option<V>) = match name {
             "s_mov_b32" => (src32(self, 0)?, None),
             "s_movk_i32" => (sext16(self), None),
+            "s_wqm_b32" => {
+                let pixels = src32(self, 0)?;
+                (self.expand_quads(pixels), None)
+            }
             "s_quadmask_b32" => {
                 let pixels = src32(self, 0)?;
                 (self.quad_mask(pixels), None)
@@ -6146,6 +6160,26 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// Sets all four bits in each quad that has any bit set.
+    fn expand_quads(&mut self, mut mask: V) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        // Spread within each pair, then between the two pairs of each quad.
+        for (distance, upper, lower) in
+            [(1, 0xaaaa_aaaa, 0x5555_5555), (2, 0xcccc_cccc, 0x3333_3333)]
+        {
+            let distance = m.i32(distance);
+            let (upper, lower) = (m.i32(upper), m.i32(lower));
+            let upper = m.bin(c, Bin::And, mask, upper);
+            let lower = m.bin(c, Bin::And, mask, lower);
+            let down = m.bin(c, Bin::LShr, upper, distance);
+            let up = m.bin(c, Bin::Shl, lower, distance);
+            let spread = m.bin(c, Bin::Or, down, up);
+            mask = m.bin(c, Bin::Or, mask, spread);
+        }
+        mask
     }
 
     /// Packs whether each consecutive group of four pixels has a set bit.

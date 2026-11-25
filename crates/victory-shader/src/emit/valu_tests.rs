@@ -2647,3 +2647,82 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn scalar_wqm_ir_tracks_register_widths_and_scc() {
+    for (word, name, dwords) in [
+        (0xBE90_0900u32, "s_wqm_b32", 1),
+        (0xBE90_0A00, "s_wqm_b64", 2),
+    ] {
+        let code: Vec<u8> = [word, S_ENDPGM]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let program = ir::build(&code, false, 16).expect("WQM IR");
+        let inst = &program.blocks[0].insts[0];
+        assert_eq!(inst.name(), name);
+        assert_eq!(inst.reads.len(), usize::from(dwords));
+        assert_eq!(inst.writes.len(), usize::from(dwords) + 1);
+        for half in 0..dwords {
+            assert!(
+                inst.read(ir::Reg::S(half)).is_some(),
+                "{name}: source {half}"
+            );
+            assert!(
+                inst.write(ir::Reg::S(16 + half)).is_some(),
+                "{name}: destination {half}"
+            );
+        }
+        assert!(inst.write(ir::Reg::Scc).is_some(), "{name}: SCC");
+    }
+}
+
+#[test]
+fn scalar_wqm_expands_nibbles_and_sets_scc() {
+    if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+        validator::Validator::load(Some(std::path::Path::new(&path)))
+            .expect("load explicitly configured DXIL validator");
+    }
+
+    // Each case lists [source low, source high] and [result low, result high, SCC].
+    let narrow = [
+        ([0, 0], [0, 0, 0]),
+        ([0x0000_0001, 0], [0x0000_000F, 0, 1]),
+        ([0x0000_0020, 0], [0x0000_00F0, 0, 1]),
+        ([0x0000_0400, 0], [0x0000_0F00, 0, 1]),
+        ([0x8000_0000, 0], [0xF000_0000, 0, 1]),
+        ([0x1020_4080, 0], [0xF0F0_F0F0, 0, 1]),
+        ([u32::MAX, 0], [u32::MAX, 0, 1]),
+    ];
+    let wide = [
+        ([0, 0], [0, 0, 0]),
+        ([0x0000_0001, 0], [0x0000_000F, 0, 1]),
+        ([0, 0x0000_0001], [0, 0x0000_000F, 1]),
+        ([0x8000_0001, 0x0040_0020], [0xF000_000F, 0x00F0_00F0, 1]),
+        ([u32::MAX, u32::MAX], [u32::MAX, u32::MAX, 1]),
+        ([0x7654_3210, 0xFEDC_BA98], [0xFFFF_FFF0, u32::MAX, 1]),
+    ];
+    for (word, cases, outputs) in [
+        (0xBE90_0900, narrow.as_slice(), &[0, 2][..]), // s_wqm_b32 s16, s0
+        (0xBE90_0A00, wide.as_slice(), &[0, 1, 2][..]), // s_wqm_b64 s[16:17], s[0:1]
+    ] {
+        let inputs: Vec<_> = cases.iter().map(|&([lo, hi], _)| [lo, hi, 0, 0]).collect();
+        for &output in outputs {
+            let shader = build_valu_cs(&[
+                word,
+                sop2(0x0a, 18, 129, 128), // s_cselect_b32 s18, 1, 0
+                vop1(1, 0, sgpr(16 + output as u8)),
+            ]);
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let sfi0 = container.part(crate::FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "WQM must not require Int64");
+            run_cases(&shader, &inputs, |backend, i, input, got| {
+                assert_eq!(
+                    got, cases[i].1[output],
+                    "{backend}: {word:#x}, {input:08x?}, output {output}"
+                );
+            });
+        }
+    }
+}
