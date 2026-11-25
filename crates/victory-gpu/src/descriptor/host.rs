@@ -40,23 +40,32 @@ impl Slots {
         })
     }
 
-    fn of(n: usize, mut bits: u64, out: &mut Vec<u32>, which: &impl Fn(u32) -> bool) {
+    fn of(n: usize, mut bits: u64, out: &mut Vec<u32>) {
         while bits != 0 {
-            let slot = n as u32 * 64 + bits.trailing_zeros();
+            out.push(n as u32 * 64 + bits.trailing_zeros());
             bits &= bits - 1;
-            if which(slot) {
-                out.push(slot);
-            }
         }
     }
 
-    /// Those that `which` says, in order.
-    fn all(&self, which: impl Fn(u32) -> bool) -> Vec<u32> {
+    /// The set slots selected by the same mask in each 64-slot word, in order.
+    fn all(&self, mask: u64) -> Vec<u32> {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
-            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire), &mut out, &which);
+            Self::of(n, bits.load(std::sync::atomic::Ordering::Acquire) & mask, &mut out);
         }
         out
+    }
+
+    /// One part of a round-robin scan. The pattern repeats at every word boundary.
+    fn part<const PARTS: u32>(&self, part: u32) -> Vec<u32> {
+        const { assert!(PARTS > 0 && u64::BITS % PARTS == 0) };
+        if part >= PARTS {
+            return Vec::new();
+        }
+        let mask = (part..u64::BITS)
+            .step_by(PARTS as usize)
+            .fold(0, |mask, bit| mask | (1 << bit));
+        self.all(mask)
     }
 
     /// All of them, and none is left.
@@ -65,7 +74,7 @@ impl Slots {
         let mut out = Vec::new();
         for (n, bits) in self.0.iter().enumerate() {
             if bits.load(Acquire) != 0 {
-                Self::of(n, bits.swap(0, AcqRel), &mut out, &|_| true);
+                Self::of(n, bits.swap(0, AcqRel), &mut out);
             }
         }
         out
@@ -2573,13 +2582,13 @@ impl HostHeap {
 
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
-        self.buffers.all(|_| true)
+        self.buffers.all(u64::MAX)
     }
 
-    /// Of [`HostHeap::buffer_slots`], those of one of `parts` parts: every
+    /// Of [`HostHeap::buffer_slots`], those of one of `PARTS` parts: every
     /// slot is in the same part each time.
-    pub(crate) fn buffer_slots_of(&self, part: u32, parts: u32) -> Vec<u32> {
-        self.buffers.all(|slot| slot % parts == part)
+    pub(crate) fn buffer_slots_of<const PARTS: u32>(&self, part: u32) -> Vec<u32> {
+        self.buffers.part::<PARTS>(part)
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -5711,11 +5720,26 @@ mod tests {
         for slot in [199, 0, 64, 63, 130, 64] {
             set.put(slot);
         }
-        assert_eq!(set.all(|_| true), [0, 63, 64, 130, 199]);
-        assert_eq!(set.all(|slot| slot % 2 == 0), [0, 64, 130]);
+        assert_eq!(set.all(u64::MAX), [0, 63, 64, 130, 199]);
+        assert_eq!(set.part::<2>(0), [0, 64, 130]);
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    #[test]
+    fn spread_scan_visits_each_live_slot_in_its_original_part() {
+        let set = Slots::new(201);
+        let live: Vec<u32> = (0..201).filter(|slot| slot % 5 != 2).collect();
+        for &slot in &live {
+            set.put(slot);
+        }
+        for part in 0..16 {
+            let expected: Vec<_> = live.iter().copied().filter(|slot| slot % 16 == part).collect();
+            assert_eq!(set.part::<16>(part), expected);
+        }
+        assert!(set.part::<16>(16).is_empty());
+        assert_eq!(set.take(), live);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
