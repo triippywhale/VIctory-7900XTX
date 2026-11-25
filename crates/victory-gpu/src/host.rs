@@ -139,15 +139,16 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit headroom in bytes, from
+/// `GlobalMemoryStatusEx`.
+pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -429,6 +430,36 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     } else {
         NORMAL_MS
     }
+}
+
+/// Idle timeout for system-RAM caches when commit headroom is low.
+/// `ullAvailPageFile` is the remaining system commit capacity; physical RAM
+/// can still be available after the commit limit has nearly been reached.
+pub(crate) fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let Some(avail) = avail_commit else {
+        return 10_000;
+    };
+    if avail < 512 * MIB {
+        250
+    } else if avail < GIB {
+        500
+    } else if avail < 2 * GIB {
+        1_000
+    } else if avail < 4 * GIB {
+        2_500
+    } else {
+        10_000
+    }
+}
+
+/// Effective idle timeout for caches backed by system memory.
+pub(crate) fn system_ram_idle_ms(available: Option<(u64, u64)>) -> u64 {
+    let Some((avail_phys, avail_commit)) = available else {
+        return ram_idle_ms(None).min(commit_idle_ms(None));
+    };
+    ram_idle_ms(Some(avail_phys)).min(commit_idle_ms(Some(avail_commit)))
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -10590,6 +10621,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn commit_idle_ms_scales_with_commit_headroom() {
+        use super::commit_idle_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(commit_idle_ms(Some(4 * gib)), 10_000);
+        assert_eq!(commit_idle_ms(Some(2 * gib)), 2_500);
+        assert_eq!(commit_idle_ms(Some(gib)), 1_000);
+        assert_eq!(commit_idle_ms(Some(903 * mib)), 500);
+        assert_eq!(commit_idle_ms(Some(267 * mib)), 250);
+        assert_eq!(commit_idle_ms(Some(0)), 250);
+        assert_eq!(commit_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn system_ram_idle_ms_responds_to_commit_pressure() {
+        use super::system_ram_idle_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let enough_memory = Some((8 * gib, 8 * gib));
+        let low_commit = Some((4 * gib, 903 * mib));
+        assert_eq!(system_ram_idle_ms(enough_memory), 10_000);
+        // The failing run had substantial physical RAM available, but less
+        // than 1 GiB left to commit.
+        assert_eq!(system_ram_idle_ms(low_commit), 500);
     }
 }
 

@@ -2047,6 +2047,15 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // The copies count against what the PC can commit too: with under a
+    // gibibyte of that left, the idle ones go whatever room the card has
+    // (after DexNom PR #43, 1a82816, which shortens the time from 4 GiB on:
+    // here that is most of a session, and what goes at 2.5 s is made again,
+    // see `crate::host::vram_keep`).
+    let commit_ms = crate::host::commit_idle_ms(crate::host::available_system_memory().map(|m| m.1));
+    // (Never under a second: handles not yet recorded into a list or slot
+    // stay protected, as `crate::host::vram_idle_ms` says.)
+    let (idle_ms, most) = if commit_ms <= 500 { (idle_ms.min(1_000), u64::MAX) } else { (idle_ms, most) };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
