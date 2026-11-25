@@ -1410,6 +1410,13 @@ impl<'a> Lower<'a> {
             db_shader_control, ..
         } = &x.native.io
             && db_shader_control & DEPTH_BEFORE_SHADER != 0
+            // Not for a program that exports depth, stencil or coverage
+            // (Z_EXPORT_ENABLE, STENCIL_TEST_VAL/OP_VAL_EXPORT_ENABLE, bits
+            // 0-2, and COVERAGE_TO_MASK... bit 8 of the register; or such
+            // an output): the host cannot test before a program that writes
+            // them (fxceless/victory-fork#907).
+            && db_shader_control & (0b111 | 1 << 8) == 0
+            && !x.outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
         {
             s.flags |= flags::EARLY_DEPTH;
         }
@@ -10035,7 +10042,18 @@ impl<'a> Lower<'a> {
             x
         };
         let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+        let x = self.s.m.bin(c, Bin::And, x, m);
+        // An integer operation's neg modifier on this half's operand: high
+        // halves take neg_hi, low halves neg; the two's complement wraps to
+        // 16 bits (fxceless/victory-fork#890). Float halves take theirs in
+        // `packed16`, after the conversion.
+        let neg = if high { v.neg_hi } else { v.neg };
+        if !float && neg >> k & 1 != 0 {
+            let z = self.s.m.i32(0);
+            let x = self.s.m.bin(c, Bin::Sub, z, x);
+            return Ok(self.s.m.bin(c, Bin::And, x, m));
+        }
+        Ok(x)
     }
 
     /// Half `high` of source `k` of `v_pk_fmac_f16`, in the low 16 bits: a
@@ -10076,7 +10094,9 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        // An integer operation's neg (per half) is applied in `packed_src`;
+        // the clamp and the output modifier are not lowered yet.
+        if v.omod != 0 || !float && v.clamp {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
