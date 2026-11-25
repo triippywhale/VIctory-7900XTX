@@ -359,6 +359,12 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// The first dword of the scatter's scratch, a dword per lane of every console wave in the
+    /// group (`ds_permute_b32`), allocated past the program's LDS.
+    scatter: Option<u32>,
+    /// Per IR block, whether every lane runs it ([`all_lane_blocks`]); none without a computable
+    /// flow (an indirect exit). A scatter's barriers need it.
+    lane_blocks: Option<Vec<bool>>,
     wave_base: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
@@ -1396,9 +1402,18 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // the scatter's scratch base (`ds_permute_b32`)
+        let mut scatter: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            // The scatter's scratch: a dword per lane of every console wave
+            // in the group, past the program's LDS. (The zero-initialized
+            // `tmp` of the ISA's ds_permute_b32; see its lowering in `ds`.)
+            if insts().any(|i| i.name() == "ds_permute_b32") {
+                scatter = Some(s.lds_dwords);
+                s.lds_dwords += 64 * cs.threads.iter().product::<u32>().div_ceil(64);
+            }
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1691,6 +1706,8 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            scatter,
+            lane_blocks: all_lane_blocks(x.st),
             wave_base: None,
             flat: None,
             no_barrier,
@@ -4344,6 +4361,7 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        eprintln!("GUARD b {b} i {i} -> {:?}", self.x.st.guards[b][i]);
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
@@ -4998,6 +5016,56 @@ impl<'a> Lower<'a> {
             };
             let r = self.read_lane(x, src);
             let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
+        if name == "ds_permute_b32" {
+            // A scatter: each lane gives its data register to the lane its
+            // address plus the offset names in dwords, within the calling
+            // lane's 32-lane half (the ISA confines the permute there in
+            // wave64). The console writes a scratch that starts at zero and
+            // each active destination lane reads its own slot, so a
+            // destination nobody targets reads zero. The lowering zeroes the
+            // calling lane's slot, runs a group barrier, has every lane
+            // write the slot its address names, runs another barrier, and
+            // reads the calling lane's slot. A barrier needs every lane: in
+            // a block some lanes leave, this refuses (a wave-wide
+            // structuring of the block would open it).
+            match &self.lane_blocks {
+                Some(all) if all[b] => {}
+                _ => return Err("a scatter permute in a branch"),
+            }
+            let scatter = self.scatter.expect("allocated with ds_permute_b32");
+            let x = self.vgprs(inst, data.first().ok_or("a scatter source")?, 1)?[0];
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a scatter address")?, 1)?[0];
+            let c = self.cur;
+            let o = self.s.m.i32(offset);
+            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let two = self.s.m.i32(2);
+            let idx = self.s.m.bin(c, Bin::LShr, at, two);
+            let thirty = self.s.m.i32(31);
+            let idx = self.s.m.bin(c, Bin::And, idx, thirty);
+            // The scratch is addressed by the console thread: every console
+            // wave of the group owns 64 consecutive dwords, so the two host
+            // waves of a split console wave never hit the same slot, and a
+            // lane names its own half.
+            let thread = self.console_thread();
+            let not_thirty = self.s.m.i32(!31);
+            let half = self.s.m.bin(c, Bin::And, thread, not_thirty);
+            let named = self.s.m.bin(c, Bin::Or, half, idx);
+            let lds = self.s.lds();
+            let k = self.s.m.i32(scatter);
+            let mine = self.s.m.bin(c, Bin::Add, k, thread);
+            let named = self.s.m.bin(c, Bin::Add, k, named);
+            let mine = self.s.m.element(c, lds, mine);
+            let named = self.s.m.element(c, lds, named);
+            let z = self.s.m.i32(0);
+            self.s.m.store(c, mine, z);
+            self.group_sync(c);
+            self.s.m.store(c, named, x);
+            self.group_sync(c);
+            let r = self.s.m.load(c, mine);
+            let reg = dst_reg.ok_or("a scatter result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }

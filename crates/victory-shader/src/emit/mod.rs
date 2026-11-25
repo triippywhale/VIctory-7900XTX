@@ -1509,6 +1509,33 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `ds_permute_b32` scatters through the console's zero-initialized
+    /// scratch: each lane gives its data register to the lane its address
+    /// names, within the calling lane's 32-lane half, and reads the slot of
+    /// its own name. It stopped as "an LDS operation".
+    #[test]
+    fn a_scatter_permute_writes_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// The scatter's barriers need every lane of the group: in a branch
+    /// this refuses (a wave-wide structuring of the block would open it).
+    #[test]
+    fn a_scatter_permute_in_a_branch_is_refused() {
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
+            0xBF88_0002, // s_cbranch_execz 2
+            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+            0x0100_0200,
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        ];
+        let e = stores_v1(&body).unwrap_err().to_string();
+        assert!(e.contains("a scatter permute in a branch"), "{e}");
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
