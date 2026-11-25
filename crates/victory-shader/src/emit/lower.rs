@@ -11849,20 +11849,39 @@ impl<'a> Lower<'a> {
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
-        // DXIL atomic operations: add, and, or, xor, signed and unsigned
-        // min and max, exchange; compare-exchange apart.
+        // DXIL atomic operations: direct `atomicBinOp` / `atomicCompareExchange`,
+        // or CAS loops for operations DXIL has no native op for.
+        #[derive(Clone, Copy)]
+        enum BufferAtomic {
+            BinOp(u32),
+            Sub,
+            CSub,
+            Inc,
+            Dec,
+            CmpSwap,
+            FCmpSwap,
+            FMin,
+            FMax,
+        }
         let atomic = match name.strip_prefix("buffer_atomic_") {
             None => None,
-            Some("add") => Some(0),
-            Some("and") => Some(1),
-            Some("or") => Some(2),
-            Some("xor") => Some(3),
-            Some("smin") => Some(4),
-            Some("smax") => Some(5),
-            Some("umin") => Some(6),
-            Some("umax") => Some(7),
-            Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
+            Some("add") => Some(BufferAtomic::BinOp(0)),
+            Some("and") => Some(BufferAtomic::BinOp(1)),
+            Some("or") => Some(BufferAtomic::BinOp(2)),
+            Some("xor") => Some(BufferAtomic::BinOp(3)),
+            Some("smin") => Some(BufferAtomic::BinOp(4)),
+            Some("smax") => Some(BufferAtomic::BinOp(5)),
+            Some("umin") => Some(BufferAtomic::BinOp(6)),
+            Some("umax") => Some(BufferAtomic::BinOp(7)),
+            Some("swap") => Some(BufferAtomic::BinOp(8)),
+            Some("sub") => Some(BufferAtomic::Sub),
+            Some("csub") => Some(BufferAtomic::CSub),
+            Some("inc") => Some(BufferAtomic::Inc),
+            Some("dec") => Some(BufferAtomic::Dec),
+            Some("cmpswap") => Some(BufferAtomic::CmpSwap),
+            Some("fcmpswap") => Some(BufferAtomic::FCmpSwap),
+            Some("fmin") => Some(BufferAtomic::FMin),
+            Some("fmax") => Some(BufferAtomic::FMax),
             Some(_) => return Err(name),
         };
         // Byte and 16-bit accesses: bits, and whether a load sign-extends.
@@ -12082,7 +12101,8 @@ impl<'a> Lower<'a> {
         }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let two = matches!(op, BufferAtomic::CmpSwap | BufferAtomic::FCmpSwap);
+            let vals = self.vgprs(inst, d, if two { 2 } else { 1 })?;
             let (h, coords) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
@@ -12109,25 +12129,108 @@ impl<'a> Lower<'a> {
             };
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let buf_cas = |l: &mut Self, cmp: V, new: V| {
                 let mut args = vec![h];
                 args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
+                args.extend([cmp, new]);
+                l.s.op(
+                    l.cur,
                     "atomicCompareExchange.i32",
                     Attr::NoUnwind,
                     i32t,
                     79,
                     &args,
                 )
-            } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            };
+            let r = match op {
+                BufferAtomic::BinOp(code) => {
+                    let mut args = vec![h, self.s.m.i32(code)];
+                    args.extend(coords);
+                    args.push(vals[0]);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                }
+                BufferAtomic::Sub => {
+                    let zero = self.s.m.i32(0);
+                    let neg = self.s.m.bin(self.cur, Bin::Sub, zero, vals[0]);
+                    let mut args = vec![h, self.s.m.i32(0)];
+                    args.extend(coords);
+                    args.push(neg);
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                }
+                BufferAtomic::CmpSwap => {
+                    // cmpswap: data is (new, compare).
+                    buf_cas(self, vals[1], vals[0])
+                }
+                BufferAtomic::FCmpSwap => {
+                    // fcmpswap: data is (new, compare), IEEE-754 float equality.
+                    let zero = self.s.m.i32(0);
+                    let pre = self.cur;
+                    let init = buf_cas(self, zero, zero);
+                    let (lp, swap, exit) = (
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                    );
+                    self.s.m.terminate(pre, Term::Br(lp));
+                    let old_v = self.s.m.phi(lp, i32t);
+                    self.cur = lp;
+                    let old_f = self.as_float(old_v);
+                    let cmp_f = self.as_float(vals[1]);
+                    let eq = self.s.m.cmp(lp, pred::OEQ, old_f, cmp_f);
+                    self.s.m.terminate(lp, Term::CondBr(eq, swap, exit));
+                    self.cur = swap;
+                    let prev = buf_cas(self, old_v, vals[0]);
+                    let done = self.s.m.cmp(swap, pred::EQ, prev, old_v);
+                    self.s.m.set_phi(old_v, vec![(init, pre), (prev, swap)]);
+                    self.s.m.terminate(swap, Term::CondBr(done, exit, lp));
+                    self.cur = exit;
+                    old_v
+                }
+                BufferAtomic::CSub
+                | BufferAtomic::Inc
+                | BufferAtomic::Dec
+                | BufferAtomic::FMin
+                | BufferAtomic::FMax => {
+                    let zero = self.s.m.i32(0);
+                    let pre = self.cur;
+                    let init = buf_cas(self, zero, zero);
+                    let (lp, exit) = (self.s.m.new_block(), self.s.m.new_block());
+                    self.s.m.terminate(pre, Term::Br(lp));
+                    let old_v = self.s.m.phi(lp, i32t);
+                    self.cur = lp;
+                    let new_v = match op {
+                        BufferAtomic::CSub => {
+                            let ge = self.s.m.cmp(lp, pred::IUGE, old_v, vals[0]);
+                            let diff = self.s.m.bin(lp, Bin::Sub, old_v, vals[0]);
+                            self.s.m.select(lp, ge, diff, zero)
+                        }
+                        BufferAtomic::Inc => {
+                            let one = self.s.m.i32(1);
+                            let ge = self.s.m.cmp(lp, pred::IUGE, old_v, vals[0]);
+                            let inc = self.s.m.bin(lp, Bin::Add, old_v, one);
+                            self.s.m.select(lp, ge, zero, inc)
+                        }
+                        BufferAtomic::Dec => {
+                            let one = self.s.m.i32(1);
+                            let is_zero = self.s.m.cmp(lp, pred::EQ, old_v, zero);
+                            let gt = self.s.m.cmp(lp, pred::IUGT, old_v, vals[0]);
+                            let wrap = self.s.m.bin(lp, Bin::Or, is_zero, gt);
+                            let dec = self.s.m.bin(lp, Bin::Sub, old_v, one);
+                            self.s.m.select(lp, wrap, vals[0], dec)
+                        }
+                        BufferAtomic::FMin => self.lds_float_pick(old_v, vals[0], false),
+                        BufferAtomic::FMax => self.lds_float_pick(old_v, vals[0], true),
+                        _ => unreachable!(),
+                    };
+                    let prev = buf_cas(self, old_v, new_v);
+                    let done = self.s.m.cmp(lp, pred::EQ, prev, old_v);
+                    self.s.m.set_phi(old_v, vec![(init, pre), (prev, lp)]);
+                    self.s.m.terminate(lp, Term::CondBr(done, exit, lp));
+                    self.cur = exit;
+                    old_v
+                }
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
