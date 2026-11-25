@@ -11282,17 +11282,20 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let has_cl = name.ends_with("_cl");
+        // A clamp, with or without a texel offset (`_cl_o`: the offset word
+        // first, the clamp after the coordinates, as for `_cl`; mathcx,
+        // uiliannn/VItoriaBr 6dcd8cd).
+        let has_cl = name.ends_with("_cl") || name.ends_with("_cl_o");
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" | "image_sample_cl_o" => (60, true),
             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
-            "image_sample_b" | "image_sample_b_cl" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" | "image_sample_b_cl_o" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" | "image_sample_d_cl" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" | "image_sample_d_cl_o" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_sample_c_cl" if self.s.pixel => (64, true),
+            "image_sample_c_cl" | "image_sample_c_cl_o" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l" | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
