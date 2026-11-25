@@ -213,8 +213,14 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
+        if n >= 32 {
+            self.pos = self.pos.saturating_add((n - 32) as usize);
+            let v = self.peek32();
+            self.pos = self.pos.saturating_add(32);
+            return v;
+        }
         let v = self.peek32() >> (32 - n);
-        self.pos += n as usize;
+        self.pos = self.pos.saturating_add(n as usize);
         v
     }
 
@@ -223,7 +229,14 @@ impl Bits<'_> {
     }
 
     fn signed(&mut self, n: u32) -> i32 {
-        ((self.read(n) << (32 - n)) as i32) >> (32 - n)
+        if n == 0 {
+            return 0;
+        }
+        let v = self.read(n);
+        if n >= 32 {
+            return v as i32;
+        }
+        ((v << (32 - n)) as i32) >> (32 - n)
     }
 
     fn consumed(&self) -> usize {
@@ -1187,6 +1200,85 @@ mod tests {
                 data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
             }
         }
+    }
+
+    #[test]
+    fn bits_handles_zero_word_and_oversized_widths() {
+        let mut buf = [0u8; 40];
+        let mut cursor = 0usize;
+        let mut push = |n: u32, v: u32| {
+            put_bits(&mut buf, cursor, n, v);
+            cursor += n as usize;
+        };
+
+        // n = 1 (0, 1), n = 16 (min, max), n = 31 (min, max), n = 32 (min, max).
+        push(1, 0);
+        push(1, 1);
+        push(16, 0x8000);
+        push(16, 0x7fff);
+        push(31, 0x4000_0000);
+        push(31, 0x3fff_ffff);
+        push(32, 0x8000_0000);
+        push(32, 0x7fff_ffff);
+        // Oversized widths: 33-bit unsigned, 36-bit signed -42 and +42.
+        push(1, 1);
+        push(32, 0xdead_beef);
+        push(4, 0xf);
+        push(32, (-42i32) as u32);
+        push(4, 0x0);
+        push(32, 42);
+
+        let mut u = Bits {
+            data: &buf,
+            pos: 0,
+            end: cursor,
+        };
+        assert_eq!(u.read(0), 0);
+        assert_eq!(u.signed(0), 0);
+        assert_eq!(u.consumed(), 0);
+
+        assert_eq!(u.read(1), 0);
+        assert_eq!(u.read(0), 0);
+        assert_eq!(u.signed(0), 0);
+        assert_eq!(u.consumed(), 1);
+        assert_eq!(u.read(1), 1);
+        assert_eq!(u.read(16), 0x8000);
+        assert_eq!(u.read(16), 0x7fff);
+        assert_eq!(u.read(31), 0x4000_0000);
+        assert_eq!(u.read(31), 0x3fff_ffff);
+        assert_eq!(u.read(32), 0x8000_0000);
+        assert_eq!(u.read(32), 0x7fff_ffff);
+        assert_eq!(u.read(33), 0xdead_beef);
+        assert_eq!(u.read(36), (-42i32) as u32);
+        assert_eq!(u.read(36), 42);
+        assert_eq!(u.consumed(), cursor);
+        assert!(!u.overread());
+
+        let mut s = Bits {
+            data: &buf,
+            pos: 0,
+            end: cursor,
+        };
+        assert_eq!(s.signed(0), 0);
+        assert_eq!(s.signed(1), 0);
+        assert_eq!(s.signed(1), -1);
+        assert_eq!(s.signed(16), i32::from(i16::MIN));
+        assert_eq!(s.signed(16), i32::from(i16::MAX));
+        assert_eq!(s.signed(31), -(1 << 30));
+        assert_eq!(s.signed(31), (1 << 30) - 1);
+        assert_eq!(s.signed(32), i32::MIN);
+        assert_eq!(s.signed(32), i32::MAX);
+        assert_eq!(s.signed(33), 0xdead_beefu32 as i32);
+        assert_eq!(s.signed(36), -42);
+        assert_eq!(s.signed(36), 42);
+        assert_eq!(s.consumed(), cursor);
+        assert!(!s.overread());
+
+        assert_eq!(s.read(64), 0);
+        assert!(s.overread());
+        s.pos = usize::MAX - 8;
+        assert_eq!(s.signed(u32::MAX), 0);
+        assert_eq!(s.consumed(), usize::MAX);
     }
 
     /// A damaged packet whose first frame says it is 0 bits long: finding
