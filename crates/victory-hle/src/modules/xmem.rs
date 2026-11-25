@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -533,7 +533,33 @@ impl Physical {
 /// The title's pages by number.
 struct Pages {
     next_page: usize,
+    /// Freed page numbers available for reuse, keeping every live page number
+    /// inside the title's 21-bit `number >> 4` field across long sessions.
+    free_pages: VecDeque<usize>,
     pages: HashMap<usize, Slice>,
+}
+
+impl Pages {
+    /// Reserves `n` distinct page numbers below [`PAGE_NUMBER_LIMIT`]: new
+    /// consecutive ones while there are (an allocation's pages stay one run,
+    /// [`runs`]), else freed ones. `None`, with nothing changed, if fewer
+    /// than `n` remain.
+    fn take_page_numbers(&mut self, n: usize) -> Option<Vec<usize>> {
+        let new_next = self.next_page.checked_add(n.checked_mul(FRAMES)?)?;
+        if new_next <= PAGE_NUMBER_LIMIT {
+            let first = std::mem::replace(&mut self.next_page, new_next);
+            return Some((0..n).map(|i| first + i * FRAMES).collect());
+        }
+        (self.free_pages.len() >= n).then(|| self.free_pages.drain(..n).collect())
+    }
+
+    /// Takes `number` out and recycles it only if it was live, so a
+    /// duplicate or unknown free never hands out the same number twice.
+    fn release_page(&mut self, number: usize) -> Option<Slice> {
+        let slice = self.pages.remove(&number)?;
+        self.free_pages.push_back(number);
+        Some(slice)
+    }
 }
 
 /// Where the title sees its pages: [`Physical::views`] the other way.
@@ -624,6 +650,7 @@ static PAGES: LazyLock<RwLock<Pages>> = LazyLock::new(|| {
     RwLock::new(Pages {
         // Page numbers are opaque to titles; 0 stays unused.
         next_page: 0x10_0000,
+        free_pages: VecDeque::new(),
         pages: HashMap::new(),
     })
 });
@@ -680,9 +707,6 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -690,21 +714,29 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
     let mut table = page_table_mut();
-    let first = table.next_page;
-    table.next_page += n * FRAMES;
-    for index in 0..n {
+    let Some(numbers) = table.take_page_numbers(n) else {
+        drop(table);
+        tracing::warn!(n, "XMemAllocatePhysicalPages: 21-bit page number space exhausted");
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
+        return 0;
+    };
+    for (index, &number) in numbers.iter().enumerate() {
         let slice = Slice {
             section: section.clone(),
             index,
         };
-        table.pages.insert(first + index * FRAMES, slice);
+        table.pages.insert(number, slice);
     }
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
-    for index in 0..n {
+    // For the GPU side's in-place census: only a committed section can be
+    // opened as a host heap.
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    for (index, number) in numbers.into_iter().enumerate() {
         // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(first + index * FRAMES) };
+        unsafe { pages.add(index).write(number) };
     }
     1
 }
@@ -713,6 +745,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+
+/// Exclusive upper bound on page numbers that survive the title's 21-bit
+/// `number >> 4` / `<< 4` round-trip (`0x200_0000`, max `0x1ff_fff0`).
+const PAGE_NUMBER_LIMIT: usize = (1usize << 21) * FRAMES;
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -723,7 +759,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
-    let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let gone: Vec<Slice> = numbers.iter().filter_map(|&number| table.release_page(number)).collect();
     drop(table);
     drop(gone);
     1
@@ -2418,6 +2454,34 @@ mod tests {
             );
         }
         assert_eq!(XMemFreePhysicalPages(1024, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn page_numbers_are_recycled_once_new_ones_run_out() {
+        let mut table = Pages { next_page: PAGE_NUMBER_LIMIT - 2 * FRAMES, free_pages: VecDeque::new(), pages: HashMap::new() };
+        // New numbers while they last, consecutive.
+        assert_eq!(table.take_page_numbers(2), Some(vec![PAGE_NUMBER_LIMIT - 2 * FRAMES, PAGE_NUMBER_LIMIT - FRAMES]));
+        // None left and none freed: refused, nothing changed.
+        assert_eq!(table.take_page_numbers(1), None);
+        assert_eq!(table.next_page, PAGE_NUMBER_LIMIT);
+        // Freed numbers come back; a duplicate or unknown free adds none.
+        let a = allocate(2);
+        let slices: Vec<Slice> = a.iter().map(|n| page_table().pages.get(n).cloned().unwrap()).collect();
+        for (&n, slice) in a.iter().zip(slices) {
+            table.pages.insert(n, slice);
+        }
+        assert!(table.release_page(a[0]).is_some());
+        assert!(table.release_page(a[0]).is_none());
+        assert!(table.release_page(0x10).is_none());
+        assert!(table.release_page(a[1]).is_some());
+        assert_eq!(table.take_page_numbers(3), None);
+        assert_eq!(table.free_pages.len(), 2);
+        let got = table.take_page_numbers(2).unwrap();
+        assert_eq!(got, a);
+        for &number in &got {
+            assert_eq!(((number >> 4) & 0x1f_ffff) << 4, number);
+        }
+        assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
