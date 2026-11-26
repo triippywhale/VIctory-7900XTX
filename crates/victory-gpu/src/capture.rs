@@ -47,7 +47,28 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || GO.load(std::sync::atomic::Ordering::Relaxed) == n
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// A frame asked for while running: a file named `go` put in the capture
+/// folder lists the frame after next (one whose lists are all recorded after
+/// the file was seen), and is removed. For scenes reached after minutes,
+/// whose frame numbers differ from run to run.
+static GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// At the present of `frame`: looks for the `go` file (every 16th frame).
+fn look_for_go(frame: u64) {
+    if !frame.is_multiple_of(16) {
+        return;
+    }
+    let Some(folder) = folder() else { return };
+    let go = folder.join("go");
+    if go.exists() && std::fs::remove_file(&go).is_ok() {
+        GO.store(frame + 2, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(frame = frame + 2, "capture asked for by the go file");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +149,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    look_for_go(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
