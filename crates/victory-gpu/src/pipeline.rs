@@ -66,6 +66,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Its part in the light probe (`crate::lightprobe`).
+    #[cfg(windows)]
+    pub(crate) probe: Option<crate::lightprobe::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -152,6 +155,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+            #[cfg(windows)]
+            probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
