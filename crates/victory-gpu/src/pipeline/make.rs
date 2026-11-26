@@ -316,7 +316,8 @@ const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
 /// How many workers may make pipelines at once that are known to take long
-/// and that no draw has asked for: a quarter of them. On a fresh cache (a
+/// and that no draw has asked for (asked for too, with [`low_memory`]): a
+/// quarter of them ([`slow_limit_of`]). On a fresh cache (a
 /// change of the translator or the driver) the early list begins with
 /// programs that take tens of seconds each: all 16 workers were in them
 /// through the whole of the title's loading, 97 pipelines made in 20 s, and
@@ -329,8 +330,36 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            slow_limit_of(configured_workers())
         }
+    })
+}
+
+/// A quarter of `workers`, at least one: of the workers there are
+/// ([`configured_workers`], `VICTORY_PIPELINE_WORKERS` included), not of the
+/// default for the processors (with 4 workers asked on 32 processors, 4 of
+/// them could be in long ones at once).
+fn slow_limit_of(workers: usize) -> usize {
+    (workers / 4).max(1)
+}
+
+/// Whether pipelines known to take long count against [`slow_limit`] when a
+/// draw or a pass over the screen asks for them too, not only when they were
+/// started early (`VICTORY_PIPELINE_LOW_MEMORY=1`; off by default). Those
+/// keep their place ahead of the early ones and take the next free slot,
+/// and quick ones go on beside them while they wait; a pipeline asked for
+/// can then wait behind a long one that is being made. For runs short of
+/// memory: each long driver compile holds hundreds of MB while it runs, and
+/// unbounded, first uses could start one on every worker (issue #56). Known
+/// is all there is to go on: a pipeline the library holds is counted too.
+fn low_memory() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PIPELINE_LOW_MEMORY").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(slow_limit = slow_limit(), "pipelines known to take long are limited at first use too");
+        }
+        on
     })
 }
 
@@ -344,6 +373,11 @@ struct Queue {
     slow: VecDeque<Arc<Pending>>,
     slow_now: usize,
     requested: VecDeque<Arc<Pending>>,
+    /// Requested ones known to take long, passes over the screen and others
+    /// ([`low_memory`]; else they are in `screen` and `requested`): counted
+    /// in `slow_now`, and before the early ones known to take long.
+    slow_screen: VecDeque<Arc<Pending>>,
+    slow_requested: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -354,50 +388,81 @@ impl Queue {
             slow: VecDeque::new(),
             slow_now: 0,
             requested: VecDeque::new(),
+            slow_screen: VecDeque::new(),
+            slow_requested: VecDeque::new(),
         }
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        let slow = slow_limit() != usize::MAX && super::library::slow(&p.key);
+        self.push_in(p, priority, slow, low_memory())
     }
 
+    /// As [`Queue::push`], with `low_memory` off.
+    #[cfg(test)]
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
+        self.push_in(p, priority, slow, false)
+    }
+
+    /// As [`Queue::push`]: `slow`, whether `p` is known to take long;
+    /// `low_memory`, whether it is limited when requested too ([`low_memory`]).
+    fn push_in(&mut self, p: &Arc<Pending>, priority: u8, slow: bool, low_memory: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED && p.screen && screens_first() {
-            self.screen.push_back(p.clone());
-        } else if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else if slow {
-            self.slow.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
-        }
+        let limited = slow && (priority != REQUESTED || low_memory);
+        let list = match (priority == REQUESTED, p.screen && screens_first(), limited) {
+            (true, true, false) => &mut self.screen,
+            (true, true, true) => &mut self.slow_screen,
+            (true, false, false) => &mut self.requested,
+            (true, false, true) => &mut self.slow_requested,
+            (false, _, true) => &mut self.slow,
+            (false, _, false) => &mut self.early,
+        };
+        list.push_back(p.clone());
         Some(prev == NOT_QUEUED)
     }
 
+    /// The next pipeline to make: passes over the screen, then requested
+    /// ones, then early ones; of each, one known to take long only while
+    /// fewer than `slow_limit` such are being made. Workers that make passes
+    /// over the screen alone (`screens_only`) take nothing else.
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
-        // An early entry can have been promoted and claimed already.
-        let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        // An entry can have been promoted and claimed already: an early one
+        // is then in a requested list too.
+        let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state: u8| {
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
+        let free = self.slow_now < slow_limit;
+        let mut slow = false;
         let mut p = self.screen.pop_front();
+        if p.is_none() && free {
+            p = unclaimed(&mut self.slow_screen, REQUESTED);
+            slow = p.is_some();
+        }
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
-            if p.is_none() && self.slow_now < slow_limit {
-                p = unclaimed(&mut self.slow);
-                if let Some(p) = &p {
-                    p.was_slow.store(true, Ordering::Relaxed);
-                    self.slow_now += 1;
-                }
+            p = self.requested.pop_front();
+            if p.is_none() && free {
+                p = unclaimed(&mut self.slow_requested, REQUESTED);
+                slow = p.is_some();
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early, EARLY);
+            }
+            if p.is_none() && free {
+                p = unclaimed(&mut self.slow, EARLY);
+                slow = p.is_some();
             }
         }
         let p = p?;
+        if slow {
+            p.was_slow.store(true, Ordering::Relaxed);
+            self.slow_now += 1;
+        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -452,17 +517,22 @@ fn worker_count(asked: Option<usize>, processors: usize) -> usize {
     }
 }
 
+/// [`worker_count`] of this machine and `VICTORY_PIPELINE_WORKERS`.
+fn configured_workers() -> usize {
+    worker_count(
+        std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok()),
+        std::thread::available_parallelism().map_or(2, |n| n.get()),
+    )
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-        );
+        let workers = configured_workers();
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
@@ -521,6 +591,203 @@ fn drained() {
         );
     }
     super::library::save(false);
+}
+
+/// The queue with [`low_memory`] on (issue #56), driven as the workers
+/// drive it: no threads, no host device, no title data.
+#[cfg(test)]
+mod low_memory_tests {
+    use super::*;
+
+    fn job(screen: bool) -> Arc<Pending> {
+        let mut p = Pending::new(Vec::new(), None);
+        p.screen = screen;
+        Arc::new(p)
+    }
+
+    /// What a worker does once it has made `p`.
+    fn finish(queue: &mut Queue, p: &Pending) {
+        if p.was_slow.load(Ordering::Relaxed) {
+            queue.slow_now -= 1;
+        }
+    }
+
+    fn pops(queue: &mut Queue, screens_only: bool, limit: usize, p: &Arc<Pending>) -> bool {
+        queue.pop(screens_only, limit).is_some_and(|got| Arc::ptr_eq(&got, p))
+    }
+
+    /// One slot, held by an early long one: a long first use and a long pass
+    /// over the screen wait, quick ones go on (one of them queued after the
+    /// long first use, which heads its queue); then the slot goes to the
+    /// pass over the screen, then to the first use, each once.
+    #[test]
+    fn requested_long_ones_wait_for_a_slot_while_quick_ones_go_on() {
+        let (held, first_use, screen) = (job(false), job(false), job(true));
+        let (quick_use, quick_early) = (job(false), job(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, EARLY, true, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        assert_eq!(queue.slow_now, 1);
+
+        assert_eq!(queue.push_in(&first_use, REQUESTED, true, true), Some(true));
+        assert_eq!(queue.push_in(&screen, REQUESTED, true, true), Some(true));
+        assert_eq!(queue.push_in(&quick_use, REQUESTED, false, true), Some(true));
+        assert_eq!(queue.push_in(&quick_early, EARLY, false, true), Some(true));
+
+        assert!(pops(&mut queue, false, 1, &quick_use));
+        assert!(pops(&mut queue, false, 1, &quick_early));
+        assert!(queue.pop(false, 1).is_none());
+        assert!(queue.pop(true, 1).is_none());
+        for quick in [&quick_use, &quick_early] {
+            assert!(!quick.was_slow.load(Ordering::Relaxed));
+            finish(&mut queue, quick);
+        }
+        assert_eq!(queue.slow_now, 1, "quick ones hold no slot");
+
+        finish(&mut queue, &held);
+        assert!(pops(&mut queue, false, 1, &screen));
+        assert!(screen.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(false, 1).is_none());
+        finish(&mut queue, &screen);
+        assert!(pops(&mut queue, false, 1, &first_use));
+        assert!(first_use.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(false, 1).is_none());
+        finish(&mut queue, &first_use);
+        assert_eq!(queue.slow_now, 0);
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    /// A long one queued early and then drawn with is in two lists; the
+    /// freed slot goes to it as a first use, ahead of an earlier early
+    /// one, and it is made once.
+    #[test]
+    fn a_promoted_long_one_goes_before_the_early_ones_and_is_made_once() {
+        let (held, early, promoted) = (job(false), job(false), job(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, EARLY, true, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        assert_eq!(queue.push_in(&early, EARLY, true, true), Some(true));
+        assert_eq!(queue.push_in(&promoted, EARLY, true, true), Some(true));
+        assert_eq!(queue.push_in(&promoted, REQUESTED, true, true), Some(false));
+        assert_eq!(queue.push_in(&promoted, REQUESTED, true, true), None);
+        assert!(queue.pop(false, 1).is_none());
+
+        finish(&mut queue, &held);
+        assert!(pops(&mut queue, false, 1, &promoted));
+        finish(&mut queue, &promoted);
+        assert!(pops(&mut queue, false, 1, &early));
+        finish(&mut queue, &early);
+        // The stale early entry of the promoted one is not made again.
+        assert!(queue.pop(false, 1).is_none());
+        assert_eq!(queue.slow_now, 0);
+    }
+
+    /// Workers that make passes over the screen alone take a long one too
+    /// once a slot is free, and still nothing else.
+    #[test]
+    fn screen_workers_wait_for_a_slot_too() {
+        let (held, screen, world) = (job(false), job(true), job(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, REQUESTED, true, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        assert_eq!(queue.push_in(&screen, REQUESTED, true, true), Some(true));
+        assert_eq!(queue.push_in(&world, REQUESTED, true, true), Some(true));
+        assert!(queue.pop(true, 1).is_none());
+        finish(&mut queue, &held);
+        assert!(pops(&mut queue, true, 1, &screen));
+        finish(&mut queue, &screen);
+        assert!(queue.pop(true, 1).is_none());
+        assert!(pops(&mut queue, false, 1, &world));
+    }
+
+    /// A cache hit: a pipeline made already is not queued at all, and one
+    /// not known to take long (the library loads it in milliseconds) holds
+    /// no slot. A miss known to take long waits for one.
+    #[test]
+    fn cache_hits_go_on_while_a_miss_waits() {
+        let made = job(false);
+        assert!(made.made.set(None).is_ok());
+        assert!(ready(&made).is_none());
+        assert_eq!(made.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+
+        let (held, hit, miss) = (job(false), job(false), job(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, REQUESTED, true, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        assert_eq!(queue.push_in(&miss, REQUESTED, true, true), Some(true));
+        assert_eq!(queue.push_in(&hit, REQUESTED, false, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &hit));
+        assert!(!hit.was_slow.load(Ordering::Relaxed));
+        assert!(queue.pop(false, 1).is_none());
+        finish(&mut queue, &held);
+        assert!(pops(&mut queue, false, 1, &miss));
+    }
+
+    /// Without a pipeline library (none in tests: no host device) nothing
+    /// is loaded, and a pipeline that took long in this run is known to: a
+    /// later request for the same key is limited.
+    #[test]
+    fn without_a_library_a_pipeline_that_took_long_is_limited() {
+        let held = job(false);
+        // A key of its own: every pipeline of no shaders has the same one,
+        // and the others' tests must not find it known to take long.
+        let mut again = Pending::new(Vec::new(), None);
+        again.key = "low-memory-test-took-long".to_owned();
+        let again = Arc::new(again);
+        super::super::library::note_time(&again.key, super::super::library::SLOW_MS);
+        assert!(super::super::library::slow(&again.key));
+        assert!(!super::super::library::slow(&held.key));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, REQUESTED, true, true), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        let slow = super::super::library::slow(&again.key);
+        assert_eq!(queue.push_in(&again, REQUESTED, slow, true), Some(true));
+        assert!(queue.pop(false, 1).is_none());
+        finish(&mut queue, &held);
+        assert!(pops(&mut queue, false, 1, &again));
+    }
+
+    /// The limit is a quarter of the workers there are, the switch's count
+    /// included, and that many long first uses are made at once.
+    #[test]
+    fn the_limit_follows_the_worker_count_asked_for() {
+        assert_eq!(slow_limit_of(worker_count(None, 24)), 4);
+        assert_eq!(slow_limit_of(worker_count(Some(4), 32)), 1);
+        assert_eq!(slow_limit_of(worker_count(Some(1), 32)), 1);
+        assert_eq!(slow_limit_of(worker_count(Some(20), 4)), 5);
+        assert_eq!(slow_limit_of(worker_count(Some(200), 4)), 16);
+
+        let limit = slow_limit_of(worker_count(Some(8), 32));
+        assert_eq!(limit, 2);
+        let jobs: Vec<_> = (0..3).map(|_| job(false)).collect();
+        let mut queue = Queue::new();
+        for p in &jobs {
+            assert_eq!(queue.push_in(p, REQUESTED, true, true), Some(true));
+        }
+        assert!(pops(&mut queue, false, limit, &jobs[0]));
+        assert!(pops(&mut queue, false, limit, &jobs[1]));
+        assert!(queue.pop(false, limit).is_none());
+        finish(&mut queue, &jobs[0]);
+        assert!(pops(&mut queue, false, limit, &jobs[2]));
+    }
+
+    /// With the switch off, a requested one known to take long is made at
+    /// once, as before: over the screen or not, slot held or not.
+    #[test]
+    fn off_requested_long_ones_take_no_slot() {
+        let (held, screen, world) = (job(false), job(true), job(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_in(&held, EARLY, true, false), Some(true));
+        assert!(pops(&mut queue, false, 1, &held));
+        assert_eq!(queue.push_in(&screen, REQUESTED, true, false), Some(true));
+        assert_eq!(queue.push_in(&world, REQUESTED, true, false), Some(true));
+        assert!(pops(&mut queue, true, 1, &screen));
+        assert!(pops(&mut queue, false, 1, &world));
+        assert!(!screen.was_slow.load(Ordering::Relaxed));
+        assert!(!world.was_slow.load(Ordering::Relaxed));
+        assert_eq!(queue.slow_now, 1);
+        assert!(queue.slow_screen.is_empty() && queue.slow_requested.is_empty());
+    }
 }
 
 #[cfg(test)]
