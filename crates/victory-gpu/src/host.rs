@@ -2742,6 +2742,52 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
+    #[test]
+    fn completed_gpu_fences_release_tables_before_lists_are_recycled() {
+        use super::{D3D12_FENCE_FLAG_NONE, Flight, ID3D12Fence, Late, host, release_completed_tables};
+        use crate::draw::State;
+        use crate::list::Detached;
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; descriptor retirement test skipped");
+            return;
+        };
+        crate::descriptor::with_test_view_heap(|heap| {
+            let views = heap.host().unwrap();
+            let capacity = views.dynamic_capacity();
+            let mut state = State::default();
+            let first = state.reserve_dynamic(heap, views, capacity).unwrap();
+            let list = host.new_list().unwrap();
+            list.close();
+            let mut items = [Late::Run(Flight {
+                number: 1,
+                fence: 1,
+                lists: vec![Detached::with_test_state(list, state)],
+                order: vec![0],
+                card: None,
+                back: Vec::new(),
+                own: None,
+                texture_back_ranges: Vec::new(),
+            })];
+            // SAFETY: a private test fence and a live device.
+            let fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            // SAFETY: a plain query on the test fence.
+            release_completed_tables(&mut items, unsafe { fence.GetCompletedValue() });
+            assert_eq!(views.dynamic(1), None, "the flight is still using its slots");
+            release_completed_tables(&mut items, u64::MAX);
+            assert_eq!(views.dynamic(1), None, "device removal cannot prove completion");
+            // SAFETY: only this test owns and signals the fence.
+            unsafe { fence.Signal(1) }.unwrap();
+            // SAFETY: a plain query on the test fence.
+            release_completed_tables(&mut items, unsafe { fence.GetCompletedValue() });
+            assert_eq!(views.dynamic(capacity), Some(first), "the list is still held but its slots are reusable");
+            drop(items);
+            assert_eq!(views.dynamic(1), None, "dropping the old list must leave the new allocation alone");
+            views.release(first, capacity);
+            eprintln!("completed fence released {capacity} dynamic descriptor slots before list recycle");
+        });
+    }
+
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
     /// before the flight.
@@ -2848,6 +2894,25 @@ enum Late {
     Write(usize, crate::queue::Written, usize),
     /// A fence signalled behind the flights before it (retaining a COM ref).
     Signal(crate::fence::FenceRef, u64),
+}
+
+/// Return shader-visible descriptor ranges as soon as the GPU has finished
+/// using them. Readback, retirement of resources, and list reset still keep
+/// their original order and may hold the list for several more submissions.
+fn release_completed_tables(items: &mut [Late], completed: u64) {
+    if completed == u64::MAX {
+        // GetCompletedValue reports this if the device has been removed.
+        return;
+    }
+    for item in items {
+        if let Late::Run(flight) = item
+            && flight.fence <= completed
+        {
+            for list in &mut flight.lists {
+                list.release_tables();
+            }
+        }
+    }
 }
 
 struct Line {
@@ -5167,8 +5232,10 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // SAFETY: a plain query on this queue's fence.
+        release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5634,7 +5701,7 @@ impl Host {
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -5681,6 +5748,9 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                // SAFETY: a plain query. Check the completed value even
+                // when the event could not be registered.
+                release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();

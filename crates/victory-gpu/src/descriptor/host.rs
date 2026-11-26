@@ -1929,6 +1929,11 @@ impl HostHeap {
         Some(self.count + first)
     }
 
+    #[cfg(test)]
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
