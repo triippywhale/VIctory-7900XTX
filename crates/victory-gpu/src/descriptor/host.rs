@@ -6385,8 +6385,12 @@ mod tests {
         assert!(null >= DYNAMIC);
         for count in [4, null - DYNAMIC, null - DYNAMIC + 1, null + 1] {
             let heap = HostHeap::new(false, count).expect("a view heap on the live device");
+            // (Past the null slot, the fork's raw twins of buffer views when
+            // there are any: `victory_shader::emit::raw_views`.)
+            let raw = victory_shader::emit::raw_views();
+            let size = if raw == 0 { null + 1 } else { 2 * raw };
             // SAFETY: a plain query of a live heap.
-            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, null + 1);
+            assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, size);
             assert_eq!(heap.dynamic, DYNAMIC);
             assert!(heap.count + heap.dynamic <= null);
             let first = heap.dynamic(DYNAMIC).expect("the whole dynamic range");
