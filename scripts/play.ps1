@@ -4,6 +4,10 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Ports        renderer patches to turn on, for A/B runs (README.md, "Renderer patches"):
+#               1 = VICTORY_PORT_CONSTANTS, 2 = VICTORY_PORT_DESCRIPTORS, 5 = VICTORY_PORT_CBV,
+#               6 = VICTORY_PORT_GUARD, 7 = VICTORY_PORT_JOURNAL; e.g. -Ports 1,5 or -Ports all.
+#               Without it all five stay off (their default). -More still wins over it.
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new
@@ -22,7 +26,8 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$NoPrebuild,
-    [switch]$CleanCache
+    [switch]$CleanCache,
+    [ValidateSet('1', '2', '5', '6', '7', 'all')][string[]]$Ports = @()
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -36,6 +41,13 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192' }
+$portSwitches = [ordered]@{
+    '1' = 'VICTORY_PORT_CONSTANTS'; '2' = 'VICTORY_PORT_DESCRIPTORS'; '5' = 'VICTORY_PORT_CBV'
+    '6' = 'VICTORY_PORT_GUARD'; '7' = 'VICTORY_PORT_JOURNAL'
+}
+$wanted = if ($Ports -contains 'all') { @($portSwitches.Keys) } else { $Ports }
+foreach ($n in $wanted) { $settings[$portSwitches[$n]] = '1' }
+if ($wanted) { Write-Host "Renderer patches on: $(($wanted | Sort-Object -Unique) -join ', ')" }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
