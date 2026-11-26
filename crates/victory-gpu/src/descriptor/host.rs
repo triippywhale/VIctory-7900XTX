@@ -376,7 +376,7 @@ pub(crate) static NEW_LATER: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 fn begun_before(view: &View) -> Option<u64> {
     // (Resolved first: the texture made here, a moment ago, is the case.)
     let shader = match view {
-        View::Placed(false, resource, _) if resource[0] != 1 => placed_texture(view)?,
+        View::Placed(false, resource, _) if resource[0] != 1 => placed_texture(view)?.view,
         View::Shader(..) => view.clone(),
         _ => return None,
     };
@@ -2448,7 +2448,7 @@ impl HeapInner {
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
             && let Some(view) = super::view(handle)
-            && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
+            && let Some(View::Shader(resource, _)) = placed_texture(&view).map(|placed| placed.view).or(Some(view))
             && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
             && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
             && !crate::texture::ahead::there(resource as crate::object::This)
@@ -4439,6 +4439,18 @@ fn make_twinned(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A view the title placed over a texture the host writes, in a
+            // format a view of that texture can have: the texture itself
+            // (`crate::resource::cast_source`), not a copy of it.
+            if let (Some((_, source)), Some(d)) = (crate::resource::cast_source(resource), desc.as_ref()) {
+                let mut view = srv_desc(d);
+                view.Format = DXGI_FORMAT(67);
+                // SAFETY: a live texture made castable to that format, and a
+                // slot of our heap.
+                unsafe { device.CreateShaderResourceView(&source, Some(&view), at) };
+                return Some(Some(source));
+            }
+            crate::resource::shown_uncast(resource);
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
@@ -4611,7 +4623,25 @@ fn make_twinned(
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                let made = make(&view.view, at);
+                #[cfg(feature = "diagnostics")]
+                if *unordered && made.as_ref().is_some_and(Option::is_some) {
+                    static FIRST: std::sync::Once = std::sync::Once::new();
+                    FIRST.call_once(|| {
+                        tracing::info!(
+                            dimension = resource[0],
+                            resource_format = resource[8],
+                            view_format = desc[0],
+                            flags = resource[12],
+                            address = format_args!(
+                                "{:#x}",
+                                u64::from(desc[10]) | u64::from(desc[11]) << 32
+                            ),
+                            "mirrored a placed texture UAV"
+                        )
+                    });
+                }
+                return made;
             }
             const BUFFER: u32 = 1;
             let memory = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -4628,13 +4658,32 @@ fn make_twinned(
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    resource.hash(&mut h);
+                    desc.hash(&mut h);
+                    h.finish()
+                };
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(memory)) || times.is_power_of_two() {
+                let mut around = [0u32; 48];
+                // SAFETY: the title's own record around the description.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        std::ptr::from_ref(desc).cast::<u32>().sub(24),
+                        around.as_mut_ptr(),
+                        around.len(),
+                    )
+                };
+                if (said.len() < 512 && said.insert(key)) || times.is_power_of_two() {
+                    #[cfg(all(windows, feature = "diagnostics"))]
+                    let (keys, addresses) = crate::resource::placed_textures_like(resource);
+                    #[cfg(not(all(windows, feature = "diagnostics")))]
+                    let (keys, addresses): (usize, Vec<u64>) = (0, Vec::new());
                     tracing::warn!(
                         address = format_args!("{memory:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        "placed unordered texture view that is not mirrored (null: writes through it are lost): unordered {unordered}, resource {resource:?}, desc {desc:?}, around {around:?}, matches {keys}, addresses {addresses:?}",
                     );
                 }
                 return None;
@@ -5128,20 +5177,54 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+/// A placed texture view's host view, and the title resource it holds (when
+/// the memory belongs to one).
+pub(crate) struct PlacedTexture {
+    pub(crate) view: View,
+    _owner: Option<crate::resource::ResourceRef>,
+}
+
+/// A placed texture's view on its host resource: of the title resource that
+/// writes the memory when there is one, else of a synthetic copy. UAV
+/// writes must land on the title resource (a synthetic copy would keep
+/// them).
+pub(crate) fn placed_texture(view: &View) -> Option<PlacedTexture> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
-    if resource[0] == BUFFER {
+    #[cfg(feature = "diagnostics")]
+    if *unordered && resource[0] != BUFFER && resource[12] & 4 == 0 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            tracing::warn!(n, "placed texture UAV probe: resource {resource:?} desc {desc:?}");
+        }
+    }
+    if resource[0] == BUFFER || (*unordered && resource[12] & 4 == 0) {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
+    let owner = if resource[12] & 4 != 0 {
+        crate::resource::writable_texture_at(address, resource)
+    } else {
+        None
+    };
+    let texture = match &owner {
+        Some(owner) => owner.as_ptr(),
+        // Unordered needed a resource the title gave; a synthetic one with
+        // no writable flag would drop writes.
+        None if *unordered => return None,
+        None => crate::resource::texture_at(address, resource)?,
+    };
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let words = desc[..10].try_into().ok();
+    let view = if *unordered {
+        View::Unordered(texture as usize, 0, words)
+    } else {
+        View::Shader(texture as usize, words)
+    };
+    Some(PlacedTexture { view, _owner: owner })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
