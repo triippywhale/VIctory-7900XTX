@@ -2669,7 +2669,7 @@ fn movrel_masks_m0_to_8_bits_and_allows_non_vgpr_src0() {
 }
 
 /// SOPK `op sdst, simm16`.
-const fn sopk(op: u8, sdst: u8, simm16: i16) -> u32 {
+const fn sopk_signed(op: u8, sdst: u8, simm16: i16) -> u32 {
     0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | (simm16 as u16) as u32
 }
 
@@ -2690,14 +2690,14 @@ fn signed_scalar_add_sub_scc_matches_rdna2() {
     // s_mov_b32 s6, s0; s_addk_i32 s6, +1 (SOPK 0x0F); s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7
     let addk_pos1 = build_valu_cs(&[
         s_mov_b32(6, 0),
-        sopk(0x0F, 6, 1),
+        sopk_signed(0x0F, 6, 1),
         sop2(0x0A, 7, 0x81, 0x80),
         vop1(0x001, 0, sgpr(7)),
     ]);
     // s_mov_b32 s6, s0; s_addk_i32 s6, -32768 (SOPK 0x0F); s_cselect_b32 s7, 1, 0; v_mov_b32 v0, s7
     let addk_neg_min = build_valu_cs(&[
         s_mov_b32(6, 0),
-        sopk(0x0F, 6, i16::MIN),
+        sopk_signed(0x0F, 6, i16::MIN),
         sop2(0x0A, 7, 0x81, 0x80),
         vop1(0x001, 0, sgpr(7)),
     ]);
