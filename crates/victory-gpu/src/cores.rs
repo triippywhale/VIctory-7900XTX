@@ -149,10 +149,20 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
 }
 
 /// The sets of one fast core of the last, and all the others, for
-/// [`lane_core`]; `None` with fewer than six fast cores.
-fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
+/// [`lane_core`]; `None` with fewer than six fast cores. `fast`: the fast
+/// sets ([`fast_of`]); the core is one of theirs. Where they are none (all
+/// cores alike), one of the best class.
+///
+/// Before, the core was always the last of the best class. On a processor
+/// whose cores are all of one class but whose complexes differ in cache
+/// (7900X3D: every core the same class), that is the last core of the
+/// complex without the stacked cache, as a rule: the submitting thread ran
+/// there, away from the larger cache and from the helpers it waits for,
+/// which are kept on the cache complex.
+fn one_core(sets: &[(u32, u8, u8)], fast: &[u32]) -> Option<(Vec<u32>, Vec<u32>)> {
     let best = sets.iter().map(|c| c.1).max()?;
-    let mut cores: Vec<u8> = sets.iter().filter(|c| c.1 == best).map(|c| c.2).collect();
+    let candidate = |c: &&(u32, u8, u8)| if fast.is_empty() { c.1 == best } else { fast.contains(&c.0) };
+    let mut cores: Vec<u8> = sets.iter().filter(candidate).map(|c| c.2).collect();
     cores.sort_unstable();
     cores.dedup();
     let core = *cores.last().filter(|_| cores.len() >= 6)?;
@@ -185,7 +195,7 @@ pub(crate) fn settle() {
     }
     let sets = cpu_sets();
     let fast = fast_of(&sets);
-    let one = one_core(&sets).filter(|_| lane_core());
+    let one = one_core(&sets, &fast).filter(|_| lane_core());
     let others: &[u32] = one.as_ref().map_or(&[], |o| &o.1);
     let null = std::ptr::null::<u32>();
     // SAFETY: our own process and the system's own set ids (none: all).
@@ -283,9 +293,9 @@ mod tests {
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
         assert_eq!(fast_by_class(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]), [256, 257]);
         assert!(fast_by_class(&[(256, 0, 0), (257, 0, 1)]).is_empty());
-        assert!(one_core(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)]).is_none());
+        assert!(one_core(&[(256, 1, 0), (257, 1, 0), (258, 0, 2)], &[256, 257]).is_none());
         let eight: Vec<(u32, u8, u8)> = (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
-        let (own, others) = one_core(&eight).unwrap();
+        let (own, others) = one_core(&eight, &fast_by_class(&eight)).unwrap();
         assert_eq!((own, others.len()), (vec![14, 15], 22));
         assert!(fast_by_class(&[]).is_empty());
         assert!(!cpu_sets().is_empty());
@@ -330,5 +340,25 @@ mod tests {
             (0..16).map(|n| (n, 1, n as u8 / 2 * 2)).chain((16..24).map(|n| (n, 0, n as u8))).collect();
         assert_eq!(fast_sets(&sets, true), (0..16).collect::<Vec<_>>());
         assert_eq!(fast_sets(&sets, false), (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn the_lane_core_is_on_the_cache_complex() {
+        // 7900X3D: twelve cores of one class, two sets each; the first six
+        // on the stacked cache.
+        let sets = alike(24);
+        let l3: Vec<(u32, u32)> = (0..24).map(|i| (256 + i, if i < 12 { 96 * MB } else { 32 * MB })).collect();
+        let fast = fast_by_cache(&sets, &l3);
+        let (own, others) = one_core(&sets, &fast).unwrap();
+        assert_eq!((own, others.len()), (vec![266, 267], 22));
+        // The stacked cache on the second complex: its last core.
+        let flipped: Vec<(u32, u32)> = (0..24).map(|i| (256 + i, if i < 12 { 32 * MB } else { 96 * MB })).collect();
+        let (own, _) = one_core(&sets, &fast_by_cache(&sets, &flipped)).unwrap();
+        assert_eq!(own, vec![278, 279]);
+        // All alike: the last core.
+        let (own, _) = one_core(&sets, &[]).unwrap();
+        assert_eq!(own, vec![278, 279]);
+        // Fewer than six fast cores: none.
+        assert!(one_core(&sets, &(256..266).collect::<Vec<_>>()).is_none());
     }
 }
