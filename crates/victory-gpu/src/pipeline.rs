@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    /// The program's name, where the container has one (`CS_...`).
+    pub(crate) name: Option<String>,
     container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
@@ -70,7 +72,11 @@ pub(crate) struct Shader {
 
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.stage, self.hash)
+        write!(f, "{} {}", self.stage, self.hash)?;
+        match &self.name {
+            Some(name) => write!(f, " {name}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -100,6 +106,26 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// The first program name in a container (`CS_`, `PS_`, `VS_`... and a
+/// word), as the title's containers carry them, to tell passes apart in the
+/// logs.
+fn program_name(bytes: &[u8]) -> Option<String> {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    (1..bytes.len().saturating_sub(6)).find_map(|i| {
+        let at = &bytes[i..];
+        let starts = b"CVPMAHDG".contains(&at[0])
+            && at[1] == b'S'
+            && at[2] == b'_'
+            && at[3].is_ascii_alphabetic()
+            && !word(bytes[i - 1]);
+        if !starts {
+            return None;
+        }
+        let len = at.iter().take(120).take_while(|&&b| word(b)).count();
+        (len >= 8).then(|| String::from_utf8_lossy(&at[..len]).into_owned())
+    })
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -113,6 +139,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                name: program_name(bytes),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),

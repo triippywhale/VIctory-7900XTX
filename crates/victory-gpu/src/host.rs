@@ -1169,6 +1169,10 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// The title textures this list writes whose placed views shaders pick
+    /// by index (`crate::resource::picked_alias`): copied into those views
+    /// when the list closes ([`HostList::aliases_current`]).
+    wrote_shown: Mutex<Vec<usize>>,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -4119,6 +4123,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                wrote_shown: Mutex::default(),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -6242,6 +6247,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
+        self.aliases_current();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -6301,6 +6307,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6354,6 +6361,14 @@ impl HostList {
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_for(copy.flags(), wanted);
+        // Target, unordered access, depth write, copy or resolve destination.
+        const WRITTEN: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+        if wanted & WRITTEN != 0 && crate::resource::has_picked_aliases(resource) {
+            let mut wrote = self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner());
+            if !wrote.contains(&(resource as usize)) {
+                wrote.push(resource as usize);
+            }
+        }
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -6556,6 +6571,23 @@ impl HostList {
             // leave its own pipeline and target set.
             self.pass_plane(depth, twin);
             self.settle(depth, SHADER_RESOURCE);
+        }
+    }
+
+    /// Before the list closes: the textures it wrote that shaders read
+    /// through placed views they pick by index are copied into those views'
+    /// textures (`crate::resource::picked_alias`), so that the lists after
+    /// this one find them as the console's shared memory would have them.
+    /// (A shader of this list that picks one after the write still reads
+    /// what the list before left.)
+    fn aliases_current(&self) {
+        let wrote = std::mem::take(&mut *self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner()));
+        for source in wrote {
+            for (placed, shown) in crate::resource::picked_aliases_of(source as crate::object::This) {
+                if crate::texture::alias(self, placed, shown) {
+                    crate::texture::PICKED_ALIAS_COPIES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
