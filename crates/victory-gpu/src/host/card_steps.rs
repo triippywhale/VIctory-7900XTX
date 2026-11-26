@@ -706,7 +706,15 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let mut behind = None;
+        let chosen = plan(&does, stage(), placed_order(), &mut behind);
+        #[cfg(feature = "diagnostics")]
+        if chosen == Err(BEHIND_PLACED)
+            && let Some((p, i)) = behind
+        {
+            note_behind(runs, steps[p], steps[i]);
+        }
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -915,10 +923,41 @@ fn noted(ops: &[Op]) {
     }
 }
 
+/// Diagnostics: refusals for [`BEHIND_PLACED`], by the step in the way: in the
+/// copy's own list or a later one, and what it is (a constant view's fill,
+/// a fill of a buffer of ours, another fill, a buffer copy), and its bytes.
+#[cfg(feature = "diagnostics")]
+static BEHIND: Mutex<Option<std::collections::BTreeMap<(bool, &'static str, usize), u64>>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn note_behind(runs: &[&HostList], placed: (usize, usize), reader: (usize, usize)) {
+    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == reader.0);
+    let (kind, len) = match list.and_then(|l| l.deferred().copies.get(reader.1).map(|s| match s {
+        Step::Fill(_, _, len, Some(FillTo::Slot(..))) => ("a constant view's fill", *len),
+        Step::Fill(_, _, len, Some(FillTo::Buffer(_))) => ("a fill of a buffer of ours", *len),
+        Step::Fill(_, _, len, None) => ("a fill of scratch memory", *len),
+        &Step::Copy(_, _, len) => ("a buffer copy", len),
+        _ => ("another step", 0),
+    })) {
+        Some(k) => k,
+        None => ("not found", 0),
+    };
+    let mut all = BEHIND.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(Default::default).entry((placed.0 == reader.0, kind, len)).or_default() += 1;
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    for ((same, kind, len), n) in BEHIND.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default() {
+        tracing::info!(
+            "refused for a copy at its place, per frame: {:.2} by {kind} of {len:#x} bytes in {} list",
+            n as f64 / frames,
+            if same { "the copy's own" } else { "a later" },
+        );
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
