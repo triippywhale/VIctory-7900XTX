@@ -74,7 +74,7 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 0: never, the default; 12 as it was), and the
 /// milliseconds it may take just before a draw of the title's decoration
 /// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
 ///
@@ -91,7 +91,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 0), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
