@@ -2294,7 +2294,8 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                // (`VICTORY_VRAM_EARLY=1`: only while the card has room.)
+                kin => (!crate::host::vram_early() || crate::resource::room_lately()) && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3219,7 +3220,8 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept =
+                        (!crate::host::vram_early() || crate::resource::room_lately()) && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
