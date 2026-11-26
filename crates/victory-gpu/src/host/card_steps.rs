@@ -85,10 +85,15 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
-/// the case did not come up once in runs submit-1 to submit-3, so it has only
-/// its tests behind it.
+/// them (on by default; `VICTORY_PLACED_ORDER=0`: wherever it stands), and a
+/// submission where it does is cut behind the copy's list ([`cut_for`]).
+///
+/// On since run rt-behind-ab (ray tracing on, with
+/// [`HostList::placed_constants`] taking the readers in the copy's own list):
+/// the readers left are constant fills in later lists (0xf0 and 0x220 bytes,
+/// about one a frame); with the cut the submitting thread's waits for flights
+/// fell from 11-19 ms a frame to under 1 ms, and frames at about 4,800 draws
+/// took 69.7 ms against 75.2 (four pairs of 20 s phases).
 ///
 /// The fills of constant buffers read the title's ring (7,500 a frame in the
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
@@ -100,7 +105,7 @@ fn placed_order() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
