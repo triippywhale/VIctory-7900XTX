@@ -195,7 +195,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && let Some(l) = lane_number(lane)
                 && let Some(&sym) = left.get(l as usize)
                 // (a lane's own value stays a lane read)
-                && !matches!(sym, Sym::Own(_))
+                && !matches!(sym, Sym::Own(..))
                 && let Some(shape) = single(sym, wave)
             {
                 reads.insert(w, shape);
