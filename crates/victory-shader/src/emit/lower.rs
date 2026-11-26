@@ -355,7 +355,7 @@ struct Lower<'a> {
     local_any: bool,
     /// With `exchange`: VGPR values every lane holds alike ([`lane_uniform`]); a first-lane
     /// read of one needs nothing from the other host wave.
-    uniform: HashSet<Value>,
+    uniform: LaneUniform,
     /// With `exchange`: the wave ORs that only steer a loop over each lane's own bits, which
     /// a host wave takes over its own lanes wherever they stand ([`super::own_bits`]).
     own_bits: super::own_bits::OwnBits,
@@ -562,6 +562,102 @@ fn need(block: usize) {
     });
 }
 
+/// What [`lane_uniform`] shows of a program's VGPR values ([`Self::alike_at`]).
+#[derive(Default)]
+pub(super) struct LaneUniform {
+    /// The values alike in a console wave where they are made.
+    same: HashSet<Value>,
+    /// The block each instruction's or phi's value is made in.
+    made: HashMap<Value, usize>,
+    /// The loops the lanes of a console wave may leave at different turns, by their blocks.
+    apart: Vec<Vec<bool>>,
+}
+
+impl LaneUniform {
+    /// Whether every lane of a console wave holds `v` alike where block `b` reads it: alike
+    /// where it is made, and not made in one of the loops the lanes may leave at different
+    /// turns while `b` lies outside it (each lane holds there what it had when it left).
+    pub(super) fn alike_at(&self, v: Value, b: usize) -> bool {
+        self.same.contains(&v) && !escapes(&self.made, self.apart.iter().map(Vec::as_slice), v, b)
+    }
+}
+
+/// Whether `v`, read in block `b`, is made in one of the loops `apart` (each as its blocks)
+/// that `b` lies outside of.
+fn escapes<'a>(
+    made: &HashMap<Value, usize>,
+    mut apart: impl Iterator<Item = &'a [bool]>,
+    v: Value,
+    b: usize,
+) -> bool {
+    let Some(&d) = made.get(&v) else {
+        return false;
+    };
+    let inside = |l: &[bool], x: usize| l.get(x).copied().unwrap_or(false);
+    apart.any(|l| inside(l, d) && !inside(l, b))
+}
+
+/// The natural loops of `p`, each as its blocks: per header, the header and the blocks that
+/// reach one of its back edges (from a block it dominates) without passing it. (`ir::build`
+/// leaves the control flow reducible.) `order` is reverse postorder.
+fn natural_loops(p: &Program, order: &[usize]) -> Vec<Vec<bool>> {
+    let n = p.blocks.len();
+    let mut index = vec![usize::MAX; n];
+    for (k, &b) in order.iter().enumerate() {
+        index[b] = k;
+    }
+    let idom = crate::ir::idoms(&p.blocks, order, &index);
+    let reached = |b: usize| idom.get(b).is_some_and(|&d| d != usize::MAX);
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            break true;
+        }
+        match idom.get(b) {
+            Some(&d) if d != b && d != usize::MAX => b = d,
+            _ => break false,
+        }
+    };
+    let mut loops = Vec::new();
+    for h in (0..n).filter(|&h| reached(h)) {
+        let mut work: Vec<usize> =
+            p.blocks[h].preds.iter().copied().filter(|&q| reached(q) && dominates(h, q)).collect();
+        if work.is_empty() {
+            continue;
+        }
+        let mut inside = vec![false; n];
+        inside[h] = true;
+        while let Some(b) = work.pop() {
+            if !inside[b] {
+                inside[b] = true;
+                work.extend(p.blocks[b].preds.iter().copied().filter(|&q| reached(q)));
+            }
+        }
+        loops.push(inside);
+    }
+    loops
+}
+
+/// Whether the VALU instruction `name` writes over only part of what its VGPR destination
+/// held, so that the old value is one of its inputs: an accumulator (`mac`, `v_dot2c`,
+/// `v_dot4c`...), the other side of a swap, or a 16-bit result, which goes to one half of the
+/// destination and keeps the other ([`Lower::write_half`], `v_fma_mixlo/hi`). The type a name
+/// gives first is its result's: `v_cvt_f16_f32` writes 16 bits, `v_cvt_f32_f16` all 32; packed
+/// results fill the register.
+fn keeps_old(name: &str) -> bool {
+    let accumulates = name.split('_').nth(1).is_some_and(|op| op.starts_with("dot") && op.ends_with('c'));
+    if name == "v_swap_b32" || name.contains("mac_") || accumulates {
+        return true;
+    }
+    if name.contains("_pk") {
+        return false;
+    }
+    let is_type = |t: &&str| {
+        let mut c = t.chars();
+        matches!(c.next(), Some('f' | 'i' | 'u' | 'b')) && t.len() > 1 && c.all(|d| d.is_ascii_digit())
+    };
+    name.split('_').find(is_type).is_some_and(|t| t.ends_with("16"))
+}
+
 /// VGPR values that are the same in every lane of a console wave holding them (`all` is
 /// [`all_lane_blocks`]): written lane by lane from scalars, constants and such values, by an
 /// instruction that either every arriving lane runs or that runs under a condition itself the
@@ -575,26 +671,79 @@ fn need(block: usize) {
 /// branch on such alike values does not). Loop-carried values count only when what the loop
 /// carries is made of such values; the analysis runs to a fixed point from nothing, so a value
 /// that needs itself to be alike never is.
+/// Where the lanes may leave a loop at different turns (on a lane condition not alike, or from
+/// a block some of them do not reach in a turn), a value made in it is alike only inside it:
+/// after it each lane holds what it had when it left ([`LaneUniform::alike_at`]). And the old
+/// value of a destination an instruction writes only in part ([`keeps_old`]) is one of its
+/// inputs.
 fn lane_uniform(
     p: &Program,
     st: &Structured,
     all: &[bool],
     wave_tid: Option<Value>,
-) -> HashSet<Value> {
+) -> LaneUniform {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let order = crate::ir::reverse_postorder(&p.blocks);
     let regions = lane_regions(st);
+    let loops = natural_loops(p, &order);
+    let mut made: HashMap<Value, usize> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for phi in &block.phis {
+            made.insert(phi.value, b);
+        }
+        for inst in &block.insts {
+            for w in &inst.writes {
+                made.insert(w.1, b);
+            }
+        }
+    }
     let mut same: HashSet<Value> = HashSet::new();
+    // (from every loop, which only shrinks as `same` grows)
+    let mut apart: Vec<usize> = (0..loops.len()).collect();
     loop {
-        // An atom of a lane condition that every lane of a console wave holds alike.
-        let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
+        // An atom of a lane condition that every lane of a console wave holds alike in block
+        // `at`.
+        let alike_atom = |same: &HashSet<Value>, apart: &[usize], a: &Atom, at: usize| match *a {
             Atom::Uniform(_) => true,
-            Atom::Lane(v) => same.contains(&v),
+            Atom::Lane(v) => {
+                same.contains(&v) && !escapes(&made, apart.iter().map(|&k| loops[k].as_slice()), v, at)
+            }
             _ => false,
         };
-        let alike_bool = |same: &HashSet<Value>, b: Bool| {
-            st.bools.support(b).iter().all(|a| alike_atom(same, a))
+        let alike_bool = |same: &HashSet<Value>, apart: &[usize], b: Bool, at: usize| {
+            st.bools.support(b).iter().all(|a| alike_atom(same, apart, a, at))
         };
+        // The loops lanes may leave at different turns: from a block on a lane condition not
+        // alike, or from one in the region of such a branch inside the loop (which not every
+        // lane reaches in a turn).
+        let now: Vec<usize> = apart
+            .iter()
+            .copied()
+            .filter(|&k| {
+                let l = &loops[k];
+                let inside = |x: usize| l.get(x).copied().unwrap_or(false);
+                (0..l.len())
+                    .filter(|&q| inside(q) && p.blocks[q].exit.successors().into_iter().any(|s| !inside(s)))
+                    .any(|q| {
+                        let split = match st.exits.get(q) {
+                            Some(&LaneExit::Branch { when, .. }) => {
+                                !(st.wide.contains(&q) || alike_bool(&same, &apart, when, q))
+                            }
+                            Some(LaneExit::Jump(_) | LaneExit::End) => false,
+                            _ => true,
+                        };
+                        split
+                            || regions.as_ref().is_none_or(|regions| {
+                                regions.iter().any(|&(d, ref region)| {
+                                    inside(d)
+                                        && region.get(q).copied().unwrap_or(false)
+                                        && matches!(st.exits[d], LaneExit::Branch { when, .. }
+                                            if !alike_bool(&same, &apart, when, d))
+                                })
+                            })
+                    })
+            })
+            .collect();
         // Blocks every lane of a console wave reaches together: `all`, or reached only past
         // branches on alike conditions.
         let wave_all: Vec<bool> = match &regions {
@@ -604,7 +753,7 @@ fn lane_uniform(
                     let LaneExit::Branch { when, .. } = st.exits[d] else {
                         continue;
                     };
-                    if alike_bool(&same, when) {
+                    if alike_bool(&same, &now, when, d) {
                         continue;
                     }
                     for (b, r) in region.iter().enumerate() {
@@ -620,28 +769,26 @@ fn lane_uniform(
         let mut next: HashSet<Value> = HashSet::new();
         for &b in &order {
             let block = &p.blocks[b];
+            // alike where block `b` reads it
+            let known = |next: &HashSet<Value>, x: &Value| {
+                (next.contains(x) || same.contains(x))
+                    && !escapes(&made, now.iter().map(|&k| loops[k].as_slice()), *x, b)
+            };
             let whole = block
                 .preds
                 .iter()
                 .all(|&q| wave_all.get(q).copied().unwrap_or(false));
             for phi in &block.phis {
-                if matches!(phi.reg, Reg::V(_))
-                    && whole
-                    && phi
-                        .args
-                        .iter()
-                        .all(|a| next.contains(a) || same.contains(a))
-                {
+                if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| known(&next, a)) {
                     next.insert(phi.value);
                 }
             }
-            let known = |next: &HashSet<Value>, x: &Value| next.contains(x) || same.contains(x);
             for (i, inst) in block.insts.iter().enumerate() {
                 let name = inst.name();
                 // under a condition: only one every lane of the console wave holds alike, and
                 // over an old value that is alike too
                 if let Some(g) = st.guards[b][i] {
-                    if !alike_bool(&same, g) {
+                    if !alike_bool(&same, &now, g, b) {
                         continue;
                     }
                     let old_alike = inst
@@ -675,12 +822,13 @@ fn lane_uniform(
                     }
                     continue;
                 }
+                // (`v_cmpx` too: of alike operands, its EXEC holds or leaves out every lane of
+                // the console wave that runs it, as a loop's exit on it does)
                 let ops = match &inst.fields {
                     Fields::Valu(v)
                         if v.dpp.is_none()
                             && v.sdwa.is_none()
                             && !name.starts_with("v_mbcnt")
-                            && !name.starts_with("v_cmpx")
                             && !name.starts_with("v_movrel")
                             && !name.starts_with("v_swaprel")
                             && !name.starts_with("v_div_fmas")
@@ -703,8 +851,10 @@ fn lane_uniform(
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
-                // Implicit VGPR inputs include accumulators and the other side of a swap.
-                let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
+                // Implicit VGPR inputs: the old destination of one written in part
+                // (`keeps_old`), the other side of a swap. (The IR has every VGPR write read
+                // the old value, which a whole write leaves to the lanes outside EXEC.)
+                let implicit_alike = !keeps_old(name)
                     || inst
                         .reads
                         .iter()
@@ -713,7 +863,7 @@ fn lane_uniform(
                     || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
                         if inst.read(Reg::S(*code))
                             .and_then(|v| st.masks.get(&v))
-                            .is_some_and(|&b| alike_bool(&same, b)));
+                            .is_some_and(|&m| alike_bool(&same, &now, m, b)));
                 let operands_alike = ops.iter().all(|op| match *op {
                     Operand::Vector { reg, dwords } => {
                         (0..dwords).all(|i| {
@@ -738,10 +888,12 @@ fn lane_uniform(
                 }
             }
         }
-        if next.is_subset(&same) {
-            return same;
+        if next.is_subset(&same) && now == apart {
+            let apart = now.iter().map(|&k| loops[k].clone()).collect();
+            return LaneUniform { same, made, apart };
         }
         same.extend(next);
+        apart = now;
     }
 }
 
@@ -1559,6 +1711,21 @@ pub(super) fn host_rdna() -> u32 {
     if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
 }
 
+/// VICTORY_PORTABLE_FLOAT_FAST=1: experiment with cheaper floating-point
+/// clamps on non-RDNA hosts. The shader fingerprint includes the switch.
+/// The ordered-constant median uses the host's min/max NaN and zero rules;
+/// validate those on the target GPU before enabling this for normal play.
+fn portable_float_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORTABLE_FLOAT_FAST").is_some_and(|v| v == "1"))
+}
+
+/// A normal nonzero literal rules out the case where both operands are
+/// signed zeros. Subnormals are excluded because a host may flush them.
+fn excludes_zero(value: Option<f32>) -> bool {
+    value.is_some_and(f32::is_normal)
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -2153,7 +2320,7 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
-                _ => HashSet::new(),
+                _ => LaneUniform::default(),
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
@@ -4349,7 +4516,10 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        if host_rdna() & super::rdna::MAX_MIN != 0
+            || portable_float_fast()
+                && (excludes_zero(self.s.m.float_k(a)) || excludes_zero(self.s.m.float_k(b)))
+        {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -4486,7 +4656,7 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
+        if host_rdna() & super::rdna::MED3 != 0 || portable_float_fast() {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
             let ordered = match k {
                 [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
@@ -7058,13 +7228,26 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // (Renderer port 5: the twin of a constant buffer's slot is a
+            // raw view of its bytes, read as one.)
+            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            let h = if as_raw {
+                self.handle(site, src, false, (11, 0))?
+            } else {
+                self.handle(site, src, false, (13, 0x1_0000))?
+            };
             let mut both = Vec::new();
+            let dwords = if as_raw { self.raw_dwords(h, addr, raw.len() as u32) } else { Vec::new() };
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = match dwords.get(k) {
+                    Some(&x) => x,
+                    None => {
+                        let off = self.s.m.i32(4 * k as u32);
+                        let a = self.s.m.bin(b, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -7117,6 +7300,12 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.constants_raw(site, src)? {
+            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7623,6 +7812,62 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`, [`super::shader::constants_raw`]):
+    /// the handle a constant buffer `src` is read through as raw bytes, or
+    /// `None` to read it as a constant buffer, as before.
+    ///
+    /// The console takes constant buffers on 16 bytes, the host on 256: the
+    /// layer copied each one the title's tables name into upload memory of
+    /// its own at every submission (some 23,000 a frame of the city, out of
+    /// the title's graphics memory, which renderer port 1 has the card read
+    /// in place), and each root one not on 256 bytes (64 KiB each). A raw
+    /// view starts on 16 bytes and a root SRV anywhere on 4, so read so the
+    /// card can take the title's bytes where they are:
+    /// - a table's (or one picked from the view heap): through the raw twin
+    ///   of its slot ([`super::shader::raw_views`]), which the host makes a
+    ///   raw view of the same bytes; a twin's reads end where the view does,
+    ///   as a constant buffer's do;
+    /// - a root one: as the root SRV `t<slot>` in [`super::shader::ROOT_CBV_SPACE`],
+    ///   which the host binds at the title's address like any root SRV.
+    ///
+    /// Anything else (a descriptor built otherwise, or chosen between kinds of
+    /// parameter) stays a constant buffer.
+    fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constants_raw() {
+            return Ok(None);
+        }
+        if let Source::Built { address, .. } = src {
+            if self.root_copy.is_some() {
+                return Ok(None);
+            }
+            let Some(&rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+            if rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None) {
+                return Ok(Some(self.s.root_srv_handle(rp.slot)));
+            }
+            return Ok(None);
+        }
+        if super::shader::raw_views() == 0 {
+            return Ok(None);
+        }
+        let x = self.x;
+        let scalar = &self.scalar;
+        let through_heap = src.leaves().iter().all(|leaf| match leaf {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
+                .get(load)
+                .and_then(|a| x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+            _ => false,
+        });
+        if !through_heap {
+            return Ok(None);
+        }
+        // (Raw, so `raw_twin` gives the twin's index.)
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -9787,7 +10032,7 @@ impl<'a> Lower<'a> {
                 // one, unless every lane holds the same value
                 let alike = match v.src.first() {
                     Some(&Operand::Vector { reg, .. }) => {
-                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.contains(&x))
+                        inst.read(Reg::V(reg)).is_some_and(|x| self.uniform.alike_at(x, self.cur_ir))
                     }
                     _ => true,
                 };
@@ -12816,7 +13061,11 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.constants_raw(site, src)?;
+            let h = match raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -12836,7 +13085,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = match raw {
+                    Some(_) => self.raw_dwords(h, a, 1)[0],
+                    None => self.cbuffer_dword(h, a),
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -14009,6 +14261,157 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
+    /// `words` (then `s_endpgm`) as a wave64 program, and what [`super::lane_uniform`] finds of
+    /// its VGPR values (`v0` being the thread id of a group of one console wave).
+    fn alike_in(words: &[u32]) -> (ir::Program, super::LaneUniform) {
+        use crate::ir::Reg;
+        let code: Vec<_> = words.iter().chain(&[S_ENDPGM]).flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 16).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let tid = p.inputs.iter().find(|(r, _)| *r == Reg::V(0)).map(|(_, v)| *v);
+        let uniform = super::lane_uniform(&p, &st, &all, tid);
+        (p, uniform)
+    }
+
+    /// The program's one `v_readfirstlane_b32`: its block and the value it reads.
+    fn first_lane_read(p: &ir::Program) -> (usize, ir::Value) {
+        use crate::gfx10::{Fields, Operand};
+        use crate::ir::Reg;
+        let reads: Vec<_> = (0..p.blocks.len())
+            .flat_map(|b| p.blocks[b].insts.iter().map(move |i| (b, i)))
+            .filter(|(_, i)| i.name() == "v_readfirstlane_b32")
+            .collect();
+        let [(b, inst)] = reads[..] else {
+            panic!("{} first-lane reads", reads.len());
+        };
+        let Fields::Valu(v) = &inst.fields else { unreachable!() };
+        let Some(&Operand::Vector { reg, .. }) = v.src.first() else { unreachable!() };
+        (b, inst.read(Reg::V(reg)).unwrap())
+    }
+
+    /// A loop each lane leaves after the turn `v9` holds, setting v8 to the turn's number (a
+    /// scalar) while it is in it; then the first lane's v8, with every lane back in EXEC.
+    /// `turns` makes v9 from the thread id v0.
+    fn loop_left_at(turns: u32) -> Vec<u32> {
+        vec![
+            turns,       // v9 = v0 >> k
+            0x4A12_1281, // v_add_nc_u32 v9, 1, v9        (the turn after which the lane leaves)
+            0x7E10_0280, // v_mov_b32 v8, 0
+            0xBE80_047E, // s_mov_b64 s[0:1], exec
+            0xBE86_047E, // s_mov_b64 s[6:7], exec        (the lanes still in the loop)
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBF82_0001, // s_branch BODY
+            0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
+            0x8112_8112, // BODY: s_add_i32 s18, s18, 1
+            0x7E10_0212, // v_mov_b32 v8, s18
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0x7DA4_1212, // v_cmpx_eq_u32 s18, v9         (the lanes that leave now)
+            0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+            0xBF85_FFF9, // s_cbranch_scc1 LOOPTOP
+            0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
+            0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        ]
+    }
+
+    /// The block of the loop's `v_mov_b32 v8, s18` and the value it writes.
+    fn turn_number(p: &ir::Program) -> (usize, ir::Value) {
+        use crate::ir::Reg;
+        (0..p.blocks.len())
+            .flat_map(|b| p.blocks[b].insts.iter().map(move |i| (b, i)))
+            .find(|(_, i)| i.name() == "v_mov_b32" && i.machine.words[0] == 0x7E10_0212)
+            .map(|(b, i)| (b, i.write(Reg::V(8)).unwrap()))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_value_made_in_a_loop_lanes_leave_at_different_turns_is_alike_only_inside_it() {
+        // Lanes 0..31 leave after the first turn, 32..63 after the second (v9 = (v0 >> 5) + 1):
+        // after the loop v8 is 1 in the lower half and 2 in the upper one, so a host wave's
+        // own first lane is not the console's there.
+        let (p, uniform) = alike_in(&loop_left_at(0x2C12_0085)); // v_lshrrev_b32 v9, 5, v0
+        let (body, v8) = turn_number(&p);
+        assert!(uniform.alike_at(v8, body), "the turn's number, in the turn");
+        let (end, read) = first_lane_read(&p);
+        assert_eq!(read, v8);
+        assert!(!uniform.alike_at(read, end), "after the loop: what each lane had when it left");
+    }
+
+    #[test]
+    fn a_value_made_in_a_loop_the_console_wave_leaves_together_is_alike_after_it() {
+        // v9 = (v0 >> 6) + 1: one turn for every lane of the console wave
+        let (p, uniform) = alike_in(&loop_left_at(0x2C12_0086)); // v_lshrrev_b32 v9, 6, v0
+        let (end, read) = first_lane_read(&p);
+        assert!(uniform.alike_at(read, end));
+    }
+
+    /// `first`, then `write` over v1, then the first lane's v1.
+    fn written_over(first: u32, write: u32) -> bool {
+        let words = [
+            first,
+            0x7E04_0201, // v_mov_b32 v2, s1
+            write,
+            0x7E20_0501, // v_readfirstlane_b32 s16, v1
+        ];
+        let (p, uniform) = alike_in(&words);
+        let (b, read) = first_lane_read(&p);
+        uniform.alike_at(read, b)
+    }
+
+    #[test]
+    fn a_write_in_part_keeps_what_the_destination_held() {
+        const LANE: u32 = 0x7E02_0300; // v_mov_b32 v1, v0      (each lane its own)
+        const ZERO: u32 = 0x7E02_0280; // v_mov_b32 v1, 0
+        // v_add_f16 v1, s0, v2: the low half alike, the high half kept
+        assert!(!written_over(LANE, 0x6402_0400));
+        assert!(written_over(ZERO, 0x6402_0400));
+        // v_dot4c_i32_i8 v1, s0, v2: v1 += the dot product
+        assert!(!written_over(LANE, 0x1A02_0400));
+        assert!(written_over(ZERO, 0x1A02_0400));
+        // whole writes leave the old value only to the lanes outside EXEC:
+        // v_mov_b32 v1, s0 and v_cvt_f32_f16 v1, s0
+        assert!(written_over(LANE, 0x7E02_0200));
+        assert!(written_over(LANE, 0x7E02_1600));
+    }
+
+    #[test]
+    fn writes_in_part_by_name() {
+        for (name, keeps) in [
+            ("v_add_f16", true),
+            ("v_cvt_f16_f32", true),
+            ("v_fma_mixlo_f16", true),
+            ("v_mad_u16", true),
+            ("v_lshlrev_b16", true),
+            ("v_dot2c_f32_f16", true),
+            ("v_dot4c_i32_i8", true),
+            ("v_fmac_f32", true),
+            ("v_pk_fmac_f16", true),
+            ("v_swap_b32", true),
+            ("v_cvt_f32_f16", false),
+            ("v_fma_mix_f32", false),
+            ("v_pk_add_f16", false),
+            ("v_cvt_pkrtz_f16_f32", false),
+            ("v_dot2_f32_f16", false),
+            ("v_add_nc_u32", false),
+            ("v_mov_b32", false),
+            ("v_cvt_f32_ubyte0", false),
+        ] {
+            assert_eq!(super::keeps_old(name), keeps, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_normal_literals_prove_signed_zero_fixup_unnecessary() {
+        use super::excludes_zero;
+        for value in [1.0, -1.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE, f32::MAX] {
+            assert!(excludes_zero(Some(value)));
+        }
+        for value in [0.0, -0.0, f32::from_bits(1), f32::NAN, f32::INFINITY] {
+            assert!(!excludes_zero(Some(value)));
+        }
+        assert!(!excludes_zero(None));
+    }
+
     #[test]
     fn shifted_thread_ids_are_uniform_only_when_every_lane_agrees() {
         use crate::ir::Reg;
@@ -14023,7 +14426,7 @@ mod tests {
             let shifted = inst.writes.iter().find(|w| w.0 == Reg::V(7)).unwrap().1;
             let uniform = super::lane_uniform(&p, &st, &[true], Some(tid));
             let expected = (0..64u32).all(|lane| lane.wrapping_shr(shift) == 0);
-            assert_eq!(uniform.contains(&shifted), expected, "inline shift {shift}");
+            assert_eq!(uniform.alike_at(shifted, 0), expected, "inline shift {shift}");
         }
     }
 
@@ -14043,7 +14446,7 @@ mod tests {
         let old_v0 = swap.read(Reg::V(0)).unwrap();
         let new_v1 = swap.write(Reg::V(1)).unwrap();
         let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0));
-        assert!(!uniform.contains(&new_v1));
+        assert!(!uniform.alike_at(new_v1, 0));
     }
 
     #[test]
