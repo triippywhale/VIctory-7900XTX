@@ -188,6 +188,11 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
+    crate::memory::results(src as u64, len as u64).or_else(|| shaders_wrote(src, len))
+}
+
+/// The title buffer's own host copy of `[src, src + len)`, if shaders write it.
+fn shaders_wrote(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {
     crate::shadow::peek(src as u64, len as u64).filter(|s| s.written() && !s.in_place())
 }
 
@@ -201,10 +206,27 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
-        let Some(to) = crate::shadow::peek(dst as u64, len as u64).filter(|s| !s.in_place()) else {
+        // A copy of what the structure builder stored in a window: only the
+        // card has it, so the destination is given a copy if it has none
+        // (where the title's CPU reads it, nothing on the card did before).
+        let results = crate::memory::results(src as u64, len as u64);
+        let builder = results.is_some();
+        let own = results.or_else(|| shaders_wrote(src, len));
+        let to = match builder {
+            true => crate::shadow::find(dst as u64, len as u64),
+            false => crate::shadow::peek(dst as u64, len as u64),
+        };
+        let Some(to) = to.filter(|s| !s.in_place()) else {
+            #[cfg(feature = "diagnostics")]
+            if builder {
+                crate::memory::trace_results_copy(dst, src, len, "not placed (no copy of the destination)");
+            }
             return false;
         };
-        let own = shaders_own(src, len);
+        #[cfg(feature = "diagnostics")]
+        if builder {
+            crate::memory::trace_results_copy(dst, src, len, "placed, out of the builder's window");
+        }
         let scratch = match &own {
             Some(_) => None,
             None if len <= MOST => match self.scratch_at(len as u64) {

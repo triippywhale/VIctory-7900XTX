@@ -192,6 +192,11 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Pages of title memory whose window (not the title buffer's own copy)
+    /// the builder stores small results in ([`Memory::small`]), and that
+    /// window's place in `copies`: where a copy of those results reads them
+    /// ([`results`]).
+    results: HashMap<u64, usize>,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -267,6 +272,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            results: HashMap::new(),
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -750,6 +756,16 @@ impl Memory {
                 self.copies[k].refresh(list, at, n);
                 self.copies[k].gpu_writes(list, at, n);
                 self.stats.back += 1;
+                // A window of title memory around the buffer: the buffer's
+                // own copy, which the title's copies read, is another one.
+                let own = crate::shadow::peek(at, n).is_some_and(|s| Arc::ptr_eq(&s, &self.copies[k]));
+                if !own && self.results.insert(page, k).is_none() {
+                    RESULTS.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        page = format_args!("{:#x}", page * PAGE),
+                        "title memory by address: the structure builder's results lie in a window; copies of them read it"
+                    );
+                }
             }
             at += n;
         }
@@ -804,6 +820,66 @@ impl Memory {
             self.faulted
         );
         self.stats.from = Some((now, self.frame));
+    }
+}
+
+/// Whether the builder stored results in a window at all ([`results`]).
+static RESULTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a copy of the builder's results is read out of its window
+/// (`VICTORY_BVH_RESULTS_COPY=0`: out of title memory at submission, as
+/// before).
+fn results_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_RESULTS_COPY").is_none_or(|v| v != "0"))
+}
+
+/// The copy that holds what the structure builder stored at `[src, src +
+/// len)`, if that is a window of title memory around a small title buffer
+/// rather than the buffer's own copy.
+///
+/// The builder's program of a structure's compacted size stores into a small
+/// title buffer through title memory by address, so into the window of the
+/// page that holds it ([`Memory::map`]). If the title then copies that buffer
+/// in a list (to where its CPU reads the size), the copy was taken out of
+/// title memory at submission, before the card had run the program: the size
+/// of the structure asked for before ([`sizes_wait`] could not help). Memory
+/// of that size taken, the copy of the new structure wrote over its
+/// neighbours. A copy out of these bytes reads the window instead, on the
+/// card, at its place in the list ([`crate::host::HostList::place_copy`]).
+pub(crate) fn results(src: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 || !RESULTS.load(std::sync::atomic::Ordering::Relaxed) || !results_copy() {
+        return None;
+    }
+    let page = src / PAGE;
+    if (src + len - 1) / PAGE != page {
+        return None;
+    }
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let &k = m.results.get(&page)?;
+    let shadow = m.copies.get(k)?;
+    shadow.written().then(|| shadow.clone())
+}
+
+/// `VICTORY_BVH_TRACE=1`: a buffer copy out of the builder's results.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_results_copy(dst: usize, src: usize, len: usize, how: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 400 || n.is_multiple_of(500) {
+        let mut b = [0u8; 8];
+        crate::host::copy_mapped(b.as_mut_ptr(), src as *const u8, 8.min(len), false);
+        tracing::info!(
+            n,
+            frame = crate::frame::current(),
+            "bvh trace: copy of the builder's results {src:#x} -> {dst:#x} ({len} bytes), {how}; title memory had {:#x}",
+            u64::from_le_bytes(b)
+        );
     }
 }
 
