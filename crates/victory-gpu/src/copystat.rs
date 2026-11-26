@@ -791,6 +791,11 @@ fn log_memory() {
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+        let [free, empty, sixteen, four, one] = crate::pool::free_parts().map(|b| b >> 20);
+        tracing::info!(
+            "memory in blocks, the textures' free room: {free} MB, of it {empty} MB in blocks with nothing in them, {sixteen} MB in \
+             whole free parts of 16 MiB, {four} MB of 4 MiB, {one} MB of 1 MiB (what blocks of that size would give back)"
+        );
     }
     let targets = crate::resource::targets_census();
     tracing::info!(
