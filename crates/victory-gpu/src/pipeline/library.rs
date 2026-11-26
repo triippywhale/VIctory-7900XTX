@@ -454,6 +454,26 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Serializes driver pipeline compilation (CreateGraphicsPipelineState /
+/// CreateComputePipelineState). On AMD drivers (amdxc64.dll), concurrent PSO
+/// creation across multiple worker threads races in boost::serialization singletons
+/// and causes access violation crashes (0xc0000005).
+/// Enabled by default on AMD adapters, or via VICTORY_DRIVER_COMPILE_LOCK=1 / VICTORY_LIBRARY_LOCK=1.
+fn compile_lock() -> Option<MutexGuard<'static, ()>> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static COMPILING: Mutex<()> = Mutex::new(());
+    ON.get_or_init(|| {
+        if let Some(v) = std::env::var_os("VICTORY_DRIVER_COMPILE_LOCK") {
+            v == "1"
+        } else if std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1") {
+            true
+        } else {
+            crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device))
+        }
+    })
+    .then(|| COMPILING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
@@ -713,6 +733,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
+        let _compile = compile_lock();
         return create_guarded(name, create);
     };
     let began = std::time::Instant::now();
@@ -738,9 +759,12 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
-    // Compiles take up to seconds. Keep only this name held.
+    // Compiles take up to seconds. Keep only this name held; serialized
+    // across workers on AMD (or with VICTORY_DRIVER_COMPILE_LOCK=1) to
+    // prevent multithreaded races in amdxc64.dll.
     let pso = {
         let _call = call("make", name);
+        let _compile = compile_lock();
         create_guarded(name, create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
