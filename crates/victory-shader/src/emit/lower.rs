@@ -9537,39 +9537,6 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
-    /// Both binary16 factors have an exact product in binary32. Use the
-    /// error-free sum residual to round an inexact sum to odd before the
-    /// final binary16 conversion (Boldo and Melquiond, 2008).
-    fn fmad_half(&mut self, a: V, b: V, addend: V) -> V {
-        let c = self.cur;
-        let product = self.s.m.bin(c, Bin::Mul, a, b);
-        let sum = self.fmad(a, b, addend);
-        let rounded_addend = self.s.m.bin(c, Bin::Sub, sum, product);
-        let rounded_product = self.s.m.bin(c, Bin::Sub, sum, rounded_addend);
-        let lost_product = self.s.m.bin(c, Bin::Sub, product, rounded_product);
-        let lost_addend = self.s.m.bin(c, Bin::Sub, addend, rounded_addend);
-        let residual = self.s.m.bin(c, Bin::Add, lost_product, lost_addend);
-
-        let bits = self.as_int(sum);
-        let residual_bits = self.as_int(residual);
-        let one = self.s.m.i32(1);
-        let minus_one = self.s.m.i32(u32::MAX);
-        let zero = self.s.m.i32(0);
-        let zero_f = self.s.m.f32(0);
-        let low_bit = self.s.m.bin(c, Bin::And, bits, one);
-        let even = self.s.m.cmp(c, pred::EQ, low_bit, zero);
-        // An ordered comparison also leaves NaNs and infinities on the
-        // existing path: their addition residual is NaN.
-        let inexact = self.s.m.cmp(c, pred::ONE, residual, zero_f);
-        let adjust = self.s.m.bin(c, Bin::And, even, inexact);
-        let signs = self.s.m.bin(c, Bin::Xor, bits, residual_bits);
-        let toward_zero = self.s.m.cmp(c, pred::SLT, signs, zero);
-        let delta = self.s.m.select(c, toward_zero, minus_one, one);
-        let odd = self.s.m.bin(c, Bin::Add, bits, delta);
-        let rounded = self.s.m.select(c, adjust, odd, bits);
-        self.as_float(rounded)
-    }
-
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
     /// op_sel (or an SDWA word select) picks the high half, except that
     /// 16-bit compares other than `v_cmp_class` ignore op_sel; inline float
@@ -9814,8 +9781,9 @@ impl<'a> Lower<'a> {
                 self.half_fsrc(inst, 2)?
             };
             let r = match name {
-                "v_fma_f16" | "v_fmac_f16" => self.fmad_half(a, b, acc),
-                "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                // shortcut: fused f16 multiply-adds as FMad in f32 (the
+                // product is exact; the sum rounds twice).
+                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)

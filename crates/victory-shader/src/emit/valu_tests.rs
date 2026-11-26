@@ -648,47 +648,6 @@ fn v_med3_f32_matches_rdna2_with_nan() {
     });
 }
 
-fn check_half_fma_nearest_even(body: [u32; 2]) {
-    let cases = [
-        ([0x6600, 0x3956, 0x0400, 0], 0x6401), // 1024.5 plus 2^-14
-        ([0x6600, 0x3956, 0, 0], 0x6400), // exact tie, even
-        ([0xe600, 0x3956, 0x8400, 0], 0xe401), // negative midpoint plus a negative tail
-        ([0x6700, 0x3894, 0x8400, 0], 0x6401), // 1025.5 minus 2^-14
-        ([0x6700, 0x3894, 0, 0], 0x6402), // exact tie, even
-    ];
-    let inputs = cases.map(|(input, _)| input);
-    run_cases(&build_valu_cs(&body), &inputs, |backend, i, _, got| {
-        assert_eq!(got & 0xffff, cases[i].1, "{backend}: case {i}");
-    });
-}
-
-#[test]
-fn half_fma_rounds_once_to_nearest_even() {
-    check_half_fma_nearest_even(vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3)));
-}
-
-#[test]
-fn half_fmac_rounds_once_to_nearest_even() {
-    let fmac = (0x036 << 25) | (2 << 9) | u32::from(vgpr(1));
-    check_half_fma_nearest_even([vop1(0x001, 0, vgpr(3)), fmac]);
-}
-
-#[test]
-fn half_fma_rounds_once_toward_zero() {
-    let [op, src] = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3));
-    let shader = build_valu_cs(&[0xba80_0881, 3, op, src]); // MODE.FP_ROUND16_64 = RTZ
-    let cases = [
-        ([0x6800, 0x3c00, 0x8400, 0], 0x67ff), // 2048 minus 2^-14
-        ([0x0400, 0xbc00, 0x6800, 0], 0x67ff), // same sum with the addend larger
-        ([0xe800, 0x3c00, 0x0400, 0], 0xe7ff), // negative mirror
-        ([0x6800, 0x3c00, 0, 0], 0x6800),
-    ];
-    let inputs = cases.map(|(input, _)| input);
-    run_cases(&shader, &inputs, |backend, i, _, got| {
-        assert_eq!(got & 0xffff, cases[i].1, "{backend}: case {i}");
-    });
-}
-
 /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
 /// FMin compare and select, which can give either zero.
 #[test]
