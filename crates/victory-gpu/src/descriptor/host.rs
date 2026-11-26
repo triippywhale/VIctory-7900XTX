@@ -894,12 +894,33 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // No pass runs (no shader that picks textures by index is bound:
+        // a cutscene, a load). The ranges were dropped here, and a slot
+        // done with its rechecks whose memory changed meanwhile showed
+        // what it held before for the rest of the run (black, for one
+        // first uploaded before the streamer filled it; run-addr0 dropped
+        // 32,768 at a cutscene change). They are made coarser instead: a
+        // pass makes more slots due than were touched, never fewer.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        coarsen(&mut ranges, MOST / 4);
     }
     ranges.push((start, end));
+}
+
+/// Makes `ranges` at most `most` long by widening them to blocks of
+/// 64 KiB, then 4 times larger each round, and joining what then touches:
+/// every byte in a range before is in one after.
+fn coarsen(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    let mut block: u64 = 64 << 10;
+    join(ranges);
+    while ranges.len() > most.max(1) {
+        for r in ranges.iter_mut() {
+            r.0 &= !(block - 1);
+            r.1 = r.1.saturating_add(block - 1) & !(block - 1);
+        }
+        join(ranges);
+        block = block.saturating_mul(4);
+    }
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -5771,6 +5792,20 @@ mod tests {
 
     /// Memory the runtime maps under a slot's texture makes the slot due
     /// again from the next frame; a stale slot leaves the queue.
+    #[test]
+    fn coarsened_ranges_hold_every_byte_and_fit() {
+        let mut ranges: Vec<(u64, u64)> = (0..40_000u64).map(|i| (0x1_0000_0000 + i * 0x3_1000, 0x1_0000_0000 + i * 0x3_1000 + 0x1000)).collect();
+        let before = ranges.clone();
+        coarsen(&mut ranges, 1000);
+        assert!(ranges.len() <= 1000);
+        for (start, end) in before {
+            assert!(ranges.iter().any(|&(s, e)| s <= start && end <= e));
+        }
+        let mut few = vec![(0x5000u64, 0x6000u64), (0x1000, 0x2000)];
+        coarsen(&mut few, 8);
+        assert_eq!(few, [(0x1000, 0x2000), (0x5000, 0x6000)]);
+    }
+
     #[test]
     fn remapped_memory_makes_its_texture_slots_due() {
         let Some(heap) = HostHeap::new(false, 8) else {
