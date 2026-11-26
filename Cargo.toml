@@ -72,6 +72,12 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# The translator is compute-bound, and whole-program optimisation reaches
+# across the crate boundaries that per-unit code generation cannot. Thin LTO
+# keeps the build near the plain build's length; one codegen unit lets the
+# last unit inline across the whole crate.
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
