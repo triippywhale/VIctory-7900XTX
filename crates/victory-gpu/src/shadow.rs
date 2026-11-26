@@ -4846,30 +4846,64 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let end = start.saturating_add(len);
+    let mut map = buffers();
+    if len >= BIG_BUFFER {
+        big_buffers_write().insert((start, resource), end);
+    }
+    map.insert((start, resource), Entry { end, shadow: None });
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    if map.remove(&(start, resource)).is_some_and(|e| e.end - start >= BIG_BUFFER) {
+        big_buffers_write().remove(&(start, resource));
+    }
+}
+
+/// Title buffers of at least this many bytes are kept in [`BIG_BUFFERS`] too.
+const BIG_BUFFER: u64 = 1 << 20;
+
+/// The big title buffers (start, resource) -> end, a subset of [`BUFFERS`]
+/// changed under its write lock (lock order: `BUFFERS`, then this).
+///
+/// A heap's placed buffers lie inside a big buffer over the same memory,
+/// and a look among the 64 buffers that start below an address (as
+/// [`holding`] does first) misses the big one once more than 64 placed
+/// buffers start between it and the address: the range then got a loose
+/// window of its own, copied and kept beside the big buffer's copy. After
+/// PalmVIDev 7dcdd0eba (`MAX_SPAN`), bounded here by looking only at big
+/// buffers in the fallback, so that a miss (all of loose memory) stays cheap.
+static BIG_BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), u64>> = std::sync::RwLock::new(BTreeMap::new());
+
+fn big_buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), u64>> {
+    BIG_BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The innermost title buffer holding `[address, end)`: among the 64 that
+/// start closest below `address`, else among the big ones ([`BIG_BUFFERS`]).
+/// The caller holds `map`'s lock.
+fn holding(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    let near = map.range(..=(address, usize::MAX)).rev().take(64);
+    if let Some((key, _)) = near.clone().find(|(_, e)| e.end >= end) {
+        return Some(*key);
+    }
+    // Fewer than 64 below: none was skipped.
+    if near.count() < 64 {
+        return None;
+    }
+    let big = BIG_BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+    big.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| **e >= end).map(|(k, _)| *k)
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end > address)
-        .map(|(k, e)| (k.0, e.end - k.0))
+    let map = buffers_read();
+    let key = holding(&map, address, address.checked_add(1)?)?;
+    map.get(&key).map(|e| (key.0, e.end - key.0))
 }
 
 /// Title memory `[at, at + len)` is about to show something else or be
@@ -4889,10 +4923,22 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
     {
-        // As `lookup` finds a buffer: among the 256 that start below.
+        // As `lookup` finds a buffer: among the 256 that start below, and
+        // the big ones ([`holding`]).
         let mut map = buffers();
+        let big: Vec<(u64, usize)> = {
+            let big = BIG_BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+            big.range(..(end, 0)).rev().take(64).filter(|(_, e)| **e > at).map(|(k, _)| *k).collect()
+        };
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                gone.extend(entry.shadow.take());
+            }
+        }
+        for key in big {
+            if let Some(entry) = map.get_mut(&key)
+                && entry.shadow.as_ref().is_some_and(|s| s.place.is_some())
+            {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -4949,7 +4995,8 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+    let map = buffers_read();
+    map.get(&holding(&map, address, end)?).and_then(|e| e.shadow.clone())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
@@ -4960,7 +5007,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+        match holding(&map, address, end).and_then(|key| map.get_key_value(&key)) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
@@ -4977,12 +5024,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
     }
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = holding(&map, address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end, len <= 1, any);
@@ -5188,8 +5230,8 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     let end = address.checked_add(len)?;
     let map = buffers_read();
-    let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
-    found.map(|(k, e)| (k.0, e.end - k.0))
+    let key = holding(&map, address, end)?;
+    map.get(&key).map(|e| (key.0, e.end - key.0))
 }
 
 /// Whether a title buffer of at most `most` bytes lies in `[address, address
@@ -5613,4 +5655,32 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod holding_tests {
+    use super::{buffers_read, holding, in_buffer, register, unregister};
+
+    /// A big buffer is found past more than 64 smaller buffers placed in
+    /// it (PalmVIDev 7dcdd0eba), and not once it is released.
+    #[test]
+    fn a_big_buffer_is_found_past_its_placed_buffers() {
+        let base = 0x7e57_0000_0000u64;
+        let big_len = 0x0200_0000u64;
+        register(1, base, big_len);
+        for i in 0..128usize {
+            register(100 + i, base + (i as u64) * 0x1000, 0x100);
+        }
+        let at = base + 128 * 0x1000 + 0x80;
+        assert_eq!(in_buffer(at, 64), Some((base, big_len)));
+        // A placed buffer itself is the innermost.
+        assert_eq!(in_buffer(base + 5 * 0x1000 + 0x10, 16), Some((base + 5 * 0x1000, 0x100)));
+        // Past the big buffer's end: none.
+        assert_eq!(holding(&buffers_read(), base + big_len - 16, base + big_len + 16), None);
+        unregister(1, base);
+        assert_eq!(in_buffer(at, 64), None);
+        for i in 0..128usize {
+            unregister(100 + i, base + (i as u64) * 0x1000);
+        }
+    }
 }
