@@ -725,7 +725,7 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     }
     for (src, dst, len) in copies {
         // SAFETY: the caller's ranges.
-        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        unsafe { copy_streaming(src as *const u8, dst as *mut u8, len) };
     }
 }
 
@@ -1416,6 +1416,92 @@ fn for_pieces_of(from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
     }
 }
 
+/// Copies `len` bytes whose destination the CPU does not read again soon (a
+/// snapshot, compared only after the card ran), with streaming stores if
+/// they are many (`VICTORY_STREAM_COPY=0`: a plain copy).
+///
+/// An ordinary copy reads each line of the destination before it writes
+/// it. On an i9-12900K with two DDR5-5200 modules writes are what is
+/// scarce: 512 MB copied 14.5 GB/s on one thread and no more on sixteen,
+/// written alone 23 GB/s, copied with streaming stores 24 GB/s (reads 37
+/// GB/s on one thread, 55 on several).
+///
+/// # Safety
+/// Both ranges are valid for `len` bytes and do not overlap.
+pub(crate) unsafe fn copy_streaming(src: *const u8, dst: *mut u8, len: usize) {
+    // Below this a plain copy: the head and tail cost as much, and small
+    // destinations may well be in the cache already.
+    const FEW: usize = 4096;
+    #[cfg(target_arch = "x86_64")]
+    if len >= FEW && streaming() {
+        // SAFETY: the caller's; AVX2 is there (`streaming`).
+        unsafe { stream_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: the caller's.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+/// Whether [`copy_streaming`] streams.
+fn streaming() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_STREAM_COPY") {
+        return on && avx2();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| avx2() && std::env::var_os("VICTORY_STREAM_COPY").is_none_or(|v| v != "0"))
+}
+
+fn avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// The head up to a 32-byte boundary of `dst` and the tail plainly, the rest
+/// in 32-byte streaming stores, four at a time; fenced, so that whoever is
+/// told the copy is done sees the bytes.
+///
+/// # Safety
+/// As [`copy_streaming`]; the CPU has AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn stream_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    let head = (dst as usize).wrapping_neg() & 31;
+    // SAFETY: the caller's ranges throughout; `head < 32 <= len`, and the
+    // streamed part is whole 32-byte blocks inside them, `dst` aligned.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let (s, d) = (src.add(head), dst.add(head));
+        let blocks = (len - head) / 32;
+        let mut i = 0;
+        while i + 4 <= blocks {
+            let a = _mm256_loadu_si256(s.add(i * 32).cast::<__m256i>());
+            let b = _mm256_loadu_si256(s.add(i * 32 + 32).cast::<__m256i>());
+            let c = _mm256_loadu_si256(s.add(i * 32 + 64).cast::<__m256i>());
+            let e = _mm256_loadu_si256(s.add(i * 32 + 96).cast::<__m256i>());
+            _mm256_stream_si256(d.add(i * 32).cast::<__m256i>(), a);
+            _mm256_stream_si256(d.add(i * 32 + 32).cast::<__m256i>(), b);
+            _mm256_stream_si256(d.add(i * 32 + 64).cast::<__m256i>(), c);
+            _mm256_stream_si256(d.add(i * 32 + 96).cast::<__m256i>(), e);
+            i += 4;
+        }
+        while i < blocks {
+            _mm256_stream_si256(d.add(i * 32).cast::<__m256i>(), _mm256_loadu_si256(s.add(i * 32).cast::<__m256i>()));
+            i += 1;
+        }
+        let done = head + blocks * 32;
+        std::ptr::copy_nonoverlapping(src.add(done), dst.add(done), len - done);
+        _mm_sfence();
+    }
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -1427,7 +1513,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     let threads = (len / PER_THREAD).clamp(1, 6);
     if threads == 1 {
         // SAFETY: the caller's.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+        unsafe { copy_streaming(src, dst, len) };
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
@@ -1437,7 +1523,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let n = each.min(len - at);
             s.spawn(move || {
                 // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                unsafe { copy_streaming((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
         }
     });
@@ -1645,7 +1731,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    unsafe { copy_streaming(src as *const u8, dst as *mut u8, len) };
                 }
             }));
         }
@@ -1841,6 +1927,27 @@ mod wide_tests {
         assert!(jobs.len() >= 3);
         wide(jobs);
         assert!(src == dst);
+    }
+
+    /// A streaming copy puts every byte of the range and none beside it,
+    /// whatever the alignment of either side and the length (under the
+    /// plain copy's threshold, at it, a few blocks more, an odd tail).
+    #[test]
+    fn a_streaming_copy_copies_the_range_and_nothing_beside() {
+        let src: Vec<u8> = (0..300_000usize).map(|i| (i * 131 + i / 251) as u8).collect();
+        for len in [0usize, 1, 31, 4095, 4096, 4097, 4096 + 127, 70_001, 200_000] {
+            for src_at in [0usize, 1, 7, 32, 45] {
+                for dst_at in [0usize, 1, 13, 31, 32, 64 + 5] {
+                    let mut dst = vec![0xA5u8; len + dst_at + 100];
+                    // SAFETY: both inside their vectors, apart.
+                    unsafe { super::copy_streaming(src.as_ptr().add(src_at), dst.as_mut_ptr().add(dst_at), len) };
+                    let at = (len, src_at, dst_at);
+                    assert!(dst[..dst_at].iter().all(|&b| b == 0xA5), "before {at:?}");
+                    assert!(dst[dst_at..dst_at + len] == src[src_at..src_at + len], "inside {at:?}");
+                    assert!(dst[dst_at + len..].iter().all(|&b| b == 0xA5), "after {at:?}");
+                }
+            }
+        }
     }
 
     /// The pieces found on several threads are the ones a walk piece by
@@ -3356,7 +3463,7 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     // SAFETY: as below; `hi <= total`.
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                        copy_streaming(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
                     }
                     kept.0[piece] = whole;
                 }
