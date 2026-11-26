@@ -855,7 +855,7 @@ impl Memory {
         self.directory.1.refresh(list, start, len);
         // With `arenas_told`: an arena's pages this module wrote lately, and
         // all of it every `TOLD_WHOLE` frames.
-        let whole = !arenas_told() || self.frame % TOLD_WHOLE == 0;
+        let whole = !arenas_told() || self.frame.is_multiple_of(TOLD_WHOLE);
         for n in 0..self.copies.len() {
             let shadow = self.copies[n].clone();
             let (start, len) = shadow.span();
