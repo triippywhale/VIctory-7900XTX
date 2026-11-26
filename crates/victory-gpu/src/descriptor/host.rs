@@ -5690,7 +5690,7 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };
-        let marked = |slot: u32| heap.spanned.all(|_| true).contains(&slot);
+        let marked = |slot: u32| heap.spanned.all(u64::MAX).contains(&slot);
         let at = 0x7fed_0000_0000u64;
         let view = |address: u64, width: u32| {
             let mut desc = [0u32; 16];
@@ -5711,7 +5711,7 @@ mod tests {
         assert!(heap.note_buffer(2, None, false).is_empty());
         let spans = heap.placed.lock().unwrap();
         assert!(spans.by_slot.is_empty() && spans.by_start.is_empty() && spans.first.is_empty());
-        assert!(heap.spanned.all(|_| true).is_empty());
+        assert!(heap.spanned.all(u64::MAX).is_empty());
     }
 
     #[test]
