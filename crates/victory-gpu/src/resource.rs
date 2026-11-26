@@ -1229,6 +1229,8 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
+    /// Newest host submission fence value when last asked for.
+    last_fence: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
     /// Its host copy was let go as idle once.
@@ -1912,6 +1914,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
     if r.host.used.load(Relaxed) != now {
         r.host.used.store(now, Relaxed);
     }
+    let fence = crate::host::pending_submission_fence();
+    if r.host.last_fence.load(Relaxed) < fence {
+        r.host.last_fence.store(fence, Relaxed);
+    }
     made.clone()
 }
 
@@ -2420,6 +2426,147 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Fence-gated LRU eviction of cached `HostTexture` copies, safely unpinning
+/// and nulling stale bindless descriptor slots (`HostHeap::kept`).
+///
+/// - When `needed_bytes` is `None` (routine sweep): inspects a rolling window
+///   and evicts at most `cap` textures unused for `> 120` frames whose
+///   `last_fence <= completed_fence`.
+/// - When `needed_bytes` is `Some(target)` (over `VICTORY_MEM_BUDGET_MB`):
+///   sorts all fence-completed textures oldest-first and evicts until
+///   `freed_bytes >= target` (90% hysteresis target).
+#[cfg(windows)]
+pub(crate) fn evict_lru(
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if cap == 0 {
+        return (0, 0);
+    }
+    static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    const ROUTINE_SCAN: usize = 4096;
+
+    let mut evicted: Vec<Made> = Vec::new();
+    let mut freed_bytes = 0u64;
+    let mut first_at = None;
+
+    {
+        let all = textures();
+        if all.is_empty() {
+            return (0, 0);
+        }
+        let candidates: Vec<usize> = if needed_bytes.is_some() {
+            let mut aged: Vec<(u64, usize)> = all
+                .iter()
+                .copied()
+                .filter_map(|at| {
+                    // SAFETY: `all` holds `TEXTURES` lock; `Drop for Resource` removes `at` under it.
+                    let r = unsafe { &*(at as *const Resource) };
+                    let used = r.host.used.load(Relaxed);
+                    let ok = used != 0
+                        && fills(&r.desc)
+                        && completed_fence >= r.host.last_fence.load(Relaxed)
+                        && !crate::texture::host_wrote(at);
+                    ok.then_some((used, at))
+                })
+                .collect();
+            aged.sort_unstable_by_key(|&(used, at)| (used >> 32, used & 0xffff_ffff, at));
+            aged.into_iter().map(|(_, at)| at).collect()
+        } else {
+            let start = CURSOR.load(Relaxed);
+            let mut scanned = 0usize;
+            let mut out = Vec::new();
+            for &at in all.range(start..).take(ROUTINE_SCAN) {
+                scanned += 1;
+                // SAFETY: `TEXTURES` lock is held.
+                let r = unsafe { &*(at as *const Resource) };
+                let used = r.host.used.load(Relaxed);
+                let last_frame = used >> 32;
+                if used != 0
+                    && fills(&r.desc)
+                    && frame.saturating_sub(last_frame) > crate::gc::IDLE_FRAMES
+                    && completed_fence >= r.host.last_fence.load(Relaxed)
+                    && !crate::texture::host_wrote(at)
+                {
+                    out.push((last_frame, at));
+                }
+                if scanned == ROUTINE_SCAN {
+                    CURSOR.store(at.saturating_add(1), Relaxed);
+                }
+            }
+            if scanned < ROUTINE_SCAN {
+                CURSOR.store(0, Relaxed);
+            }
+            out.sort_unstable_by_key(|&(f, at)| (f, at));
+            out.into_iter().map(|(_, at)| at).collect()
+        };
+
+        for at in candidates {
+            if evicted.len() >= cap {
+                break;
+            }
+            if let Some(target) = needed_bytes
+                && freed_bytes >= target
+            {
+                break;
+            }
+            // SAFETY: `TEXTURES` lock is held.
+            let r = unsafe { &*(at as *const Resource) };
+            let taken = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let can_evict = made.as_ref().is_some_and(|(host, twin)| {
+                    if std::sync::Arc::strong_count(host) != 1
+                        || host.ahead.load(Relaxed) == 1
+                        || completed_fence < r.host.last_fence.load(Relaxed)
+                    {
+                        return false;
+                    }
+                    let pinned = crate::descriptor::host::slot_ref_count(&host.texture);
+                    twin.is_none() && (crate::host::references(&host.texture) as usize) == 1 + pinned
+                });
+                if can_evict {
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    r.host.gone.store(true, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(pair) = taken {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(pair.0.bytes, Relaxed);
+                freed_bytes = freed_bytes.saturating_add(pair.0.bytes);
+                if first_at.is_none() {
+                    first_at = Some(at);
+                }
+                evicted.push(pair);
+            }
+        }
+    }
+
+    // All `TEXTURES` and `r.host.made` locks are released before nulling
+    // bindless slots and retiring D3D12 resources.
+    let count = evicted.len();
+    for (host, twin) in evicted {
+        let _ = crate::descriptor::host::evict_resource(&host.texture);
+        crate::host::retire((host, twin));
+    }
+    if count > 0 {
+        crate::host::trail(|| {
+            format!(
+                "gc: {count} cached textures evicted ({} KiB), descriptor slots nulled; first: {:#x}",
+                freed_bytes >> 10,
+                first_at.unwrap_or(0)
+            )
+        });
+    }
+    (count, freed_bytes)
 }
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
@@ -2976,6 +3123,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
+            last_fence: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),

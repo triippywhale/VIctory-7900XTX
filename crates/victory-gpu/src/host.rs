@@ -39,7 +39,7 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
-    fence: ID3D12Fence,
+    pub(crate) fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -95,6 +95,12 @@ fn retired() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(u64, 
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Most recent value signaled on `Host::fence`.
+static LAST_SIGNALED_FENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn pending_submission_fence() -> u64 {
+    LAST_SIGNALED_FENCE.load(Ordering::Acquire) + crate::queue::queued()
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 #[allow(dead_code)]
@@ -2268,6 +2274,29 @@ fn trim_spare_chunks() {
     drop(freed);
 }
 
+/// Trims spare scratch chunks down to `keep_max` bytes under VRAM/RAM budget
+/// pressure, returning the bytes freed.
+pub(crate) fn trim_spare_scratch(keep_max: u64) -> u64 {
+    let mut freed = Vec::new();
+    let mut freed_bytes = 0u64;
+    {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        while spare.bytes > keep_max
+            && let Some((chunk, size)) = spare.kept.pop()
+        {
+            spare.bytes = spare.bytes.saturating_sub(size);
+            ALIVE[3].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[4].fetch_sub(size, Ordering::Relaxed);
+            ALIVE[1].fetch_sub(1, Ordering::Relaxed);
+            ALIVE[2].fetch_sub(size, Ordering::Relaxed);
+            freed_bytes += size;
+            freed.push(chunk);
+        }
+    }
+    drop(freed);
+    freed_bytes
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2537,13 +2566,22 @@ enum Step {
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
+struct PooledListUpload {
+    buffer: ID3D12Resource,
+    ptr: usize,
+    alloc_size: u64,
+    kind: crate::gc::HeapKind,
+}
+
 #[derive(Default)]
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    uploads: Vec<PooledListUpload>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
+    /// Exact `(Host::fence, value)` signaled when this list was submitted.
+    submitted_fence: Option<(ID3D12Fence, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -2594,13 +2632,35 @@ impl Deferred {
             .chain(self.texture_backs.iter().map(crate::texback::Back::range))
     }
 
-    /// Holds `buffer` (`size` bytes of upload memory) until the list is
-    /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+    /// Holds `buffer` (`alloc_size` bytes of pooled upload/shared memory)
+    /// until the list is reset, then returns it to [`crate::gc`].
+    fn hold_upload(
+        &mut self,
+        buffer: ID3D12Resource,
+        ptr: *mut u8,
+        alloc_size: u64,
+        kind: crate::gc::HeapKind,
+    ) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
-        ALIVE[7].fetch_add(size, Ordering::Relaxed);
-        self.upload_bytes += size;
-        self.uploads.push(buffer);
+        ALIVE[7].fetch_add(alloc_size, Ordering::Relaxed);
+        self.upload_bytes += alloc_size;
+        self.uploads.push(PooledListUpload {
+            buffer,
+            ptr: ptr as usize,
+            alloc_size,
+            kind,
+        });
+    }
+
+    /// Records the exact `Host::fence` value that signaled this list's GPU work,
+    /// and tags any `Step::Texture` staging buffers with the graphics fence too.
+    fn note_submitted(&mut self, fence: &ID3D12Fence, value: u64) {
+        self.submitted_fence = Some((fence.clone(), value));
+        for step in &self.copies {
+            if let Step::Texture(staging) = step {
+                staging.note_fence(fence, value);
+            }
+        }
     }
 
     /// The steps recorded last write title memory: what was brought up to
@@ -2616,6 +2676,24 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        if self.uploads.is_empty() {
+            return;
+        }
+        let gate = self.submitted_fence.take().or_else(|| {
+            let h = host()?;
+            let sig = h.latest_signaled();
+            (sig > 0).then(|| (h.fence.clone(), sig))
+        });
+        for item in std::mem::take(&mut self.uploads) {
+            let gates = gate.iter().cloned().collect();
+            crate::gc::give_upload_multi(
+                item.kind,
+                item.buffer,
+                item.ptr as *mut u8,
+                item.alloc_size,
+                gates,
+            );
+        }
     }
 }
 
@@ -5546,6 +5624,7 @@ impl Host {
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
+                    LAST_SIGNALED_FENCE.store(*submitted, Ordering::Release);
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
@@ -6252,6 +6331,10 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            LAST_SIGNALED_FENCE.store(*submitted, Ordering::Release);
+            for list in runs {
+                list.deferred().note_submitted(&self.fence, *submitted);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -6301,8 +6384,14 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [(&lists[..], ())];
         submitting(2, runs.len());
-        for (_i, &(group, _kind)) in groups.iter().enumerate() {
+        for (i, &(group, _kind)) in groups.iter().enumerate() {
             *submitted += 1;
+            LAST_SIGNALED_FENCE.store(*submitted, Ordering::Release);
+            if i + 1 == groups.len() {
+                for list in runs {
+                    list.deferred().note_submitted(&self.fence, *submitted);
+                }
+            }
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -6348,7 +6437,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (_i, started);
+            let _ = started;
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
@@ -6837,6 +6926,7 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        crate::descriptor::host::clear_list_views();
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -7512,14 +7602,18 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset and then recycled via [`crate::gc`].
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let kind = if card_steps::stage() > 1 {
+            crate::gc::HeapKind::SharedUav
+        } else {
+            crate::gc::HeapKind::Upload
+        };
+        let domain = Some(windows::core::Interface::as_raw(&host.fence) as usize);
+        let (buffer, data, alloc_size) = crate::gc::take_upload(host, size, kind, domain)?;
+        name(&buffer, || format!("list upload {alloc_size:#x}"));
+        self.deferred().hold_upload(buffer.clone(), data, alloc_size, kind);
         Some((buffer, data))
     }
 
@@ -7547,9 +7641,12 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            self.deferred().hold_upload(buffer.clone(), len);
+            let domain = Some(windows::core::Interface::as_raw(&host.fence) as usize);
+            let (buffer, data, alloc_size) =
+                crate::gc::take_upload(host, len, crate::gc::HeapKind::Upload, domain)?;
+            name(&buffer, || format!("list scratch {alloc_size:#x}"));
+            self.deferred()
+                .hold_upload(buffer.clone(), data, alloc_size, crate::gc::HeapKind::Upload);
             return Some((buffer, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
@@ -9948,10 +10045,17 @@ impl Host {
             showing.end();
             if !presented { return None; }
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            let black = probe.is_some_and(|b| crate::capture::black(&b));
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            let black = false;
+            drop(presenter);
+            crate::gc::on_present(self, frame);
+            Some(black)
         }
+    }
+
+    pub(crate) fn latest_signaled(&self) -> u64 {
+        LAST_SIGNALED_FENCE.load(Ordering::Acquire)
     }
 
     fn presenter(

@@ -253,6 +253,9 @@ impl Worker {
             self.list.Close()?;
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
+            for job in jobs {
+                job.staging.note_fence(&self.fence, value);
+            }
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;
         }

@@ -41,6 +41,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+mod gc;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
