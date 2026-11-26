@@ -66,6 +66,18 @@ pub(crate) struct Table<const N: usize>(pub [*const (); N]);
 // SAFETY: function addresses only.
 unsafe impl<const N: usize> Sync for Table<N> {}
 
+/// Adds a reference unless the last was already let go.
+#[cfg(windows)]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: the caller holds the lock the object's destructor must acquire.
+    unsafe { &*this }
+        .refs
+        .fetch_update(Ordering::Acquire, Ordering::Relaxed, |n| {
+            if n == 0 { None } else { n.checked_add(1) }
+        })
+        .is_ok()
+}
+
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
