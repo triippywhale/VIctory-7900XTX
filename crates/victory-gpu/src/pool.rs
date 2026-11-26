@@ -43,7 +43,7 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// `SPARE..=SPARE_KEPT`. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        room_with_budget(memory, crate::gc::vram_budget_bytes(memory));
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
@@ -66,6 +66,20 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+}
+
+/// Updates [`SPARES`] taking `VICTORY_MEM_BUDGET_MB` (or 75% DXGI local budget)
+/// and <= 8 GiB VRAM caps into account so 8 GB cards do not hoard 4 GiB of
+/// empty 64 MiB heaps.
+pub(crate) fn room_with_budget(memory: Option<[u64; 4]>, budget_limit: Option<u64>) {
+    let base = spares(memory, crate::host::keep_freed());
+    let capped = match (memory, budget_limit) {
+        (Some([_, used, ..]), Some(limit)) if used > limit => 1,
+        (Some([dxgi_budget, ..]), _) if dxgi_budget <= (8 << 30) => base.min(SPARE),
+        (_, Some(limit)) if limit <= (6 << 30) => base.min(SPARE),
+        _ => base,
+    };
+    SPARES.store(capped, Ordering::Relaxed);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -419,6 +433,24 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// Immediately releases rested pieces and drops empty 64 MiB blocks down to 1
+/// spare under VRAM budget pressure, returning the VRAM bytes freed.
+pub(crate) fn trim_empty_blocks() -> u64 {
+    SPARES.store(1, Ordering::Relaxed);
+    let now = now();
+    let freed_tex_blocks = {
+        let mut tex = lock(&TEXTURES);
+        let before = tex.blocks();
+        tex.rested(now);
+        before.saturating_sub(tex.blocks()) as u64
+    };
+    {
+        let mut st = lock(&STAGING);
+        st.rested(now);
+    }
+    freed_tex_blocks * BLOCK
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.

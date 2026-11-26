@@ -127,7 +127,19 @@ impl Made {
     }
 }
 
-pub(crate) struct HostHeap {
+pub(crate) struct HostHeap(std::sync::Arc<HeapInner>);
+
+impl std::ops::Deref for HostHeap {
+    type Target = HeapInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub(crate) struct HeapInner {
+    id: u64,
+    weak: std::sync::OnceLock<std::sync::Weak<HeapInner>>,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -417,7 +429,7 @@ fn queue_batches() -> bool {
 }
 
 /// An open [`HostHeap::queue_batch`]; done when dropped.
-pub(crate) struct QueueBatch<'a>(Option<&'a HostHeap>);
+pub(crate) struct QueueBatch<'a>(Option<&'a HeapInner>);
 
 impl Drop for QueueBatch<'_> {
     fn drop(&mut self) {
@@ -546,7 +558,7 @@ static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
 /// ([`HostHeap::texture_slots_flip`]); on any thread. Not if the heap is at
 /// something else: the next texture pass does.
 pub(crate) fn flip_now() {
-    let _ = super::with_view_heap(HostHeap::texture_slots_flip);
+    let _ = super::with_view_heap(|h| h.texture_slots_flip());
 }
 
 /// Since the start: slots made from their new view after its upload had run,
@@ -1773,7 +1785,11 @@ impl HostHeap {
             })
             .flatten();
         let queued = std::sync::Arc::new(Queued::new(if sampler { 0 } else { count }));
-        let h = HostHeap {
+        static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let inner = std::sync::Arc::new(HeapInner {
+            id,
+            weak: std::sync::OnceLock::new(),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -1817,7 +1833,9 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
-        };
+        });
+        let _ = inner.weak.set(std::sync::Arc::downgrade(&inner));
+        let h = HostHeap(inner);
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
@@ -1829,7 +1847,15 @@ impl HostHeap {
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
     }
+}
 
+impl Drop for HeapInner {
+    fn drop(&mut self) {
+        purge_heap_slots(self.id);
+    }
+}
+
+impl HeapInner {
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
@@ -1901,7 +1927,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
-impl HostHeap {
+impl HeapInner {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -3016,6 +3042,7 @@ impl HostHeap {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let new_raw = resource.as_ref().map(|r| windows::core::Interface::as_raw(r) as usize);
         let old = {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -3025,6 +3052,9 @@ impl HostHeap {
             }
             std::mem::replace(&mut *slot, resource)
         };
+        // `self.kept[index]` is unlocked BEFORE updating `RESOURCE_SLOTS` (strict lock ordering).
+        let old_raw = old.as_ref().map(|r| windows::core::Interface::as_raw(r) as usize);
+        update_resource_slots(self, index, old_raw, new_raw);
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
@@ -3035,6 +3065,16 @@ impl HostHeap {
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pin_for_test(&self, index: u32, resource: ID3D12Resource) {
+        self.keep(index, Some(resource));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_slot_empty_for_test(&self, index: u32) -> bool {
+        self.kept_in(index).is_none()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -6442,4 +6482,124 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+/// Drops any `ID3D12Resource` clones held in this thread's `LIST_VIEWS` table
+/// once a list finishes recording so idle threads do not pin evicted resources.
+pub(crate) fn clear_list_views() {
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut() {
+            views.recording = 0;
+            views.made.clear();
+        }
+    });
+}
+
+type SlotRef = (std::sync::Weak<HeapInner>, u64, u32);
+type ResourceSlotMap = std::collections::HashMap<
+    usize,
+    Vec<SlotRef>,
+    std::hash::BuildHasherDefault<crate::host::AddressHash>,
+>;
+
+/// Reverse index of bindless/dynamic descriptor slots currently pinning each
+/// `ID3D12Resource` (`raw_ptr -> Vec<(Weak<HeapInner>, heap_id, slot)>`).
+///
+/// Lock ordering invariant: NEVER lock `RESOURCE_SLOTS` while holding
+/// `HeapInner::kept[slot]` or `Made::lock(slot)`, and NEVER lock `kept[slot]`
+/// or `Made::lock(slot)` while holding `RESOURCE_SLOTS`.
+static RESOURCE_SLOTS: Mutex<Option<ResourceSlotMap>> = Mutex::new(None);
+
+fn update_resource_slots(heap: &HeapInner, slot: u32, old_raw: Option<usize>, new_raw: Option<usize>) {
+    if old_raw == new_raw {
+        return;
+    }
+    let Some(weak) = heap.weak.get().cloned() else {
+        return;
+    };
+    let heap_id = heap.id;
+    let mut guard = RESOURCE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(Default::default);
+    if let Some(old) = old_raw
+        && let Some(list) = map.get_mut(&old)
+    {
+        list.retain(|&(ref w, id, s)| !(id == heap_id && s == slot) && w.strong_count() > 0);
+        if list.is_empty() {
+            map.remove(&old);
+        }
+    }
+    if let Some(new) = new_raw {
+        let list = map.entry(new).or_default();
+        if !list.iter().any(|&(_, id, s)| id == heap_id && s == slot) {
+            list.push((weak, heap_id, slot));
+        }
+    }
+}
+
+fn purge_heap_slots(heap_id: u64) {
+    let mut guard = RESOURCE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = guard.as_mut() else {
+        return;
+    };
+    map.retain(|_, list| {
+        list.retain(|&(ref w, id, _)| id != heap_id && w.strong_count() > 0);
+        !list.is_empty()
+    });
+}
+
+/// Exact count of live descriptor slots currently holding `resource` in
+/// `HostHeap::kept`. Drops `RESOURCE_SLOTS` before inspecting slot locks.
+pub(crate) fn slot_ref_count(resource: &ID3D12Resource) -> usize {
+    use windows::core::Interface;
+    let raw = resource.as_raw() as usize;
+    let candidates: Vec<SlotRef> = {
+        let guard = RESOURCE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().and_then(|m| m.get(&raw)).cloned().unwrap_or_default()
+    };
+    candidates
+        .into_iter()
+        .filter(|(weak, _, slot)| {
+            weak.upgrade()
+                .and_then(|heap| heap.kept_in(*slot))
+                .is_some_and(|r| r.as_raw() as usize == raw)
+        })
+        .count()
+}
+
+/// Safely clears/nulls every shader-visible descriptor slot (and raw twin)
+/// currently viewing `resource`, releasing its `HostHeap::kept` reference into
+/// fence-gated retirement. Extracts candidates and drops `RESOURCE_SLOTS`
+/// completely before taking `Made` or `kept` locks.
+pub(crate) fn evict_resource(resource: &ID3D12Resource) -> usize {
+    use windows::core::Interface;
+    let raw = resource.as_raw() as usize;
+    let candidates: Vec<SlotRef> = {
+        let mut guard = RESOURCE_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_mut().and_then(|m| m.remove(&raw)).unwrap_or_default()
+    };
+    let mut cleared = 0;
+    for (weak, _, slot) in candidates {
+        let Some(heap) = weak.upgrade() else {
+            continue;
+        };
+        if slot < heap.count {
+            let _made = heap.made.lock(slot);
+            if !heap.kept_in(slot).is_some_and(|r| r.as_raw() as usize == raw) {
+                continue;
+            }
+            if heap.made.get(slot).unwrap_or(0) != 0 {
+                heap.unmake(slot);
+            } else {
+                heap.make_null(slot);
+            }
+            if !heap.sampler {
+                heap.changed.put(slot);
+            }
+            cleared += 1;
+        } else if heap.kept_in(slot).is_some_and(|r| r.as_raw() as usize == raw) {
+            heap.make_null(slot);
+            cleared += 1;
+        }
+    }
+    cleared
 }

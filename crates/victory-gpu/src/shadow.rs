@@ -75,6 +75,8 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Newest host submission fence value when last asked for.
+    last_fence: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -3092,6 +3094,107 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Fence-gated LRU eviction of cached `Shadow` buffer/window copies across
+/// `LOOSE` and clean read-only `BUFFERS`, unpinning and nulling any stale
+/// bindless descriptor slots.
+pub(crate) fn evict_lru(
+    completed_fence: u64,
+    frame: u64,
+    needed_bytes: Option<u64>,
+    cap: usize,
+) -> (usize, u64) {
+    if cap == 0 {
+        return (0, 0);
+    }
+    let can_evict = |s: &Arc<Shadow>| -> bool {
+        if Arc::strong_count(s) != 1 || completed_fence < s.last_fence.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last_frame = s.used.load(Ordering::Relaxed) >> 32;
+        if needed_bytes.is_none() && frame.saturating_sub(last_frame) <= crate::gc::IDLE_FRAMES {
+            return false;
+        }
+        let pinned = crate::descriptor::host::slot_ref_count(&s.buffer);
+        (crate::host::references(&s.buffer) as usize) == 1 + pinned
+    };
+
+    let mut evicted: Vec<Arc<Shadow>> = Vec::new();
+    let mut freed_bytes = 0u64;
+
+    // 1. Loose windows outside title buffers.
+    {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if !map.is_empty() {
+            let mut candidates: Vec<(u64, (u64, u64))> = map
+                .iter()
+                .filter_map(|(&key, s)| can_evict(s).then_some((s.used.load(Ordering::Relaxed), key)))
+                .collect();
+            candidates.sort_unstable_by_key(|&(used, key)| (used >> 32, used & 0xffff_ffff, key));
+            for (_, key) in candidates {
+                if evicted.len() >= cap {
+                    break;
+                }
+                if let Some(target) = needed_bytes
+                    && freed_bytes >= target
+                {
+                    break;
+                }
+                if let Some(s) = map.remove(&key) {
+                    freed_bytes = freed_bytes.saturating_add(s.len);
+                    evicted.push(s);
+                }
+            }
+        }
+    }
+
+    // 2. Clean read-only registered title buffer copies in `BUFFERS` (including
+    //    device-local `CARDED` twins), leaving the registration entry intact so
+    //    any future read transparently recreates the shadow copy.
+    if evicted.len() < cap && needed_bytes.is_none_or(|t| freed_bytes < t) {
+        let mut map = buffers();
+        let mut candidates: Vec<(u64, (u64, usize))> = map
+            .iter()
+            .filter_map(|(&key, entry)| {
+                if key.1 == key.0 as usize {
+                    return None;
+                }
+                let s = entry.shadow.as_ref()?;
+                if s.written.load(Ordering::Relaxed) || s.place.is_some() || !can_evict(s) {
+                    return None;
+                }
+                Some((s.used.load(Ordering::Relaxed), key))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(used, key)| (used >> 32, used & 0xffff_ffff, key));
+        for (_, key) in candidates {
+            if evicted.len() >= cap {
+                break;
+            }
+            if let Some(target) = needed_bytes
+                && freed_bytes >= target
+            {
+                break;
+            }
+            if let Some(entry) = map.get_mut(&key)
+                && let Some(s) = entry.shadow.take()
+            {
+                freed_bytes = freed_bytes.saturating_add(s.len);
+                evicted.push(s);
+            }
+        }
+    }
+
+    // Locks on `LOOSE` and `BUFFERS` are dropped before clearing bindless slots.
+    let count = evicted.len();
+    for shadow in evicted {
+        LET_GO[0].fetch_add(1, Ordering::Relaxed);
+        LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
+        let _ = crate::descriptor::host::evict_resource(&shadow.buffer);
+        crate::host::retire(shadow);
+    }
+    (count, freed_bytes)
+}
+
 /// For the memory line: host copies alive and their bytes, of them the
 /// windows of memory outside buffers and their bytes, and the snapshot
 /// buffers kept for reuse and the bytes they reserve.
@@ -3129,6 +3232,17 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    fn touch(&self) {
+        let now = crate::host::moment();
+        if self.used.load(Ordering::Relaxed) != now {
+            self.used.store(now, Ordering::Relaxed);
+        }
+        let fence = crate::host::pending_submission_fence();
+        if self.last_fence.load(Ordering::Relaxed) < fence {
+            self.last_fence.store(fence, Ordering::Relaxed);
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -3230,6 +3344,7 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            last_fence: AtomicU64::new(crate::host::pending_submission_fence()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
@@ -5283,6 +5398,7 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        shadow.touch();
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -5291,6 +5407,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         match holding(&map, address, end).and_then(|key| map.get_key_value(&key)) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
+                shadow.touch();
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -5593,10 +5710,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
+        shadow.touch();
         if shadow.asked[0].load(Ordering::Relaxed) > address {
             shadow.asked[0].fetch_min(address, Ordering::Relaxed);
         }
@@ -5653,11 +5767,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // In the card's memory when there is room (`Host::window_buffer`): then
+    // no second copy on the card.
+    let (buffer, data, in_card) = host()?.window_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    let card_side = if in_card { None } else { window_card_for(len) };
+    let (buffer, card) = match card_side {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
@@ -5732,7 +5849,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let now = *tick;
     if let Some((shadow, used)) = map.get_mut(&(address, len)) {
         *used = now;
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        shadow.touch();
         return Some(shadow.clone());
     }
     if map.len() >= MANY {

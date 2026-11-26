@@ -243,12 +243,95 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// How many host lists are kept idle: `VICTORY_LIST_POOL_MOST` if set, else
+/// by how full the PC's memory shared with the card is, looked at every
+/// half second. Each idle list keeps its command allocators' memory, which
+/// the driver takes from that memory (half the PC's). On a 16 GB PC 512 of
+/// them filled it with the rest (run 7900-s3: 13-14 fps, out of memory a
+/// minute in); none (s5) held it at 4.8 GB but the frame took three times
+/// as long (4.5 fps); 96 (s6) held it at 5.8 GB at 10-11 fps for eight
+/// minutes at 82 % of the budget. So: 256 below 70 %, 96 below 86 %, 32
+/// below 92 %, none above (and the idle ones go, [`trim_idle`]).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(most) = *FIXED.get_or_init(|| std::env::var("VICTORY_LIST_POOL_MOST").ok().and_then(|v| v.trim().parse().ok())) {
+        return most;
+    }
+    // The tenth of a second it was last looked at (from 1), and the answer.
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static MOST: AtomicU64 = AtomicU64::new(IDLE_MOST.0 as u64);
+    let now = crate::host::now_ms() / 500 + 1;
+    if LAST.swap(now, Relaxed) == now {
+        return MOST.load(Relaxed) as usize;
+    }
+    let most = match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([_, _, budget, used]) if budget > 0 => match used * 100 / budget {
+            0..70 => 256,
+            70..86 => 96,
+            86..92 => 32,
+            _ => 0,
+        },
+        _ => IDLE_MOST.0,
+    };
+    let was = MOST.swap(most as u64, Relaxed) as usize;
+    if most < was {
+        trim_idle(most);
+    }
+    if most != was {
+        tracing::info!(idle_lists = most, "host lists kept idle (by the PC's memory shared with the card)");
+    }
+    most
+}
+
+/// The idle host lists past `most` go.
+#[cfg(windows)]
+fn trim_idle(most: usize) {
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= most {
+            return;
+        }
+        let gone = idle.0.split_off(most);
+        idle.1 -= gone.iter().map(|g| g.1).sum::<u64>();
+        gone
+    };
+    // What they held of the PC's memory shared with the card, as the
+    // system counts it (for sizing the pool).
+    let shared = || crate::host::host().and_then(|h| h.video_memory()).map_or(0, |m| m[3]);
+    let (n, before) = (gone.len(), shared());
+    drop(gone);
+    let after = shared();
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+        tracing::info!(
+            lists = n,
+            shared_before_mb = before >> 20,
+            shared_after_mb = after >> 20,
+            per_list_kb = (before.saturating_sub(after) / n.max(1) as u64) >> 10,
+            "idle host lists let go: the PC's memory shared with the card before and after"
+        );
+    }
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
 fn pools() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The host is short of memory (`crate::host::relieve`): the idle host
+/// lists go, with their command allocators' memory, which the driver keeps
+/// in the PC's memory shared with the card (up to 512 lists of two
+/// allocators each; 1,956 lists were alive when a 16 GB PC ran out of it).
+/// Gives how many went.
+#[cfg(windows)]
+pub(crate) fn relieve() -> usize {
+    let idle = std::mem::take(&mut *IDLE.lock().unwrap_or_else(|e| e.into_inner()));
+    idle.0.len()
 }
 
 /// A host list open for recording: one that has run, as a title's list is
@@ -282,7 +365,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        // Asked before the lock: it may let idle lists go under it.
+        let most = idle_most();
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -290,7 +375,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

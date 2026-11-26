@@ -41,6 +41,13 @@ pub(crate) struct Staging {
     base: u64,
     /// Back in the pool with the last list that names it.
     _piece: Option<crate::pool::StagingPiece>,
+    /// Allocated bucket size when backed by [`crate::gc`]'s upload pool.
+    pooled_alloc: Option<u64>,
+    /// Exact `(ID3D12Fence, value)` gates from every queue (graphics or
+    /// `VICTORY_UPLOAD_AHEAD` copy queue) that read this staging buffer.
+    fence_gates: Mutex<Vec<(ID3D12Fence, u64)>>,
+    /// Newest graphics submission number when a list recorded a use of it.
+    last_fence: std::sync::atomic::AtomicU64,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
     size: u64,
@@ -482,11 +489,52 @@ pub(crate) fn live_staging_bytes() -> u64 {
     STAGED[1].load(std::sync::atomic::Ordering::Relaxed)
 }
 
+impl Staging {
+    /// Records the exact `ID3D12Fence` and value that signaled GPU work reading
+    /// this staging buffer (copy queue or graphics queue).
+    pub(crate) fn note_fence(&self, fence: &ID3D12Fence, value: u64) {
+        use windows::core::Interface;
+        if value == 0 {
+            return;
+        }
+        let dom = fence.as_raw() as usize;
+        let mut gates = self.fence_gates.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, existing)) = gates.iter_mut().find(|(f, _)| f.as_raw() as usize == dom) {
+            *existing = (*existing).max(value);
+        } else {
+            gates.push((fence.clone(), value));
+        }
+    }
+
+    fn fences_completed(&self) -> bool {
+        let gates = self.fence_gates.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `GetCompletedValue` is free-threaded on live COM fences.
+        gates.iter().all(|(fence, val)| unsafe { fence.GetCompletedValue() } >= *val)
+    }
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        if let Some(alloc_size) = self.pooled_alloc {
+            let mut gates = std::mem::take(self.fence_gates.get_mut().unwrap_or_else(|e| e.into_inner()));
+            let last_gfx = self.last_fence.load(Relaxed);
+            if gates.is_empty()
+                && last_gfx > 0
+                && let Some(h) = crate::host::host()
+            {
+                gates.push((h.fence.clone(), h.latest_signaled()));
+            }
+            crate::gc::give_upload_multi(
+                crate::gc::HeapKind::Upload,
+                self.buffer.clone(),
+                self.data,
+                alloc_size,
+                gates,
+            );
+        }
     }
 }
 
@@ -520,6 +568,27 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
+/// The host is short of memory (`crate::host::relieve`): the staging
+/// buffers no list holds go (an unchanged texture is detiled and uploaded
+/// again when next sampled). Gives the bytes let go.
+pub(crate) fn relieve() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut bytes = 0;
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.retain(|_, s| {
+            let keep = Arc::strong_count(s) > 1;
+            if !keep {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                bytes += s.bytes;
+            }
+            keep
+        });
+    }
+    bytes
+}
+
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
@@ -549,6 +618,49 @@ pub(crate) fn let_go_idle() {
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
+}
+
+/// Frame-driven fence-gated LRU sweep of idle texture staging buffers.
+pub(crate) fn evict_lru(completed_fence: u64, frame: u64, force_budget: bool, cap: usize) -> (usize, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if cap == 0 {
+        return (0, 0);
+    }
+    let victims: Vec<Arc<Staging>> = {
+        let mut guard = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = guard.as_mut() else {
+            return (0, 0);
+        };
+        if map.is_empty() {
+            return (0, 0);
+        }
+        let idle_limit = if force_budget { 8 } else { crate::gc::IDLE_FRAMES };
+        let mut eligible: Vec<(u64, usize)> = map
+            .iter()
+            .filter_map(|(&key, s)| {
+                let last_frame = s.used.load(Relaxed) >> 32;
+                let ok = Arc::strong_count(s) == 1
+                    && completed_fence >= s.last_fence.load(Relaxed)
+                    && frame.saturating_sub(last_frame) > idle_limit
+                    && s.fences_completed();
+                ok.then_some((last_frame, key))
+            })
+            .collect();
+        if eligible.is_empty() {
+            return (0, 0);
+        }
+        eligible.sort_unstable_by_key(|&(last_frame, key)| (last_frame, key));
+        eligible.truncate(cap);
+        eligible.into_iter().filter_map(|(_, key)| map.remove(&key)).collect()
+    };
+    let count = victims.len();
+    let bytes: u64 = victims.iter().map(|s| s.bytes).sum();
+    if count > 0 {
+        LET_GO[0].fetch_add(count as u64, Relaxed);
+        LET_GO[1].fetch_add(bytes, Relaxed);
+    }
+    drop(victims);
+    (count, bytes)
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -773,6 +885,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         staging.once.store(false, Relaxed);
     }
     staging.used.store(crate::host::moment(), Relaxed);
+    staging.last_fence.store(crate::host::pending_submission_fence(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -1560,8 +1673,14 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
+    {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            map.remove(&(resource as usize));
+        }
+    }
+    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = through.as_mut() {
         map.remove(&(resource as usize));
     }
 }
@@ -1902,8 +2021,8 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
-        Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
+    let (piece, pooled_alloc, buffer, base, data) = match crate::pool::staging(host, total) {
+        Some((piece, buffer, base, data)) => (Some(piece), None, buffer, base, data),
         None => {
             // (`VICTORY_RESIDENCY=1`: no buffer of its own for a texture
             // picked by index while commit is short; it stays due.)
@@ -1914,14 +2033,15 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                 crate::residency::note_staging_deferred();
                 return None;
             }
-            let (buffer, data) = host.upload_buffer(total)?;
+            let (buffer, data, alloc_size) =
+                crate::gc::take_upload(host, total, crate::gc::HeapKind::Upload, None)?;
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
                     d.Width, d.Height, d.DepthOrArraySize, d.Format.0
                 )
             });
-            (None, buffer, 0, data)
+            (None, Some(alloc_size), buffer, 0, data)
         }
     };
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
@@ -1931,6 +2051,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         buffer,
         base,
         _piece: piece,
+        pooled_alloc,
+        fence_gates: Mutex::new(Vec::new()),
+        last_fence: std::sync::atomic::AtomicU64::new(crate::host::pending_submission_fence()),
         #[cfg(feature = "diagnostics")]
         size: total,
         data,
