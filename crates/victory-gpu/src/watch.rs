@@ -274,6 +274,8 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(11, started.elapsed().as_nanos() as u64);
         }
         if failed {
+            // (On the timeline: how many askings the kernel refuses.)
+            crate::timeline::span("asking refused").end();
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -306,6 +308,33 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Puts page range `[first, last)` into `ahead`, which stays in order and
+/// joined (`a.1 < b.0` for neighbours): a range that overlaps or touches
+/// others becomes one with them. With one asking for a submission
+/// ([`ask_rest`]) `ahead` holds thousands of ranges, and every [`writes`]
+/// looked through all of them (after PalmVIDev 86e7eddab).
+fn ahead_insert(ahead: &mut Vec<(usize, usize)>, (mut first, mut last): (usize, usize)) {
+    if first >= last {
+        return;
+    }
+    // The first range that ends at or after `first` (touching counts).
+    let from = ahead.partition_point(|r| r.1 < first);
+    let mut to = from;
+    while to < ahead.len() && ahead[to].0 <= last {
+        first = first.min(ahead[to].0);
+        last = last.max(ahead[to].1);
+        to += 1;
+    }
+    ahead.splice(from..to, [(first, last)]);
+}
+
+/// Whether `[first, last)` lies in one range of `ahead` (in order and
+/// joined, [`ahead_insert`]).
+fn ahead_contains(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let at = ahead.partition_point(|r| r.1 < last);
+    ahead.get(at).is_some_and(|&(a, b)| a <= first && last <= b)
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -313,6 +342,11 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    ask_ahead_held(ranges, false);
+}
+
+/// [`ask_ahead`]; `held`: the caller holds everything ([`Asking::hold_all`]).
+fn ask_ahead_held(ranges: &[(usize, usize)], held: bool) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -329,7 +363,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if journal().kept {
         return;
     }
-    let _all = Asking::hold_all();
+    let _all = (!held).then(Asking::hold_all);
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
     while i < pieces.len() {
@@ -349,7 +383,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    let mut ahead = Vec::with_capacity(asked.len());
+    for range in asked {
+        ahead_insert(&mut ahead, range);
+    }
+    j.ahead = ahead;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -531,15 +569,22 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let mut spent = crate::timeline::span("asking: ahead");
     ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
+    // Both parts under one hold of everything: a second hold waited for the
+    // other threads' askings again (0.5 ms a time, run fills-ab3), and no
+    // other asking comes between the two parts.
+    let _all = Asking::hold_all();
+    ask_ahead_held(ranges, true);
+    spent.next("asking: the rest");
+    ask_rest(ranges, true);
+    spent.end();
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
-fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
+fn ask_rest(ranges: &[(usize, usize)], held: bool) {
+    let _all = (!held).then(Asking::hold_all);
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
@@ -555,11 +600,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_contains(&ahead, first, last)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            ahead_insert(&mut ahead, (first, last));
         }
     }
     note_hot(&written);
@@ -647,9 +692,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_contains(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +705,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_contains(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -746,7 +789,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_contains(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -1044,7 +1087,7 @@ pub(crate) fn opened_for_writing(at: usize) {
 
 /// An asking made blocks of `pages` clean and noted them in the journal.
 fn publish(pages: &[usize]) {
-    let g = guards();
+    let g = guards_read();
     for &page in pages {
         if g.clean.contains(page) || g.held.contains(page) {
             PUBLISHED.set(page);
@@ -1139,7 +1182,7 @@ pub(crate) fn look_at_holes() {
     }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
-        let g = guards();
+        let g = guards_read();
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
         let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
@@ -1206,10 +1249,20 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
+    #[cfg(feature = "diagnostics")]
+    tally(7, started.elapsed().as_nanos() as u64);
+    g
+}
+
+/// [`guards_read`], the wait for it counted as [`guards_timed`]'s is.
+fn guards_read_timed() -> std::sync::RwLockReadGuard<'static, Guards> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let g = guards_read();
     #[cfg(feature = "diagnostics")]
     tally(7, started.elapsed().as_nanos() as u64);
     g
@@ -1413,7 +1466,11 @@ impl Guards {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+/// Shared by looks that change nothing (the clean check that answers most
+/// of [`guard`]'s asks, some 150,000 blocks a frame), alone by all else:
+/// refreshes on several threads looked one after another under a mutex
+/// (after PalmVIDev 9e543b97b).
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: Blocks::new(),
     clean: Blocks::new(),
     absent: Blocks::new(),
@@ -1425,11 +1482,23 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_lock() {
-        return g;
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    match GUARDS.try_write() {
+        Ok(g) => return g,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
     }
-    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
+    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// [`GUARDS`] shared, for a look that changes nothing.
+fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
+    match GUARDS.try_read() {
+        Ok(g) => return g,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+    waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -1625,7 +1694,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     if len == 0 {
         return false;
     }
-    let g = guards();
+    let g = guards_read();
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
@@ -1645,7 +1714,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (PROTECTED.any(first, first + 1) || {
-            let g = guards_timed();
+            let g = guards_read_timed();
             g.protected.contains(first) || g.absent.contains(first)
         });
     if !known && !is_view(start, end) {
@@ -1657,7 +1726,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
-        let g = guards_timed();
+        let g = guards_read_timed();
         if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
@@ -2526,7 +2595,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -3084,7 +3153,7 @@ mod tests {
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges);
+        ask_rest(&ranges, false);
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
@@ -4381,5 +4450,32 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::{ahead_contains, ahead_insert};
+
+    /// Ranges put in out of order, overlapping and touching come out in
+    /// order and joined, and a look finds what a look through all of them
+    /// finds.
+    #[test]
+    fn ahead_ranges_are_kept_in_order_and_joined() {
+        let mut ahead = Vec::new();
+        let put = [(50, 60), (10, 20), (20, 25), (70, 80), (15, 18), (58, 72), (100, 101), (5, 5)];
+        for &r in &put {
+            ahead_insert(&mut ahead, r);
+        }
+        assert_eq!(ahead, vec![(10, 25), (50, 80), (100, 101)]);
+        for first in 0..110 {
+            for last in first + 1..112 {
+                let linear = ahead.iter().any(|&(a, b)| a <= first && last <= b);
+                assert_eq!(ahead_contains(&ahead, first, last), linear, "{first}..{last}");
+            }
+        }
+        // One range over several joins them all.
+        ahead_insert(&mut ahead, (0, 200));
+        assert_eq!(ahead, vec![(0, 200)]);
     }
 }
