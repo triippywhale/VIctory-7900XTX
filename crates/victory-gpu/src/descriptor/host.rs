@@ -380,14 +380,18 @@ static LATE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::Ato
 /// What a texture slot showed before its last write: its record (0: null or
 /// the neutral texture), when (ms), and the submissions begun and finished.
 #[cfg(feature = "diagnostics")]
-static BEFORE: Mutex<std::collections::BTreeMap<u32, (u64, u64, (u64, u64), &'static str)>> =
-    Mutex::new(std::collections::BTreeMap::new());
+/// In parts by slot: the heaps' records are mirrored on several threads, and
+/// one lock for all of them was waited for about 5 ms a frame (timeline of
+/// 2026-11-26).
+type Before = std::collections::BTreeMap<u32, (u64, u64, (u64, u64), &'static str)>;
+#[cfg(feature = "diagnostics")]
+static BEFORE: [Mutex<Before>; 64] = [const { Mutex::new(std::collections::BTreeMap::new()) }; 64];
 
 #[cfg(feature = "diagnostics")]
 fn note_before(index: u32, was: u64, by: &'static str) {
     if crate::book::on() {
         let entry = (was, crate::host::now_ms(), crate::host::submissions(), by);
-        BEFORE.lock().unwrap_or_else(|e| e.into_inner()).insert(index, entry);
+        BEFORE[index as usize % 64].lock().unwrap_or_else(|e| e.into_inner()).insert(index, entry);
     }
 }
 
@@ -1407,7 +1411,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         if let Some(at) = host.written.get(slot as usize) {
             text.push_str(&format!(", written last at {:.1} s", f64::from(at.load(Relaxed)) / 1e3));
         }
-        let before = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied();
+        let before = BEFORE[index as usize % 64].lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied();
         if let Some((was, at, (started, finished), by)) = before {
             let what = match view_at(was as u32, (was >> 32) as u32) {
                 _ if was == 0 => "nothing (or the neutral texture)".into(),
