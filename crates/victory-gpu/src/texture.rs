@@ -318,6 +318,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     );
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::AliasCopies, 1);
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {

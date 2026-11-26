@@ -4446,8 +4446,17 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A view the title placed, in another format, in the memory of
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
-            let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            // Where every descriptor of the view shows that texture itself
+            // (`crate::resource::read_cast`), it is read as it is: no copy.
+            let cast = crate::resource::read_cast(*resource as This);
+            if let Some(source) = cast {
+                crate::list::ensure_state(list, source, SHADER_RESOURCE);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::AliasCast, 1);
+            }
+            let aliased = cast.is_some()
+                || crate::resource::alias_of(*resource as This)
+                    .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             #[cfg(feature = "diagnostics")]
             if !aliased && placed.is_some() {
                 crate::resource::alias_watch(*resource as This);

@@ -4399,6 +4399,18 @@ fn make_twinned(
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
+            // A view the title placed over a texture the host writes, in a
+            // format a view of that texture can have: the texture itself
+            // (`crate::resource::cast_source`), not a copy of it.
+            if let (Some((_, source)), Some(d)) = (crate::resource::cast_source(resource), desc.as_ref()) {
+                let mut view = srv_desc(d);
+                view.Format = DXGI_FORMAT(67);
+                // SAFETY: a live texture made castable to that format, and a
+                // slot of our heap.
+                unsafe { device.CreateShaderResourceView(&source, Some(&view), at) };
+                return Some(Some(source));
+            }
+            crate::resource::shown_uncast(resource);
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
