@@ -47,8 +47,8 @@ What is known to be wrong:
 - Lighting is too bright or too dark after walking indoors, until the title has
   run for a while; rooms with little direct light are too dark without `-RayTracing`.
 - Textures of what just came into view appear late while the title streams.
-- The first run of a new build stutters while the driver makes pipelines
-  (`victory warm` makes them ahead).
+- The first run with a new driver or a new build stutters while the driver makes
+  pipelines (`victory translate --cache --pipelines` or `victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
 ## How to run it
@@ -73,6 +73,14 @@ Before the first run, ahead of time (both can be stopped and go on later):
 ```powershell
 target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+```
+
+Or, with no earlier run needed, every pipeline of the title's shader pack made
+into the run's pipeline library (after fxceless/DexNom; run it with the same
+`VICTORY_*` settings you play with, from a normal window):
+
+```powershell
+target\diag\victory.exe translate --cache --pipelines <game folder>
 ```
 
 Commands, debugging switches and upstream's own description:
