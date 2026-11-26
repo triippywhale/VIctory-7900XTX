@@ -5658,6 +5658,27 @@ pub(crate) fn arenas_ahead() -> usize {
     *AHEAD_N.get_or_init(|| std::env::var("VICTORY_ARENAS_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
 }
 
+/// The bytes of an arena of [`crate::memory`]'s (64 MiB).
+const ARENA_BYTES: u64 = 64 << 20;
+
+/// Whether an arena goes on the card even when the card's memory is past
+/// 97 % of its budget (`VICTORY_ARENAS_OVER=1`; off unless set;
+/// `VICTORY_AB` can name it). A run with ray tracing makes some 40 arenas
+/// (2.6 GB), and those made at the move into a cutscene, with the card at
+/// 17.3 of a 17.2 GB budget, went to the PC's memory (runs pr24-A and
+/// pr24-B: 12 to 15 of them, 0.8 GB): kept ahead ones ([`arenas_ahead`])
+/// were long gone by then. With this the system has to make room for them
+/// on the card (it moves other memory of ours out), not the rays read
+/// them over the bus for the rest of the run.
+fn arenas_over() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ARENAS_OVER") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ARENAS_OVER").is_some_and(|v| v == "1"))
+}
+
 /// [`by_address`] copies that went to the PC's memory so far: how many, and
 /// their bytes.
 pub(crate) fn by_address_off_card() -> (u64, u64) {
@@ -5723,7 +5744,8 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     };
     let from_ahead = ready.is_some();
     let memory = host.video_memory();
-    let room = memory.is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    // With [`arenas_over`] an arena goes on the card past the 97 % too.
+    let room = (arenas_over() && len >= ARENA_BYTES) || memory.is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let on_card = match ready {
         Some(buffer) => Some(buffer),
         None if !room => None,
