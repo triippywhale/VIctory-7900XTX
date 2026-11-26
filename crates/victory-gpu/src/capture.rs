@@ -490,6 +490,12 @@ fn dump_one(
                 d.Width, d.Height, d.Format.0
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            // R32_UINT targets that hold packed light (R9G9B9E5, as the
+            // screen probes' diffuse light): that reading too.
+            if f.Format.0 == 42 {
+                let e5 = packed_light_rgba(f.Width as usize, f.Height as usize, pitch, rows);
+                save_as(&format!("{name}-e5"), f.Width, f.Height, f.Width as usize * 4, false, &e5);
+            }
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -577,6 +583,35 @@ fn small_float(bits: u32, man: u32) -> f32 {
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
+}
+
+/// Rows of 32-bit words read as R9G9B9E5 light, as 8-bit RGBA through a
+/// cube root, scaled by the 99.9th percentile channel value (a few hot
+/// texels would turn the rest black). The scale is logged.
+fn packed_light_rgba(w: usize, h: usize, pitch: usize, rows: &[u8]) -> Vec<u8> {
+    let texel = |x: usize, y: usize| {
+        let at = y * pitch + x * 4;
+        let v = u32::from_le_bytes(rows[at..at + 4].try_into().unwrap_or([0; 4]));
+        let scale = 2f32.powi((v >> 27) as i32 - 24);
+        [0, 1, 2].map(|k| (v >> (9 * k) & 0x1ff) as f32 * scale)
+    };
+    let mut peaks: Vec<f32> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| texel(x, y).into_iter().fold(0.0f32, f32::max))
+        .filter(|v| v.is_finite())
+        .collect();
+    peaks.sort_by(f32::total_cmp);
+    let top = peaks.get(peaks.len() * 999 / 1000).copied().unwrap_or(1.0).max(1e-20);
+    let median = peaks.get(peaks.len() / 2).copied().unwrap_or(0.0);
+    tracing::info!(width = w, height = h, top, median, "packed light picture: white is top");
+    let mut out = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let c = texel(x, y).map(|c| ((c / top).clamp(0.0, 1.0).cbrt() * 255.0) as u8);
+            out.extend([c[0], c[1], c[2], 255]);
+        }
+    }
+    out
 }
 
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
