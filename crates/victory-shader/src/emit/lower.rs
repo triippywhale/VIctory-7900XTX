@@ -2871,11 +2871,15 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // Only where the console thread index is read (`console_thread`): through the
+        // exchange, the scatter, or a relabelled thread id (console lanes); else the
+        // ticket's group barrier would be one more for nothing.
         if let Some(slot) = self.wave_ticket
-            && (counted
-                || self.exchange.is_some()
+            && (self.exchange.is_some()
                 || self.scatter.is_some()
-                || self.x.io.inputs.iter().any(|(_, input)| matches!(input, Input::ThreadIdInGroup(_))))
+                || self.console_lanes
+                    && (counted
+                        || self.x.io.inputs.iter().any(|(_, input)| matches!(input, Input::ThreadIdInGroup(_)))))
         {
             self.console_flat = Some(wave_ticket_prologue(&mut self.s, slot, 32));
         }
