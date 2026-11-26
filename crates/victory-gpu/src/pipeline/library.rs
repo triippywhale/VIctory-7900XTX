@@ -51,7 +51,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -446,32 +446,57 @@ impl Drop for HeldName<'_> {
     }
 }
 
-/// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
-fn one_call() -> Option<MutexGuard<'static, ()>> {
+/// With `VICTORY_LIBRARY_LOCK=1` (or by default on AMD adapters): held by every
+/// library call (load, make, store) to prevent multithreaded races in driver
+/// compilers and deserializers (amdxc64.dll).
+///
+/// Not a plain `MutexGuard`: a worker the compiler crashes on is parked for
+/// good ([`compiler_crashed`]) and must let go of it first, or every later
+/// load and compile would wait on it forever ([`release_one_call`]).
+fn one_call() -> Option<OneCall> {
     static ON: OnceLock<bool> = OnceLock::new();
-    static CALLING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1"))
-        .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
+    let on = *ON.get_or_init(|| {
+        if let Some(v) = std::env::var_os("VICTORY_LIBRARY_LOCK") {
+            v == "1"
+        } else {
+            crate::host::is_amd()
+        }
+    });
+    if !on || HOLDS_CALL.with(std::cell::Cell::get) {
+        return None;
+    }
+    let mut held = CALL_HELD.lock().unwrap_or_else(|e| e.into_inner());
+    while *held {
+        held = CALL_FREE.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+    *held = true;
+    HOLDS_CALL.with(|h| h.set(true));
+    Some(OneCall)
 }
 
-/// Serializes driver pipeline compilation (CreateGraphicsPipelineState /
-/// CreateComputePipelineState). On AMD drivers (amdxc64.dll), concurrent PSO
-/// creation across multiple worker threads races in boost::serialization singletons
-/// and causes access violation crashes (0xc0000005).
-/// Enabled by default on AMD adapters, or via VICTORY_DRIVER_COMPILE_LOCK=1 / VICTORY_LIBRARY_LOCK=1.
-fn compile_lock() -> Option<MutexGuard<'static, ()>> {
-    static ON: OnceLock<bool> = OnceLock::new();
-    static COMPILING: Mutex<()> = Mutex::new(());
-    ON.get_or_init(|| {
-        if let Some(v) = std::env::var_os("VICTORY_DRIVER_COMPILE_LOCK") {
-            v == "1"
-        } else if std::env::var_os("VICTORY_LIBRARY_LOCK").is_some_and(|v| v == "1") {
-            true
-        } else {
-            crate::host::host().is_some_and(|h| crate::indirect::amd(&h.device))
-        }
-    })
-    .then(|| COMPILING.lock().unwrap_or_else(|e| e.into_inner()))
+static CALL_HELD: Mutex<bool> = Mutex::new(false);
+static CALL_FREE: Condvar = Condvar::new();
+
+thread_local! {
+    /// Whether this thread holds [`one_call`].
+    static HOLDS_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`one_call`] held.
+struct OneCall;
+
+impl Drop for OneCall {
+    fn drop(&mut self) {
+        release_one_call();
+    }
+}
+
+/// Lets go of [`one_call`] if this thread holds it.
+fn release_one_call() {
+    if HOLDS_CALL.try_with(|h| h.replace(false)).unwrap_or(false) {
+        *CALL_HELD.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        CALL_FREE.notify_one();
+    }
 }
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
@@ -689,6 +714,8 @@ unsafe extern "system" fn compiler_crashed(
             let _ = writeln!(f, "{name}");
         }
     }
+    // (The other workers must not wait on the lock this one holds.)
+    release_one_call();
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
@@ -733,7 +760,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        let _compile = compile_lock();
+        let _all = one_call();
         return create_guarded(name, create);
     };
     let began = std::time::Instant::now();
@@ -760,11 +787,11 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiles take up to seconds. Keep only this name held; serialized
-    // across workers on AMD (or with VICTORY_DRIVER_COMPILE_LOCK=1) to
-    // prevent multithreaded races in amdxc64.dll.
+    // across workers on AMD (or with VICTORY_LIBRARY_LOCK=1) to prevent
+    // multithreaded races in amdxc64.dll.
     let pso = {
         let _call = call("make", name);
-        let _compile = compile_lock();
+        let _all = one_call();
         create_guarded(name, create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
