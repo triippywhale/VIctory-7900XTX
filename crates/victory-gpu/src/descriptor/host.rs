@@ -2449,6 +2449,39 @@ impl HostHeap {
         }
     }
 
+    /// Makes null the host slots whose placed texture lies in `[start,
+    /// end)` (`crate::resource::unpin_idle`), but those a draw read through a
+    /// table lately. Each is remembered, so that a draw that reads it later
+    /// is said ([`note_unpinned_read`]). Returns how many were made null.
+    pub(crate) fn unpin_range(&self, start: u64, end: u64) -> usize {
+        let frame = crate::frame::current();
+        let slots = self.placed.lock().unwrap_or_else(|e| e.into_inner()).slots_in(start, end);
+        let mut n = 0;
+        for slot in slots {
+            if self.tabled_lately(slot, frame) {
+                continue;
+            }
+            {
+                let _made = self.made.lock(slot);
+                if self.made.get(slot).unwrap_or(0) == 0 {
+                    continue;
+                }
+                self.unmake(slot);
+            }
+            n += 1;
+            UNPINNED_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).insert((std::ptr::from_ref(self) as usize, slot), start);
+            let said = UNPIN_SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if said < 32 {
+                tracing::info!(
+                    slot,
+                    address = format_args!("{start:#x}"),
+                    "slot of an idle texture held by slots alone made null with the card full (VICTORY_UNPIN_IDLE)"
+                );
+            }
+        }
+        n
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its lock ([`Made`]).
     fn unmake(&self, index: u32) {
@@ -3180,6 +3213,9 @@ impl HostHeap {
             return None;
         };
         if shown != key {
+            if for_draw && shown == 0 && crate::resource::unpin_idle() {
+                note_unpinned_read(std::ptr::from_ref(self) as usize, index);
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -4415,6 +4451,34 @@ fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
         t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
     }
     t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
+}
+
+/// Slots `HostHeap::unpin_range` made null (heap, slot), with the address
+/// of their texture; and how many were said.
+static UNPINNED_SLOTS: std::sync::LazyLock<Mutex<std::collections::HashMap<(usize, u32), u64>>> =
+    std::sync::LazyLock::new(Default::default);
+static UNPIN_SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the start: slots made null by `HostHeap::unpin_range` that a draw
+/// or a pass read again (made again from their view then).
+pub(crate) static UNPINNED_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A draw or a pass reads slot `index` of the heap at `heap` while it is
+/// null: if `HostHeap::unpin_range` made it so, counted (the first 32
+/// said), so that a black texture can be traced to it.
+fn note_unpinned_read(heap: usize, index: u32) {
+    let Some(address) = UNPINNED_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(heap, index)) else {
+        return;
+    };
+    let n = UNPINNED_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 32 || n.is_power_of_two() {
+        tracing::info!(
+            slot = index,
+            n,
+            address = format_args!("{address:#x}"),
+            "a slot made null with the card full was read again (made again from its view)"
+        );
+    }
 }
 
 /// Writes of a slot with another view of the placed texture it showed,

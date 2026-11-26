@@ -2303,6 +2303,9 @@ pub(crate) fn let_go_idle() {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
+    // Memory of idle copies held by slots alone ([`unpin_idle`]), and
+    // their bytes.
+    let (mut pinned, mut pinned_bytes): (Vec<(u64, u64)>, u64) = (Vec::new(), 0);
     let mut looked = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
@@ -2328,6 +2331,22 @@ pub(crate) fn let_go_idle() {
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
+            // Held by slots of the title's heaps alone, with the card past
+            // its line: their slots are made null below, and the copy goes
+            // at a later sweep ([`unpin_idle`]).
+            if !idle
+                && most != u64::MAX
+                && unpin_idle()
+                && pinned.len() < UNPIN_MOST
+                && pinned_bytes < most.saturating_sub(bytes)
+                && let Some((host, _)) = made.as_ref()
+                && std::sync::Arc::strong_count(host) == 1
+                && r.host.placed.load(Relaxed)
+                && let Some(span) = crate::texture::title_span(at as This, 0)
+            {
+                pinned_bytes += host.bytes;
+                pinned.push(span);
+            }
             if idle {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
@@ -2350,6 +2369,15 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    drop(all);
+    // (With the table let go: making a slot null takes the slot's lock,
+    // under which a view's texture is made, which takes the table's.)
+    if !pinned.is_empty() {
+        let slots: usize = pinned.iter().map(|&(at, len)| crate::descriptor::unpin_slots(at, at + len)).sum();
+        UNPINNED[0].fetch_add(pinned.len() as u64, Relaxed);
+        UNPINNED[1].fetch_add(pinned_bytes, Relaxed);
+        UNPINNED[2].fetch_add(slots as u64, Relaxed);
+    }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2363,6 +2391,29 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Whether [`let_go_idle`], with the card past its line, also takes idle
+/// host copies of placed textures that slots of the title's heaps alone
+/// hold: those slots are made null (black if a shader still reads them; a
+/// draw that reads one through a table makes it again, and each such read is
+/// said: `descriptor::host::note_unpinned_read`) and the copy goes at the
+/// next sweep. A slot keeps what it views, and the title's heap views
+/// nearly every texture it streamed, so such copies stayed for the run.
+/// `VICTORY_UNPIN_IDLE=1`; off by default.
+#[cfg(windows)]
+pub(crate) fn unpin_idle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNPIN_IDLE").is_some_and(|v| v == "1"))
+}
+
+/// Textures [`unpin_idle`] takes at most in one sweep.
+#[cfg(windows)]
+const UNPIN_MOST: usize = 1024;
+
+/// Since the start: host copies whose slots [`unpin_idle`] made null, their
+/// bytes, and the slots.
+#[cfg(windows)]
+pub(crate) static UNPINNED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.

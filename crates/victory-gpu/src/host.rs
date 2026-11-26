@@ -8828,6 +8828,16 @@ impl Meter {
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
                 );
+                {
+                    let [textures, bytes, slots] = [0, 1, 2].map(|i| crate::resource::UNPINNED[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "idle textures held by slots alone, with the card full (VICTORY_UNPIN_IDLE={}), since the start: {textures} \
+                         ({} MB), {slots} slots made null, {} of them read again by draws",
+                        u8::from(crate::resource::unpin_idle()),
+                        bytes >> 20,
+                        crate::descriptor::host::UNPINNED_READ.load(Ordering::Relaxed)
+                    );
+                }
                 crate::tiles::status();
                 {
                     let [queued, due, away, partly, oldest] =
