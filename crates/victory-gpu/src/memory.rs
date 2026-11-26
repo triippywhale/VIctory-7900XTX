@@ -106,6 +106,20 @@ const BACK: u64 = 256 << 10;
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+
+/// Pages taken from faults in all ([`FAULTS_ALL`] unless
+/// `VICTORY_BVH_FAULTS` says another number; held pages stay under [`MOST`]
+/// either way). With ray tracing on, the 2,048 were gone 7-20 seconds after
+/// the builder started (7900 XT runs, 2026-11-26), and from then on up to
+/// about 1,000 pages a frame that structures point into read as zeros, which
+/// looks like dark and flickering indirect light. The switch is for measuring
+/// what a bigger budget gives against the memory it holds.
+fn faults_all() -> usize {
+    static ALL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| {
+        std::env::var("VICTORY_BVH_FAULTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+    })
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -676,7 +690,7 @@ impl Memory {
         pages.sort_unstable();
         let mut made = 0;
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
+            if made < FAULTS && self.faulted < faults_all() && self.copy_of(page).is_none() && self.map(page) {
                 made += 1;
                 self.faulted += 1;
                 self.bring(page, page + 1);
