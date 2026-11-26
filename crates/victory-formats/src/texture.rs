@@ -826,10 +826,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -933,6 +933,20 @@ impl Texture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_formats_have_layouts() {
+        for (dxgi, bytes) in [(189, 4), (190, 1), (191, 4)] {
+            assert_eq!(
+                format(dxgi),
+                Some(Format {
+                    bytes,
+                    block: 1,
+                    stencil: false
+                })
+            );
+        }
+    }
 
     fn desc(w: u32, h: u32, mips: u32, bpe: u32, swizzle: Swizzle) -> Desc {
         Desc {
@@ -1486,6 +1500,46 @@ mod tests {
             layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
             Err(Error::TooSmall)
         );
+    }
+
+    #[test]
+    fn volume_copies_reject_overlapping_slices() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex3d,
+                depth: 2,
+                ..desc(4, 2, 1, 4, swizzle)
+            })
+            .unwrap();
+            let row_pitch = 21;
+            let row_bytes = 16;
+            let slice_bytes = row_pitch + row_bytes;
+            let input: Vec<u8> = (0..2 * slice_bytes).map(|n| n as u8).collect();
+            let mut tiled = vec![0xcc; layout.size as usize];
+            let mut output = vec![0xcc; input.len()];
+
+            let bad_pitch = slice_bytes - 1;
+            let into = layout.tile(&mut tiled, 0, 0, &input, row_pitch, bad_pitch);
+            let from = layout.detile(&tiled, 0, 0, &mut output, row_pitch, bad_pitch);
+            assert_eq!((into, from), (Err(Error::TooSmall), Err(Error::TooSmall)));
+            assert!(tiled.iter().chain(&output).all(|&byte| byte == 0xcc));
+
+            layout
+                .tile(&mut tiled, 0, 0, &input, row_pitch, slice_bytes)
+                .unwrap();
+            layout
+                .detile(&tiled, 0, 0, &mut output, row_pitch, slice_bytes)
+                .unwrap();
+            for (source, destination) in input.chunks(slice_bytes).zip(output.chunks(slice_bytes)) {
+                assert_eq!(destination[..row_bytes], source[..row_bytes]);
+                assert_eq!(destination[row_pitch..], source[row_pitch..]);
+                assert!(
+                    destination[row_bytes..row_pitch]
+                        .iter()
+                        .all(|&byte| byte == 0xcc)
+                );
+            }
+        }
     }
 
     #[test]

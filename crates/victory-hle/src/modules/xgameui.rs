@@ -212,15 +212,22 @@ mod dialog {
         entry.typed
     }
 
-    extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    pub(super) extern "system" fn procedure(
+        dialog: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {
             let edit = wm::GetDlgItem(dialog, EDIT);
             match message {
                 wm::WM_INITDIALOG => {
+                    let Some(entry) = (lparam as *const Entry).as_ref() else {
+                        return 0;
+                    };
                     wm::SetWindowLongPtrW(dialog, wm::GWLP_USERDATA, lparam);
-                    let entry = &*(lparam as *const Entry);
                     wm::SendMessageW(edit, EM_LIMITTEXT, entry.max as WPARAM, 0);
                     wm::SendMessageW(edit, EM_SETSEL, 0, -1);
                     SetFocus(edit);
@@ -234,9 +241,12 @@ mod dialog {
                     let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
-                            let mut buffer = vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
-                            let n = wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
-                            entry.typed = Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
+                            let len = wm::GetWindowTextLengthW(edit).max(0) as usize;
+                            let mut buffer = vec![0u16; len + 1];
+                            let n =
+                                wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+                            entry.typed =
+                                Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
                             wm::EndDialog(dialog, 1);
                         }
                         wm::IDCANCEL => {
@@ -389,5 +399,20 @@ mod tests {
             let used = std::ptr::null_mut();
             assert_eq!(result(this, &mut b, size, out.as_mut_ptr(), used), S_OK);
         }
+    }
+
+    #[test]
+    fn dialog_procedure_ignores_null_userdata_and_init_lparam() {
+        use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+        // WM_COMMAND arriving before WM_INITDIALOG (or with null HWND/userdata)
+        // must return 0 cleanly instead of dereferencing null.
+        assert_eq!(
+            dialog::procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as usize, 0),
+            0
+        );
+        assert_eq!(
+            dialog::procedure(std::ptr::null_mut(), wm::WM_INITDIALOG, 0, 0),
+            0
+        );
     }
 }

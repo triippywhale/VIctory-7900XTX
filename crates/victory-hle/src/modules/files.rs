@@ -419,6 +419,21 @@ pub extern "system" fn GetDiskFreeSpaceExW(
     )
 }
 
+fn volume_root(host: &mut Vec<u16>) {
+    let prefix = if host.starts_with(&VERBATIM) {
+        VERBATIM.len()
+    } else {
+        0
+    };
+    if let [_, colon, sep, ..] = host[prefix..]
+        && colon == u16::from(b':')
+        && SEPARATORS.contains(&sep)
+    {
+        host.truncate(prefix + 3);
+        host.push(0);
+    }
+}
+
 /// Wants a volume root: a virtual drive answers for the host volume its
 /// folder is on.
 pub extern "system" fn GetDiskFreeSpaceW(
@@ -429,12 +444,8 @@ pub extern "system" fn GetDiskFreeSpaceW(
     clusters: *mut u32,
 ) -> i32 {
     let mut p = wide(root);
-    if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
-        && colon == u16::from(b':')
-        && SEPARATORS.contains(&sep)
-    {
-        *host = vec![letter, colon, sep, 0];
+    if let Some(host) = &mut p.1 {
+        volume_root(host);
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -1016,5 +1027,49 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn disk_free_space_truncates_to_volume_root() {
+        let mut plain = w(r"C:\dir\sub");
+        volume_root(&mut plain);
+        assert_eq!(plain, w(r"C:\"));
+
+        let mut verbatim = w(r"\\?\C:\dir\sub");
+        volume_root(&mut verbatim);
+        assert_eq!(verbatim, w(r"\\?\C:\"));
+
+        let mut unc = w(r"\\?\UNC\server\share\dir");
+        volume_root(&mut unc);
+        assert_eq!(unc, w(r"\\?\UNC\server\share\dir"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let letter = mount(dir.path()).unwrap();
+        let (mut spc, mut bps, mut free, mut total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"{letter}:\")).as_ptr(),
+                &mut spc,
+                &mut bps,
+                &mut free,
+                &mut total,
+            ),
+            0
+        );
+        assert_ne!(spc * bps, 0);
+        assert_ne!(total, 0);
+
+        let (mut v_spc, mut v_bps, mut v_free, mut v_total) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"\\?\{letter}:\")).as_ptr(),
+                &mut v_spc,
+                &mut v_bps,
+                &mut v_free,
+                &mut v_total,
+            ),
+            0
+        );
+        assert_eq!((v_spc, v_bps, v_total), (spc, bps, total));
     }
 }

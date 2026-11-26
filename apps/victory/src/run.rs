@@ -42,7 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
-) -> Result<()> {
+) -> Result<u32> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
@@ -170,7 +170,7 @@ pub fn run(
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
-        return Ok(());
+        return Ok(0);
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -194,7 +194,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
-    Ok(())
+    Ok(code)
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -225,6 +225,34 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     );
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_watch_rvas(list: &str, size: usize) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
+        .collect()
+}
+
+/// Reads a `u32` at `addr` without UB even when `addr` is not 4-byte aligned.
+///
+/// # Safety
+/// `addr..addr + 4` must be readable mapped memory.
+#[cfg(all(windows, feature = "diagnostics"))]
+unsafe fn read_watch_u32(addr: usize) -> u32 {
+    if addr.is_multiple_of(4) {
+        // SAFETY: caller guarantees `addr..addr + 4` is readable and we checked alignment.
+        unsafe { (addr as *const u32).read_volatile() }
+    } else {
+        let mut bytes = [0u8; 4];
+        let ptr = addr as *const u8;
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            // SAFETY: caller guarantees `addr..addr + 4` is readable.
+            *byte = unsafe { ptr.add(i).read_volatile() };
+        }
+        u32::from_ne_bytes(bytes)
+    }
+}
+
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -232,17 +260,16 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
+    let rvas = parse_watch_rvas(&list, size);
+    if rvas.is_empty() {
+        return;
+    }
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
             for (&rva, seen) in rvas.iter().zip(&mut seen) {
                 // SAFETY: four bytes inside the mapped image, checked above.
-                let value = unsafe { ((base + rva) as *const u32).read_volatile() };
+                let value = unsafe { read_watch_u32(base + rva) };
                 if *seen != Some(value) {
                     eprintln!("VIctory: title+{rva:#x} = {value:#x}");
                     *seen = Some(value);
@@ -355,12 +382,29 @@ impl LateDlls {
                     inner: &old,
                     dlls: &new,
                 };
+                let mut reports = Vec::with_capacity(new.len());
                 for (name, dll) in &new {
                     println!(
                         "title dll      {name} at {:#x} (loaded by the title)",
                         dll.base()
                     );
-                    show(name, dll.bind_imports(&resolver, self.policy)?);
+                    match dll.bind_imports(&resolver, self.policy) {
+                        Ok(report) => reports.push((name.as_str(), report)),
+                        Err(err) => {
+                            // Unmap every newly loaded DLL before returning so
+                            // none leak or linger unattached in `IMAGES`.
+                            for (_, dll) in new {
+                                // SAFETY: none were attached or exposed to title code yet.
+                                unsafe { dll.unload() };
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                for (name, report) in reports {
+                    show(name, report);
+                }
+                for (name, dll) in &new {
                     set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
@@ -410,23 +454,27 @@ struct LoaderLock {
 #[cfg(windows)]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
+        struct Guard<'a>(&'a LoaderLock);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                let mut owner = self.0.owner.lock().unwrap_or_else(|e| e.into_inner());
+                owner.1 -= 1;
+                if owner.1 == 0 {
+                    owner.0 = None;
+                    self.0.free.notify_one();
+                }
+            }
+        }
         let me = std::thread::current().id();
-        let lock = || self.owner.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut owner = lock();
+            let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
             while owner.0.is_some_and(|o| o != me) {
                 owner = self.free.wait(owner).unwrap_or_else(|e| e.into_inner());
             }
             *owner = (Some(me), owner.1 + 1);
         }
-        let result = f();
-        let mut owner = lock();
-        owner.1 -= 1;
-        if owner.1 == 0 {
-            owner.0 = None;
-            self.free.notify_one();
-        }
-        result
+        let _guard = Guard(self);
+        f()
     }
 }
 
@@ -498,6 +546,38 @@ mod tests {
         let expected_ok = true;
         assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
     }
+
+    #[test]
+    fn loader_lock_releases_on_panic() {
+        let lock = Arc::new(super::LoaderLock::default());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lock.hold(|| {
+                lock.hold(|| panic!("boom"));
+            });
+        }));
+        assert!(panicked.is_err());
+
+        // Another thread must be able to acquire the lock without deadlocking.
+        let theirs = lock.clone();
+        let got = std::thread::spawn(move || theirs.hold(|| 42))
+            .join()
+            .unwrap();
+        assert_eq!(got, 42);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn watch_helpers_reject_overflow_and_read_unaligned() {
+        let rvas = super::parse_watch_rvas("0x0, 0x1, fffffffffffffffe, 0x10", 0x10);
+        assert_eq!(rvas, [0, 1]);
+        assert!(super::parse_watch_rvas("bad, fffffffffffffffd", 0x10).is_empty());
+
+        let bytes: [u8; 8] = [0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00];
+        let base = bytes.as_ptr() as usize;
+        // SAFETY: `bytes` has 8 readable bytes; offset 1 is intentionally unaligned.
+        let unaligned = unsafe { super::read_watch_u32(base + 1) };
+        assert_eq!(unaligned, u32::from_ne_bytes([0x78, 0x56, 0x34, 0x12]));
+    }
 }
 
 #[cfg(test)]
@@ -529,6 +609,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
     anyhow::bail!("running titles requires Windows")
 }

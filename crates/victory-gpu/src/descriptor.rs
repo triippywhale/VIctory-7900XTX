@@ -28,10 +28,10 @@ const HEAP_IIDS: [Iid; 4] = [
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeapDesc {
-    kind: u32,
-    count: u32,
-    flags: u32,
-    nodes: u32,
+    pub(crate) kind: u32,
+    pub(crate) count: u32,
+    pub(crate) flags: u32,
+    pub(crate) nodes: u32,
 }
 
 /// Newer titles (the title) pass the description followed by
@@ -664,6 +664,10 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        drop(heaps);
+        if let Some(Some(host)) = self.host.get() {
+            crate::memory::forget_heap(host);
+        }
     }
 }
 
@@ -1293,10 +1297,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or_default();
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1586,6 +1589,17 @@ mod tests {
             ),
             5..5
         );
+    }
+
+    #[test]
+    fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
+
+        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     #[test]

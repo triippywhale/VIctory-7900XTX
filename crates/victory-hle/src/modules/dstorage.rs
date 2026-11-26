@@ -585,12 +585,80 @@ struct Job {
     seq: u64,
     request: Request,
     note: Note,
+    file: FileHold,
     staging: u64,
 }
 
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// How many storage workers run at once. The pool reads, inflates and unpacks
+/// in parallel, so the useful count is the PC's **physical** cores: logical
+/// processors count SMT twins, which add little to a pool that already
+/// oversubscribes the cores the submitting thread and the copies need. One
+/// 8-core/16-thread laptop ran 16 workers and had the submitting thread
+/// waiting behind them; 8 measured `copying back` at 2.4-3.5 ms/MB against
+/// 5.7 ms/MB with 16. `VICTORY_DSTORAGE_WORKERS` sets the count outright.
+fn worker_count() -> usize {
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_DSTORAGE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| (1..=64).contains(n))
+        {
+            return n;
+        }
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        physical_cores().unwrap_or_else(|| (logical / 2).max(2)).clamp(1, 32)
+    })
+}
+
+/// The PC's physical cores, if the system will say so (`RelationProcessorCore`
+/// returns one record per core, whatever its SMT twins are).
+#[cfg(windows)]
+fn physical_cores() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut len: u32 = 0;
+    // SAFETY: a null buffer asks for the size; the call fails with
+    // ERROR_INSUFFICIENT_BUFFER and fills `len`.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len) };
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the buffer is `len` bytes and the call writes at most that.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            buf.as_mut_ptr().cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut at = 0usize;
+    let mut cores = 0usize;
+    while at + 8 <= buf.len() {
+        // SAFETY: the record's own header; `Size` is its first field.
+        let size = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at).cast::<u32>()) } as usize;
+        if size < 8 || at + size > buf.len() {
+            break;
+        }
+        cores += 1;
+        at += size;
+    }
+    (cores > 0).then_some(cores)
+}
+
+#[cfg(not(windows))]
+fn physical_cores() -> Option<usize> {
+    None
+}
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -620,12 +688,24 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
-                    .spawn(|| work(scheduler))
+                    .spawn(|| {
+                        // Below the title's threads that record frames: a
+                        // worker per logical processor at normal priority
+                        // took the processor from them while it decoded.
+                        #[cfg(windows)]
+                        // SAFETY: a plain call on our own thread.
+                        unsafe {
+                            use windows_sys::Win32::System::Threading::*;
+                            let _ =
+                                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        }
+                        work(scheduler)
+                    })
                     .is_ok()
             })
             .count();
@@ -767,7 +847,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -782,6 +862,9 @@ fn work(scheduler: &'static Scheduler) {
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // The file's reference (and its handle, if the last) goes before the
+        // title sees the read complete.
+        job.file.release();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -837,14 +920,15 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (seq, front) = lane.reads.front()?;
+        let seq = *seq;
+        let staging = staging_bytes(&front.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (_, Read { request, note, file }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -857,6 +941,7 @@ impl Lanes {
             seq,
             request,
             note,
+            file,
             staging,
         })
     }
@@ -1032,10 +1117,49 @@ enum Command {
 }
 
 /// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
 struct Read {
     request: Request,
     note: Note,
+    file: FileHold,
+}
+
+impl Read {
+    fn new(request: Request, note: Note) -> Self {
+        Self { request, note, file: FileHold::new(&request) }
+    }
+}
+
+/// A COM reference on the `File` a read comes from, so that the title may
+/// release its `IDStorageFile` right after `EnqueueRequest`: held from the
+/// enqueue until the read is done.
+struct FileHold(Option<*mut Instance<File>>);
+
+impl FileHold {
+    fn new(request: &Request) -> Self {
+        const SUPPORTED: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
+        Self(
+            (request.options & !SUPPORTED == 0
+                && request.options & MEMORY_SOURCE == 0
+                && !request.source.is_null())
+            .then(|| {
+                let file = request.source as *mut Instance<File>;
+                add_ref_instance(file);
+                file
+            }),
+        )
+    }
+
+    fn release(&mut self) {
+        if let Some(file) = self.0.take() {
+            release(file);
+        }
+    }
+}
+
+impl Drop for FileHold {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// The streaming trace (`VICTORY_DSTORAGE_TRACE`): 0 or unset: off; 1: a
@@ -1262,7 +1386,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
         return;
     };
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(this, Command::Read(Read::new(request, note)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -1395,6 +1519,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         }
         let size = request.source_size as usize;
         return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+            .or_else(|hr| copy_through_buffer(request, size, hr))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -1531,13 +1656,80 @@ static READING: AtomicU64 = AtomicU64::new(0);
 const READ_RETRIES: u32 = 8;
 
 /// Fills `out` (the source size) from the request's file or memory.
+/// A plain read into a title address that the kernel refused because the
+/// destination was read-only when it wrote (`ERROR_INVALID_USER_BUFFER` or
+/// `ERROR_NOACCESS`): the GPU side's write guard can protect a block again
+/// between `kernel_will_write` opening it and the read landing. Read into
+/// our own buffer instead and store the bytes with plain writes, which
+/// fault into the guard's handler like the title's own. Only for committed,
+/// accessible destinations; anything else keeps the kernel's error.
+fn copy_through_buffer(request: &Request, size: usize, hr: HRESULT) -> Result<(), HRESULT> {
+    const INVALID_USER_BUFFER: u32 = 0x8007_06F8;
+    const NOACCESS: u32 = 0x8007_03E6;
+    if request.options & (PAGE_DESTINATION | MEMORY_SOURCE) != 0
+        || !matches!(hr as u32, INVALID_USER_BUFFER | NOACCESS)
+        || !committed(request.destination as usize, size)
+    {
+        return Err(hr);
+    }
+    let mut data = vec![0u8; size];
+    read_into(request, &mut data)?;
+    // SAFETY: the title's destination holds `destination_size` bytes, at
+    // least `size`, committed (checked above) and written by nothing else
+    // until completion; a guarded block faults into the guard's handler.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), request.destination.cast::<u8>(), size);
+    }
+    static RETRIED: AtomicU32 = AtomicU32::new(0);
+    let n = RETRIED.fetch_add(1, Ordering::Relaxed);
+    if n.is_power_of_two() || n == 0 {
+        tracing::info!(
+            retried = n + 1,
+            offset = request.offset,
+            size,
+            hr = format_args!("{:#010x}", hr as u32),
+            "dstorage: a read the kernel refused into guarded title memory was copied through a buffer"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `[at, at + len)` is committed memory that is not `PAGE_NOACCESS`
+/// or a guard page.
+fn committed(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = at.saturating_add(len);
+    let mut next = at;
+    while next < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(next as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0
+            || info.Protect == 0
+        {
+            return false;
+        }
+        let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if region_end <= next {
+            return false;
+        }
+        next = region_end;
+    }
+    true
+}
+
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
+    // SAFETY: a file object we created; the read holds a reference on it.
     let files = &unsafe { &*request.source.cast::<Instance<File>>() }
         .state
         .files;
@@ -2218,7 +2410,7 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read::new(r, note)));
     }
 
     #[test]
@@ -2542,5 +2734,66 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn releasing_file_after_enqueue_keeps_it_alive_until_read_completes() {
+        let plain = pattern(8192);
+        let packed = compress_zlib(&plain);
+        let mut contents = plain.clone();
+        contents.extend_from_slice(&packed);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("released.bin");
+        std::fs::write(&path, &contents).unwrap();
+        let file = open(&path);
+
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut raw = vec![0u8; 512];
+        let mut inflated = vec![0u8; plain.len()];
+        enqueue(
+            queue,
+            &request(0, raw.as_mut_ptr().cast(), raw.len(), file, 128, raw.len()),
+        );
+        enqueue(
+            queue,
+            &request(
+                ZLIB,
+                inflated.as_mut_ptr().cast(),
+                inflated.len(),
+                file,
+                plain.len() as u64,
+                packed.len(),
+            ),
+        );
+        // Title releases the file immediately after EnqueueRequest, before Submit.
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(rel(file), 2, "two queued reads retain the file");
+
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(raw, plain[128..128 + 512]);
+        assert_eq!(inflated, plain);
+        // The OS file handle must already be closed once completion is visible.
+        std::fs::remove_file(&path).expect("file handle released before completion");
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn closing_queue_with_unsubmitted_file_read_releases_file_ref() {
+        let (_dir, file) = file_with(&pattern(256));
+        let queue = new_queue(0);
+        let mut buf = [0u8; 64];
+        enqueue(
+            queue,
+            &request(0, buf.as_mut_ptr().cast(), buf.len(), file, 0, buf.len()),
+        );
+        let add: extern "system" fn(*mut c_void) -> u32 = call(file, 0x08);
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(add(file), 3);
+        assert_eq!(rel(file), 2);
+        // Close without submitting: unsubmitted read drops and releases its ref.
+        void(queue, 0x40);
+        assert_eq!(rel(file), 0, "file refcount returns cleanly to 0");
     }
 }

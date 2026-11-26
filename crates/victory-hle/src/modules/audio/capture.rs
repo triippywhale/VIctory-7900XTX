@@ -22,8 +22,8 @@ use windows::Win32::Media::Audio::{
     IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
@@ -93,7 +93,9 @@ pub fn child() -> bool {
 }
 
 fn header(frames: u64) -> [u8; 44] {
-    let data = u32::try_from(frames * FRAME_BYTES as u64).unwrap_or(u32::MAX - 36);
+    let data = frames
+        .saturating_mul(FRAME_BYTES as u64)
+        .min(u64::from(u32::MAX - 36)) as u32;
     let mut h = [0u8; 44];
     let fields: [(&[u8], usize); 11] = [
         (b"RIFF", 0),
@@ -115,12 +117,49 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+/// Converts a WASAPI QPC timestamp (100 ns units) to an audio frame position
+/// relative to the first packet without underflow on non-monotonic QPC values
+/// or 64-bit multiplication overflow.
+fn packet_frame_position(qpc: u64, first: &mut Option<u64>) -> u64 {
+    let origin = *first.get_or_insert(qpc);
+    let delta = u128::from(qpc.saturating_sub(origin));
+    ((delta * u128::from(RATE)) / 10_000_000).min(u128::from(u64::MAX)) as u64
+}
+
+fn write_silence(file: &mut impl Write, mut frames: u64) -> std::io::Result<()> {
+    const CHUNK_FRAMES: usize = 16_384; // 64 KiB
+    let zeros = [0u8; CHUNK_FRAMES * FRAME_BYTES];
+    while frames > 0 {
+        let step = frames.min(CHUNK_FRAMES as u64) as usize;
+        file.write_all(&zeros[..step * FRAME_BYTES])?;
+        frames -= step as u64;
+    }
+    Ok(())
+}
+
+struct ComGuard;
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        // SAFETY: pairs with the successful `CoInitializeEx` in `record`.
+        unsafe { CoUninitialize() };
+    }
+}
+
+struct OwnedHandle(HANDLE);
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was opened by `OpenProcess` in `record`.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-        let target = OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?;
+        let _com = ComGuard;
+        let target = OwnedHandle(OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?);
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -187,24 +226,24 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut patched = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(10));
-            let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
+            let ended = WaitForSingleObject(target.0, 0) == WAIT_OBJECT_0;
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
-                if at > written + u64::from(RATE / 500) {
+                let at = packet_frame_position(qpc, &mut first);
+                if at > written.saturating_add(u64::from(RATE / 500)) {
+                    let gap = at - written;
                     tracing::debug!(
-                        ms = (at - written) * 1000 / u64::from(RATE),
+                        ms = gap * 1000 / u64::from(RATE),
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
-                    file.write_all(&silence)?;
+                    write_silence(&mut file, gap)?;
                     written = at;
                 }
                 let bytes = frames as usize * FRAME_BYTES;
                 if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    file.write_all(&vec![0u8; bytes])?;
+                    write_silence(&mut file, u64::from(frames))?;
                 } else {
                     file.write_all(std::slice::from_raw_parts(data, bytes))?;
                 }
@@ -225,5 +264,46 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_header_clamps_near_u32_max_without_overflow() {
+        // Previously panicked on `36 + data` when `frames * 4` landed in `(u32::MAX - 35)..=u32::MAX`.
+        let near_max_frames = u64::from(u32::MAX / FRAME_BYTES as u32);
+        let h = header(near_max_frames);
+        let riff = u32::from_le_bytes(h[4..8].try_into().unwrap());
+        let data = u32::from_le_bytes(h[40..44].try_into().unwrap());
+        assert_eq!(data, u32::MAX - 36);
+        assert_eq!(riff, u32::MAX);
+        // Saturates cleanly on huge u64 values too.
+        let h2 = header(u64::MAX);
+        assert_eq!(u32::from_le_bytes(h2[40..44].try_into().unwrap()), u32::MAX - 36);
+    }
+
+    #[test]
+    fn packet_frame_position_handles_non_monotonic_and_large_qpc() {
+        let mut first = None;
+        assert_eq!(packet_frame_position(10_000_000, &mut first), 0);
+        // Earlier / zero QPC timestamp must saturate to 0 instead of underflowing.
+        assert_eq!(packet_frame_position(0, &mut first), 0);
+        assert_eq!(packet_frame_position(9_999_999, &mut first), 0);
+        // +1 second (10_000_000 ticks) = RATE frames.
+        assert_eq!(packet_frame_position(20_000_000, &mut first), u64::from(RATE));
+        // Huge QPC delta must not overflow u64 during multiplication by RATE.
+        let huge = packet_frame_position(u64::MAX, &mut first);
+        assert!(huge > u64::from(RATE));
+    }
+
+    #[test]
+    fn write_silence_streams_in_fixed_chunks() {
+        let mut out = Vec::new();
+        write_silence(&mut out, 20_000).unwrap();
+        assert_eq!(out.len(), 20_000 * FRAME_BYTES);
+        assert!(out.iter().all(|&b| b == 0));
     }
 }

@@ -3765,6 +3765,33 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host stores to typed unordered views of `format`.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -3922,6 +3949,8 @@ fn make_twinned(
     let host = host()?;
     let device = &host.device;
     match view {
+        // make_at and the mirror path write a typed null for this view.
+        View::Constant(0, _) => None,
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -4067,6 +4096,19 @@ fn make_twinned(
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return None;
+            }
+            // The host refuses (and removes the device for) a typed unordered
+            // view in a format it cannot store to: the packed 16-bit ones
+            // (B5G5R5A1, B4G4R4A4), 2026-11-24. Such a view is null.
+            // SAFETY: a live resource.
+            let final_format = desc
+                .as_ref()
+                .map(|d| d.Format.0 as u32)
+                .filter(|&f| f != 0)
+                .unwrap_or_else(|| unsafe { texture.GetDesc() }.Format.0 as u32);
+            if !typed_store(final_format) {
+                once!(format = final_format, "an unordered view in a format the host cannot store");
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.

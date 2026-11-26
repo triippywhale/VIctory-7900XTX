@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -2614,8 +2614,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
-    /// A fence (its address) signalled behind the flights before it.
-    Signal(usize, u64),
+    /// A fence signalled behind the flights before it (retaining a COM ref).
+    Signal(crate::fence::FenceRef, u64),
 }
 
 struct Line {
@@ -3096,15 +3096,18 @@ fn split<T>(lists: Vec<T>, order: Vec<usize>, cut: usize) -> Result<[Run<T>; 2],
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
-/// air, if there are any, and is set when they are settled. Whether it
-/// did; if not the caller sets the fence now.
-pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
+/// air, if there are any, and is set when they are settled. Returns `Ok(())`
+/// if queued, or `Err(fence)` if the caller should set the fence now.
+pub(crate) fn late_signal(
+    fence: crate::fence::FenceRef,
+    value: u64,
+) -> Result<(), crate::fence::FenceRef> {
     if !late() {
-        return false;
+        return Err(fence);
     }
     let mut line = line();
     if line.line.is_empty() && !line.settling {
-        return false;
+        return Err(fence);
     }
     line.line.push(Late::Signal(fence, value));
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
@@ -3113,7 +3116,7 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
     // the helper thread for it.
     LINE_MOVED.notify_one();
     RELAY_MOVED.notify_one();
-    true
+    Ok(())
 }
 
 /// A queue stands at `wait`, which memory does not meet now ([`late`]):
@@ -3795,15 +3798,26 @@ fn read_backs(list: &HostList) {
         crate::texback::land(back);
     }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+        if *rows == 0 || *row == 0 {
+            continue;
+        }
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
-        // run; the title's destination holds every row (checked when the
-        // copy was recorded).
+        // run. Title memory is written through `write_mapped` after the
+        // watch is told, so a page unmapped or guarded while the list flew
+        // is skipped instead of faulting (PalmVIDev 2ef001c8, from
+        // fxceless/victory-fork#565).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
+                let src_pitch = row.next_multiple_of(256);
+                let span = (rows - 1).saturating_mul(*pitch).saturating_add(*row);
+                crate::watch::writing(*at, span);
                 for line in 0..*rows {
-                    std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                    let Some(dst) = line.checked_mul(*pitch).and_then(|off| at.checked_add(off)) else {
+                        break;
+                    };
+                    write_mapped(dst as *mut u8, from.add(line * src_pitch), *row);
                 }
                 // The walls trace: what the title is handed (one row of at
                 // most 24 values: its 5x1 and 1x1 float targets).
@@ -4870,7 +4884,7 @@ impl Host {
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
                 Late::Signal(fence, value) => {
-                    crate::fence::set(fence as crate::object::This, value);
+                    crate::fence::set(fence.as_this(), value);
                     crate::land::spent(crate::land::stat::TOLD, telling)
                 }
             };
@@ -5198,6 +5212,30 @@ impl Host {
         number
     }
 
+    /// Waits for a direct queue fence with the shared event, under the submission lock.
+    fn wait_for_submission(&self, target: u64, started: std::time::Instant, context: &str) {
+        // SAFETY: the fence and event are ours, and the submission lock
+        // prevents another wait from using this event.
+        unsafe {
+            if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                fail(format_args!("could not register a direct fence wait for {context} ({e})"));
+            }
+            working(false);
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            match WaitForSingleObject(self.event, INFINITE) {
+                WAIT_OBJECT_0 => {}
+                WAIT_FAILED => {
+                    let error = windows::core::Error::from_thread();
+                    fail(format_args!("could not wait for {context} ({error})"));
+                }
+                status => fail(format_args!("unexpected direct fence wait result for {context} ({:#x})", status.0)),
+            }
+            stood(started);
+            working(true);
+        }
+    }
+
     /// Waits for the card to run every flight in the air ([`late`]) and
     /// does what they left to do, as [`Host::execute`] does for one
     /// submission after its wait: the pieces their shaders wrote in copies
@@ -5249,21 +5287,7 @@ impl Host {
             if flights > 0 {
                 submitting(2, flights);
                 let waiting = std::time::Instant::now();
-                // SAFETY: the fence and event are ours, under the
-                // submission lock; `submitted` is the last value signalled.
-                unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            working(false);
-                            #[cfg(feature = "diagnostics")]
-                            let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
-                            stood(waiting);
-                            working(true);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "submissions sent ahead not waited for"),
-                    }
-                }
+                self.wait_for_submission(*submitted, waiting, "submissions sent ahead");
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 LATE_WAITED[why.min(10)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5332,7 +5356,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    Late::Signal(fence, value) => crate::fence::set(fence.as_this(), value),
                 }
             }
             if last > 0 {
@@ -5397,6 +5421,17 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // D3D12 forbids a command list twice in one `ExecuteCommandLists`
+        // (drivers hang: DXGI_ERROR_DEVICE_HUNG), and a list's second
+        // `prelude` would reset the one queued for its first occurrence.
+        // Split at a duplicate: the part before it runs (and is waited for)
+        // first (fxceless/victory-fork#675).
+        if let Some(split) = first_duplicate(runs) {
+            let before: Vec<usize> = parts.iter().copied().filter(|&p| p < split).collect();
+            let after: Vec<usize> = parts.iter().filter(|&&p| p > split).map(|&p| p - split).collect();
+            let _ = self.submit(&runs[..split], &before, false);
+            return self.submit(&runs[split..], &after, late);
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5696,24 +5731,14 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signalled = self.queue.Signal(&self.fence, *submitted);
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
-                match waited {
-                    Ok(()) => {
-                        working(false);
-                        #[cfg(feature = "diagnostics")]
-                        let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
-                        stood(started);
-                        working(true);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                if let Err(e) = signalled {
+                    fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
             }
+            self.wait_for_submission(*submitted, started, "a synchronous host submission");
             // With timing on each group is one of `runs` (and the compare
             // of copies in the card's memory, with the last): every
             // command's time on the card goes to the sums by pipeline.
@@ -9570,6 +9595,38 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+}
+
+/// Index of the first list in `runs` that already appeared earlier in
+/// `runs` (by identity), or `None` if every list is distinct.
+fn first_duplicate(runs: &[&HostList]) -> Option<usize> {
+    if runs.len() <= 1 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter().position(|list| !seen.insert(std::ptr::from_ref(*list) as usize))
+}
+
+#[cfg(test)]
+mod duplicate_lists {
+    /// A submission naming one list twice is split at the second
+    /// occurrence and runs to the end (fxceless/victory-fork#675).
+    #[test]
+    fn a_list_named_twice_is_submitted_in_two_parts() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let a = host.new_list().unwrap();
+        a.close();
+        let b = host.new_list().unwrap();
+        b.close();
+        assert_eq!(super::first_duplicate(&[]), None);
+        assert_eq!(super::first_duplicate(&[&a]), None);
+        assert_eq!(super::first_duplicate(&[&a, &b]), None);
+        assert_eq!(super::first_duplicate(&[&a, &a]), Some(1));
+        assert_eq!(super::first_duplicate(&[&a, &b, &a]), Some(2));
+        host.execute(&[&a, &b, &a]);
     }
 }
 

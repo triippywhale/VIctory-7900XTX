@@ -148,7 +148,11 @@ impl Tables {
             let used = m / 16 + 2;
             let mut at = 0u32;
             for b in 0..used {
-                if freq[m][b] == 0 {
+                // Bucket 0 holds symbol 0 across slots `1..freq[0]-1` (slot 0
+                // is unused), so `freq[m][0] == 1` leaves 0 usable slots and
+                // causes `Lane::step` to compute `f = freq[0] - 1 == 0` and
+                // `rem = 0u32.wrapping_sub(1)`.
+                if freq[m][b] == 0 || (b == 0 && freq[m][b] < 2) {
                     return Err(Error("a model has an empty bucket"));
                 }
                 start[m][b] = at;
@@ -1604,5 +1608,18 @@ mod tests {
             let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
             assert!(ok, "entry {k}: {:?}", ix.ix);
         }
+    }
+
+    /// Bucket 0 spans slots `1..freq[0]-1` (slot 0 is unused), so a custom
+    /// table with `freq[m][0] == 1` has zero usable slots for symbol 0 and
+    /// would corrupt `Lane::step`. `Tables::parse` must reject it even when
+    /// the frequencies still sum to 65536.
+    #[test]
+    fn tables_parse_rejects_bucket0_frequency_one() {
+        let mut raw = tables();
+        // Model 0 uses buckets 0 and 1 (`at = freq[0] + freq[1] == 65536`).
+        raw[0..2].copy_from_slice(&1u16.to_le_bytes());
+        raw[2..4].copy_from_slice(&65535u16.to_le_bytes());
+        assert_eq!(Tables::parse(&raw).err(), Some(Error("a model has an empty bucket")));
     }
 }

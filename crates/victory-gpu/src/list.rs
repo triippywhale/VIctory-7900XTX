@@ -728,15 +728,22 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 last: u64::from(crate::host::legal_state(texture, wanted)),
             })
         }
+        // An aliasing barrier: D3D12 takes no reference on the resources a
+        // barrier names, so the list keeps the host textures alive until it
+        // is reset (PalmVIDev d3f0ad91).
         1 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
+                let res = crate::resource::host_resource(b.first)?;
+                list.keep(res);
                 host(b.first)?
             },
             second: if b.second == 0 {
                 0
             } else {
+                let res = crate::resource::host_resource(b.second as This)?;
+                list.keep(res);
                 host(b.second as This)? as u64
             },
             ..*b
@@ -748,15 +755,38 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
                 // A depth texture's unordered access is its colour twin's
                 // (the host gives the depth texture none): the barrier is
                 // on the texture shaders write.
-                match crate::resource::twin_resource(b.first) {
-                    Some(twin) => twin.as_raw().cast_const().cast(),
-                    None => host(b.first)?,
-                }
+                let res = match crate::resource::twin_resource(b.first) {
+                    Some(twin) => twin,
+                    None => crate::resource::host_resource(b.first)?,
+                };
+                list.keep(res);
+                res.as_raw().cast_const().cast()
             },
             ..*b
         }),
         _ => None,
     }
+}
+
+/// For an unordered access barrier on a depth-stencil texture: the same
+/// barrier on its depth plane's twin, which shaders write too (the colour
+/// twin holds the stencil plane). PalmVIDev d3f0ad91 / fxceless#214.
+#[cfg(windows)]
+fn depth_plane_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
+    use windows::core::Interface;
+    if b.kind != 2 || b.first.is_null() {
+        return None;
+    }
+    let res = crate::resource::twin_plane_resource(b.first)?;
+    // SAFETY: a live D3D12 resource.
+    if unsafe { res.GetDesc() }.Flags.0 as u32 & 0x4 == 0 {
+        return None;
+    }
+    list.keep(res);
+    Some(Barrier {
+        first: res.as_raw().cast_const().cast(),
+        ..*b
+    })
 }
 
 /// An unordered access barrier on every resource: earlier shader writes
@@ -782,7 +812,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
             .iter()
-            .filter_map(|b| host_barrier(list, b))
+            .flat_map(|b| [host_barrier(list, b), depth_plane_barrier(list, b)])
+            .flatten()
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
@@ -905,7 +936,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            if to == from || unlike(dst, src) {
                 return;
             }
             // Two title textures over the same memory have one host
@@ -1212,7 +1243,10 @@ fn read_back(
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
     // The title's buffer holds every row at its own pitch.
-    let bytes = pitch * (rows - 1) + row;
+    let bytes = pitch
+        .checked_mul(rows - 1)
+        .and_then(|n| n.checked_add(row))
+        .ok_or("footprint size overflows")?;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
     let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
@@ -1261,6 +1295,17 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Dimensions (width, height) of subresource sub of a texture whose mip 0
+/// is width x height with mip_levels mips per array slice.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn subresource_size(width: u64, height: u32, mip_levels: u16, sub: u32) -> (u64, u32) {
+    let mips = u32::from(mip_levels).max(1);
+    let mip = (sub % mips).min(63);
+    let w = (width >> mip).max(1);
+    let h = (u64::from(height) >> mip).max(1) as u32;
+    (w, h)
+}
+
 extern "system" fn resolve(
     this: This,
     dst: This,
@@ -1301,7 +1346,10 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            // The levels resolved, not level 0, decide the path and the region.
+            let (aw, ah) = subresource_size(a.Width, a.Height, a.MipLevels, dst_sub);
+            let (bw, bh) = subresource_size(b.Width, b.Height, b.MipLevels, src_sub);
+            if (aw, ah) == (bw, bh) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -1309,8 +1357,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: aw.min(bw).min(i32::MAX as u64) as i32,
+                    bottom: ah.min(bh).min(i32::MAX as u32) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -1788,7 +1836,11 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if y * z != 1 {
+        // No groups in any dimension: nothing runs.
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
+        if y != 1 || z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
@@ -2376,6 +2428,29 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// `DispatchMesh` with group counts whose product overflows, or with
+    /// none in a dimension, is no mesh dispatch (and no panic).
+    #[cfg(windows)]
+    #[test]
+    fn mesh_dispatches_with_overflowing_or_zero_groups_do_nothing() {
+        // A null list: the state is never reached.
+        state::dispatch_mesh(std::ptr::null(), 16, 65536, 65536);
+        state::dispatch_mesh(std::ptr::null(), 16, 0, 1);
+        state::dispatch_mesh(std::ptr::null(), 0, 1, 1);
+    }
+
+    #[test]
+    fn subresource_size_tracks_mips_and_array_slices() {
+        assert_eq!(subresource_size(1024, 512, 10, 0), (1024, 512));
+        assert_eq!(subresource_size(1024, 512, 10, 1), (512, 256));
+        assert_eq!(subresource_size(1024, 512, 10, 2), (256, 128));
+        // Array slice 1, mip 1 (subresource = 1 * 10 + 1 = 11).
+        assert_eq!(subresource_size(1024, 512, 10, 11), (512, 256));
+        // Clamped at 1x1 on deep mips and safe when mip_levels == 0.
+        assert_eq!(subresource_size(1024, 512, 11, 10), (1, 1));
+        assert_eq!(subresource_size(64, 32, 0, 5), (64, 32));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

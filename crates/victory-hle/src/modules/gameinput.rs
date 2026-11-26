@@ -108,11 +108,49 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
+    fn keys(&mut self, looks: u64) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+}
+
+/// A press is reported until the title has taken this many current readings
+/// since it began: one would let the poll between a pad reading and a
+/// keyboard reading of the same frame drop it.
+const LATCH_LOOKS: u64 = 2;
+/// ... or this long, for a title that is not reading at all.
+const LATCH_MAX: Duration = Duration::from_secs(2);
+
+/// Presses kept until the title has looked.
+///
+/// The host is polled every [`POLL`] and the title takes the current reading
+/// once a frame. At a few frames a second a tap falls between two frames:
+/// the key or button is down and up again before the title looks, and the
+/// press is lost (seen in the world at about 350 ms a frame: three 60 ms
+/// taps of the menu key did nothing, a 1.5 s hold opened the menu). A press
+/// is therefore reported from when it begins until the title has looked
+/// [`LATCH_LOOKS`] times, even if it was released meanwhile.
+#[derive(Default)]
+struct Latch {
+    /// (key or button, looks when the press began, when it began)
+    held: Vec<(u32, u64, Instant)>,
+}
+
+impl Latch {
+    /// What to report as down: `down` now, plus presses the title has not
+    /// seen yet. `looks` counts successful reads from this input source.
+    fn report(&mut self, down: &[u32], looks: u64, now: Instant) -> Vec<u32> {
+        self.held.retain(|&(id, at, since)| {
+            down.contains(&id) || (looks < at + LATCH_LOOKS && now.duration_since(since) < LATCH_MAX)
+        });
+        for &id in down {
+            if !self.held.iter().any(|h| h.0 == id) {
+                self.held.push((id, looks, now));
+            }
+        }
+        self.held.iter().map(|h| h.0).collect()
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -361,6 +399,9 @@ pub struct Hub {
     source: Mutex<Box<dyn Source>>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
+    /// Successful current readings per input source. The stand-in pad and
+    /// keyboard are two views of the same sampled keys.
+    looks: [AtomicU64; DEVICES],
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -393,6 +434,7 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             one_pad,
+            looks: Default::default(),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -432,8 +474,9 @@ impl Hub {
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
-            let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let pads: [_; PADS] =
+                std::array::from_fn(|i| source.pad(i, self.looks[i].load(Ordering::Relaxed)));
+            (pads, source.keys(self.looks[KEYBOARD].load(Ordering::Relaxed)))
         };
         let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
         self.deliver(events);
@@ -555,10 +598,10 @@ fn host() -> Box<dyn Source> {
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize, _: u64) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             Vec::new()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
@@ -635,12 +678,13 @@ extern "system" fn current_reading(
             .history
             .back()
             .filter(|r| r.kind() & kind != 0)
+            .map(|r| (i, r))
     };
     let found = if device.is_null() {
         (0..DEVICES)
             .filter(|&i| state.slots[i].connected)
             .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+            .max_by_key(|(_, r)| r.timestamp)
     } else {
         match hub.index(device) {
             None => return fail(out, E_INVALIDARG),
@@ -651,10 +695,15 @@ extern "system" fn current_reading(
     tracing::trace!(
         kind = format_args!("{kind:#x}"),
         device = ?hub.index(device),
-        sequence = found.map(|r| r.sequence),
+        sequence = found.map(|(_, r)| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let hr = hand(out, found.map(|(_, r)| r));
+    if hr == S_OK && let Some((i, _)) = found {
+        let source = if i == FALLBACK { KEYBOARD } else { i };
+        hub.looks[source].fetch_add(1, Ordering::Relaxed);
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference` on its device.
@@ -966,7 +1015,7 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
+            if source.pad(slot, device.hub().looks[slot].load(Ordering::Relaxed)).is_some() {
                 source.rumble(slot, speed(low), speed(high));
             }
         }
@@ -1060,14 +1109,16 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
-        Value::Pad(state) if !out.is_null() => {
-            // SAFETY: checked non-null.
-            unsafe { out.write(*state) };
-            true
-        }
-        _ => false,
+    if out.is_null() {
+        return false;
     }
+    let (state, is_gamepad) = match &reading(this).value {
+        Value::Pad(state) => (*state, true),
+        Value::Keys(_) => (PadState::default(), false),
+    };
+    // SAFETY: the title passes writable storage for the state.
+    unsafe { out.write(state) };
+    is_gamepad
 }
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
@@ -1177,10 +1228,14 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Key presses the title has not seen yet ([`Latch`]).
+        keys: Latch,
+        /// Button presses, per pad.
+        buttons: [Latch; PADS],
     }
 
     impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1193,6 +1248,13 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // A button tapped between two of the title's looks stays down
+            // until it has looked.
+            let down: Vec<u32> = (0..32).filter(|bit| pad.buttons & (1 << bit) != 0).collect();
+            pad.buttons = self.buttons[slot]
+                .report(&down, looks, Instant::now())
+                .into_iter()
+                .fold(0, |all, bit| all | (1 << bit));
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
@@ -1208,7 +1270,7 @@ mod host {
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, looks: u64) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
@@ -1221,7 +1283,15 @@ mod host {
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
+                // A key tapped between two of the title's looks stays down
+                // until it has looked.
+                let held: Vec<u32> = held.into_iter().map(u32::from).collect();
+                let latched = self.keys.report(&held, looks, Instant::now());
+                for vk in latched.into_iter().map(|vk| vk as u8) {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1340,10 +1410,10 @@ mod tests {
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize, _: u64) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
+        fn keys(&mut self, _: u64) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1481,6 +1551,28 @@ mod tests {
     }
 
     #[test]
+    fn only_successful_reads_from_the_input_source_count_toward_a_tap() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        let mut latch = Latch::default();
+        let keyboard_reads = || hub.looks[KEYBOARD].load(Ordering::Relaxed);
+        let now = Instant::now();
+        assert_eq!(latch.report(&[27], keyboard_reads(), now), [27]);
+        for _ in 0..2 {
+            assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+            release(current(hub, GAMEPAD_KIND, 1).unwrap());
+        }
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        release(current(hub, GAMEPAD_KIND, FALLBACK).unwrap());
+        assert_eq!(latch.report(&[], keyboard_reads(), now + POLL), [27]);
+        release(current(hub, KEYBOARD_KIND, KEYBOARD).unwrap());
+        assert!(latch.report(&[], keyboard_reads(), now + POLL * 2).is_empty());
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1562,8 +1654,9 @@ mod tests {
         release(r);
 
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        let mut state = pad(r);
         assert_eq!(
-            pad(r),
+            state,
             PadState {
                 buttons: A,
                 left_y: 1.0,
@@ -1575,6 +1668,11 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let get = slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(r, 0xb0);
+        assert!(!get(r, &mut state));
+        assert_eq!(state, PadState::default());
+        release(r);
     }
 
     #[test]
@@ -1710,5 +1808,55 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+}
+
+#[cfg(test)]
+mod latch_tests {
+    use super::*;
+
+    /// A tap that ends before the title looks is still reported, until the
+    /// title has looked [`LATCH_LOOKS`] times.
+    #[test]
+    fn a_tap_between_two_looks_is_kept_until_the_title_has_looked() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        // Down at look 10, up 8 ms later with the title not having looked.
+        assert_eq!(latch.report(&[27], 10, t), [27]);
+        assert_eq!(latch.report(&[], 10, t + POLL), [27]);
+        // One look: still down (a second reading of the same frame may follow).
+        assert_eq!(latch.report(&[], 11, t + POLL * 2), [27]);
+        // Two looks: released.
+        assert!(latch.report(&[], 12, t + POLL * 3).is_empty());
+    }
+
+    /// A held key stays down however often the title looks, and is released
+    /// as soon as it is let go once the title has seen it.
+    #[test]
+    fn a_held_key_is_down_while_held_and_no_longer() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[65], 0, t), [65]);
+        assert_eq!(latch.report(&[65], 50, t + Duration::from_secs(5)), [65]);
+        assert!(latch.report(&[], 50, t + Duration::from_secs(5) + POLL).is_empty());
+    }
+
+    /// With a title that does not look, a tap is not held for ever.
+    #[test]
+    fn a_tap_is_dropped_after_a_while_without_looks() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[13], 3, t), [13]);
+        assert_eq!(latch.report(&[], 3, t + LATCH_MAX / 2), [13]);
+        assert!(latch.report(&[], 3, t + LATCH_MAX + POLL).is_empty());
+    }
+
+    /// Presses are kept apart: one tap ending does not end another key's hold.
+    #[test]
+    fn keys_are_latched_one_by_one() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.report(&[1, 2], 0, t), [1, 2]);
+        assert_eq!(latch.report(&[2], 2, t + POLL), [2]);
     }
 }

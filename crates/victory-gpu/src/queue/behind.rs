@@ -388,9 +388,10 @@ enum Job {
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
     /// begin in the order, and the signals given behind them.
-    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
-    /// A signal of the queue's.
-    Signal(usize, u64),
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(crate::fence::FenceRef, u64)>),
+    /// A signal of the queue's (holding a reference on the fence until it
+    /// is set).
+    Signal(crate::fence::FenceRef, u64),
     /// A frame is shown: the texture and the state its lists leave it in.
     Present(Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, super::Shown),
 }
@@ -480,7 +481,7 @@ impl Work for Job {
                 }
             }
             &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                if crate::fence::completed(fence as This) < value && !signals.iter().any(|(f, v)| f.as_this() as usize == fence && *v >= value) {
                     return Err(next);
                 }
             }
@@ -559,14 +560,14 @@ impl Work for Job {
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
-                    if !crate::host::late_signal(fence, value) {
-                        crate::fence::set(fence as This, value);
+                    if let Err(fence) = crate::host::late_signal(fence, value) {
+                        crate::fence::set(fence.as_this(), value);
                     }
                 }
             }
             Job::Signal(fence, value) => {
-                if !crate::host::late_signal(fence, value) {
-                    crate::fence::set(fence as This, value);
+                if let Err(fence) = crate::host::late_signal(fence, value) {
+                    crate::fence::set(fence.as_this(), value);
                 }
             }
             Job::Present(texture, shown) => {
@@ -794,10 +795,10 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
 /// A signal of queue `this`: behind what it has in the line; if that is
 /// nothing, behind the flights in the air, or now.
 pub(super) fn signal(this: This, fence: This, value: u64) {
-    let fence = fence as usize;
-    LANE.push_behind(this as usize, false, Job::Signal(fence, value), || {
-        if !crate::host::late_signal(fence, value) {
-            crate::fence::set(fence as This, value);
+    let job = Job::Signal(crate::fence::FenceRef::new(fence), value);
+    LANE.push_behind(this as usize, false, job, || {
+        if let Err(fence) = crate::host::late_signal(crate::fence::FenceRef::new(fence), value) {
+            crate::fence::set(fence.as_this(), value);
         }
     });
 }

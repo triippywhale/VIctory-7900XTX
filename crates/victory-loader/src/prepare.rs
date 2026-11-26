@@ -98,7 +98,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -131,27 +134,49 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let start = start as usize;
+    let section_end = info
+        .sections
+        .iter()
+        .find_map(|s| {
+            let s_start = s.file_offset as usize;
+            let s_end = s_start.saturating_add(s.file_size as usize);
+            (start >= s_start && start < s_end).then_some(s_end)
+        })
+        .unwrap_or(bytes.len());
+    let mut at = start;
+    let end = start
+        .saturating_add(size as usize)
+        .min(section_end)
+        .min(bytes.len());
+    while at.saturating_add(8) <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(block_end) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || block_end > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
+        // Only iterate complete 2-byte relocation entries so an odd
+        // `SizeOfBlock` never straddles into the next block's header.
+        let entries_end = at + (block & !1);
+        for entry in (at + 8..entries_end).step_by(2) {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
-        at += block;
+        at = block_end;
     }
     out
 }
@@ -279,5 +304,65 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    #[test]
+    fn dir64_relocations_handles_overflowing_page_odd_block_and_oversized_dir() {
+        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
+        let d = layout::data_directory_offset(&original, dir::BASERELOC).unwrap();
+        let rva = layout::read_u32(&original, d).unwrap();
+        let start = info.rva_to_file_offset(rva).unwrap() as usize;
+
+        // Build three consecutive relocation blocks inside `.reloc`:
+        // 1) Block 1 (10 bytes): `page = 0xFFFF_F800`, DIR64 offset 0x900 (overflows u32).
+        // 2) Block 2 (odd SizeOfBlock = 9): trailing stray byte `0x00` right before Block 3.
+        //    Block 3 starts with `VirtualAddress` whose low byte is `0xA0`, so reading
+        //    `[0x00, 0xA0]` across the boundary would look like DIR64 (10 << 12) + 0!
+        // 3) Block 3 (10 bytes): valid DIR64 at `0x0000_20A0 + 0x10 = 0x0000_20B0`.
+        let tls_field = info
+            .tls
+            .as_ref()
+            .map(|t| t.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .unwrap_or(0x0000_1000);
+        let mut table = Vec::new();
+        // Block 1: overflowing page + offset.
+        table.extend_from_slice(&0xFFFF_F800u32.to_le_bytes());
+        table.extend_from_slice(&10u32.to_le_bytes());
+        table.extend_from_slice(&((10u16 << 12) | 0x900).to_le_bytes());
+        // Block 2: odd SizeOfBlock = 9, crafted so straddling byte 0 of Block 3
+        // would produce `DIR64` targeting `tls_field`.
+        let stray_lo = (tls_field & 0xFF) as u8;
+        let stray_hi = (0xA0u8) | (((tls_field >> 8) & 0x0F) as u8);
+        let block2_page = tls_field & !0xFFF;
+        table.extend_from_slice(&block2_page.to_le_bytes());
+        table.extend_from_slice(&9u32.to_le_bytes());
+        table.push(stray_lo);
+        // Block 3: valid block whose VirtualAddress low byte is `stray_hi`.
+        let block3_off = table.len();
+        let block3_page = 0x0000_2000u32 | u32::from(stray_hi);
+        table.extend_from_slice(&block3_page.to_le_bytes());
+        table.extend_from_slice(&10u32.to_le_bytes());
+        table.extend_from_slice(&((10u16 << 12) | 0x010).to_le_bytes());
+
+        original[start..start + table.len()].copy_from_slice(&table);
+        // Oversized directory size beyond the table and section must clamp safely.
+        write_u32(&mut original, d + 4, table.len() as u32).unwrap();
+
+        let relocs = dir64_relocations(&original, &info);
+        assert_eq!(relocs, vec![(start + block3_off + 8, block3_page + 0x010)]);
+
+        // Running `prepare` must not panic on the overflowing entry and must not
+        // corrupt Block 3's `VirtualAddress` header byte.
+        let prepared = prepare(&original).unwrap();
+        assert_eq!(
+            layout::read_u32(&prepared.bytes, start + block3_off),
+            Some(block3_page),
+            "odd relocation block must not corrupt the next block's header"
+        );
+
+        // Also confirm an oversized `BASERELOC` directory size (`u32::MAX`) clamps cleanly.
+        write_u32(&mut original, d + 4, u32::MAX).unwrap();
+        let _ = dir64_relocations(&original, &info);
     }
 }
