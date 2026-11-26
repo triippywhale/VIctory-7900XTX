@@ -4405,7 +4405,6 @@ impl<'a> Lower<'a> {
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
-        eprintln!("GUARD b {b} i {i} -> {:?}", self.x.st.guards[b][i]);
         match self.x.st.guards[b][i] {
             None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
