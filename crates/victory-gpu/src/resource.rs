@@ -3518,7 +3518,7 @@ pub(crate) fn placed_textures_like(desc: &[u32; 14]) -> (usize, Vec<u64>) {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let mut keys = 0;
     let mut addresses: Vec<u64> = Vec::new();
-    for ((address, other), _) in map.iter() {
+    for (address, other) in map.keys() {
         let mut blank = *other;
         blank[1] = 0;
         blank[13] = 0;
