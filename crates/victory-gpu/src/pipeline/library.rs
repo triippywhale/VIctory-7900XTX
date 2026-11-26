@@ -72,6 +72,11 @@ pub(super) fn folder() -> Option<PathBuf> {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+/// Creations the host compiler refused with `E_OUTOFMEMORY` and that were
+/// tried again (see [`retry_out_of_memory`]), and of those the ones a later
+/// attempt made.
+pub(crate) static OOM_RETRIED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static OOM_RECOVERED: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -512,17 +517,179 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// How often a creation refused with `E_OUTOFMEMORY` is tried again: once
+/// at once, then this many times one at a time (see [`retry_out_of_memory`]).
+const OOM_SERIAL_ATTEMPTS: u32 = 2;
+
+/// The outcome of `create`, tried again while it fails with `E_OUTOFMEMORY`.
+///
+/// A driver's shader compiler sometimes faults inside itself on a compile
+/// its cache does not hold (NVIDIA's reports a null read it catches as
+/// `E_OUTOFMEMORY`), on any pipeline worker, and the same pipeline then
+/// builds on a later attempt. So a creation refused that way is tried once
+/// more at once, then up to [`OOM_SERIAL_ATTEMPTS`] times holding `serial`,
+/// so that no other retried compile runs beside it. Any other error, and
+/// the last attempt's, is returned as it is.
+fn retry_out_of_memory<T>(
+    serial: &Mutex<()>,
+    mut create: impl FnMut() -> windows::core::Result<T>,
+) -> windows::core::Result<T> {
+    let out_of_memory =
+        |r: &windows::core::Result<T>| matches!(r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
+    let mut made = create();
+    if !out_of_memory(&made) {
+        return made;
+    }
+    OOM_RETRIED.fetch_add(1, Ordering::Relaxed);
+    let mut attempts = 1;
+    made = create();
+    while out_of_memory(&made) && attempts <= OOM_SERIAL_ATTEMPTS {
+        let _one = serial.lock().unwrap_or_else(|e| e.into_inner());
+        made = create();
+        attempts += 1;
+    }
+    match &made {
+        Ok(_) => {
+            OOM_RECOVERED.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(attempts = attempts + 1, "host pipeline made after the compiler ran out of memory");
+        }
+        Err(e) => tracing::warn!(error = %e, attempts = attempts + 1, "host pipeline still refused when tried again"),
+    }
+    made
+}
+
+/// Pipelines an AMD driver's compiler crashed on, one name a line, in the
+/// cache folder ([`compiler_crashed`]).
+const CRASHED_FILE: &str = "crashed-pipelines.txt";
+
+/// Whether the driver's compiler crashes are survived: on AMD adapters
+/// only (their compiler faults on a few of the world's compute shaders;
+/// belobug/victory-belobug-amd 0d2f6a62), NVIDIA and Intel unchanged.
+/// `VICTORY_COMPILER_CRASH_GUARD=0` turns it off there too.
+fn crash_guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        const AMD: u32 = 0x1002;
+        std::env::var_os("VICTORY_COMPILER_CRASH_GUARD").is_none_or(|v| v != "0")
+            && crate::host::host().and_then(|h| h.vendor_id()) == Some(AMD)
+    })
+}
+
+/// Whether the driver's compiler crashed making the pipeline `name` in an
+/// earlier run (or this one): it is left out.
+fn crashed_before(name: &str) -> bool {
+    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+    crash_guard()
+        && NAMES
+            .get_or_init(|| {
+                DIR.get()
+                    .and_then(|d| std::fs::read_to_string(d.join(CRASHED_FILE)).ok())
+                    .map(|t| t.lines().map(str::to_owned).collect())
+                    .unwrap_or_default()
+            })
+            .contains(name)
+}
+
+thread_local! {
+    /// The pipeline the driver is making on this thread, if guarded.
+    static MAKING: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The driver makes pipeline `name` on this thread while this lives.
+struct Making;
+
+impl Making {
+    fn new(name: &str) -> Option<Making> {
+        use windows_sys::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+        if !crash_guard() {
+            return None;
+        }
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a handler that lives as long as the process.
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, Some(compiler_crashed));
+        });
+        MAKING.with(|m| name.clone_into(&mut m.borrow_mut()));
+        Some(Making)
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.with(|m| m.borrow_mut().clear());
+    }
+}
+
+/// An access violation near address 0 on a thread making a pipeline
+/// ([`Making`]) is the driver's compiler crashing (AMD's does on a few
+/// compute shaders): the pipeline is noted in [`CRASHED_FILE`] and left out
+/// from then on, and the thread parked for good, so that the other workers
+/// and the title go on instead of the process ending. Any other fault is
+/// not ours (the write guards' are at title addresses). Port of
+/// belobug/victory-belobug-amd 0d2f6a62
+/// (<https://github.com/belobug/victory-belobug-amd>).
+unsafe extern "system" fn compiler_crashed(
+    info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    const ACCESS_VIOLATION: i32 = 0xc000_0005_u32 as i32;
+    const CONTINUE_SEARCH: i32 = 0;
+    // SAFETY: the system passes a live record.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let name = MAKING
+        .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+        .unwrap_or_default();
+    if record.ExceptionCode != ACCESS_VIOLATION || name.is_empty() || record.ExceptionInformation[1] >= 0x10000 {
+        return CONTINUE_SEARCH;
+    }
+    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out, its worker parked");
+    if let Some(dir) = DIR.get() {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+        if let Ok(mut f) = file {
+            let _ = writeln!(f, "{name}");
+        }
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// [`create_retrying`] for the pipeline `name`, guarded against the
+/// driver's compiler crashing ([`compiler_crashed`]); a pipeline it crashed
+/// on before is refused (E_FAIL) without a compile.
+fn create_guarded(
+    name: &str,
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    if crashed_before(name) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(name, "a pipeline the driver's compiler crashed on is left out"));
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+    }
+    let _making = Making::new(name);
+    create_retrying(create)
+}
+
+/// `create` through [`retry_out_of_memory`], one retried compile at a time
+/// across all pipeline workers.
+fn create_retrying(
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    retry_out_of_memory(&SERIAL, create)
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnMut() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create_guarded(name, create);
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -548,7 +715,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        create_guarded(name, create)?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -559,14 +726,97 @@ pub(crate) fn pipeline(
         )
     });
     let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
+    // A save holds the library alone while it serialises it (seconds to
+    // minutes for a library of gigabytes): the store waits for after it
+    // instead of the worker ([`DEFERRED`]).
+    let _stores = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            defer_store(wide, &pso);
+            return Ok(pso);
+        }
+    };
+    {
+        let _call = call("store", name);
+        store(library, &wide, &pso);
+    }
+    store_deferred(library);
+    Ok(pso)
+}
+
+/// Stores `pso` under `name`, with the library's store lock held (shared);
+/// whether the library took it.
+fn store(library: &Library, name: &HSTRING, pso: &ID3D12PipelineState) -> bool {
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    let stored = unsafe { library.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok();
+    if stored {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
-    Ok(pso)
+    stored
+}
+
+/// A pipeline made while a save held the library, to be stored after it.
+struct Deferred(HSTRING, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Deferred {}
+
+/// At most this many stores wait for a save; past it a pipeline is not
+/// stored (the next run compiles it again), so that a save that never ends
+/// does not hold host pipelines without bound.
+const DEFERRED_MAX: usize = 4096;
+
+/// Stores that found a save holding the library (PalmVIDev #255). A save
+/// of a 7 GB library took over three minutes on a world run (RTX 4090,
+/// little physical memory free), and every pipeline worker waited for it
+/// in its store with its pipeline already made: 16 of 16 workers "busy"
+/// at 0.2 processors, and the frame's queued pipelines made a few a
+/// minute. Now the worker hands its pipeline on at once and the store
+/// waits here.
+static DEFERRED: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
+
+/// Stores deferred while a save held the library, since the start.
+static DEFERRED_STORES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a list of `len` deferred stores has room for one more.
+fn defer_room(len: usize) -> bool {
+    len < DEFERRED_MAX
+}
+
+/// Keeps `pso` for a store after the save in progress.
+fn defer_store(name: HSTRING, pso: &ID3D12PipelineState) {
+    let mut deferred = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+    if defer_room(deferred.len()) {
+        deferred.push(Deferred(name, pso.clone()));
+        DEFERRED_STORES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Stores the deferred pipelines; the caller holds the store lock (shared).
+fn store_deferred(library: &Library) {
+    let waiting = std::mem::take(&mut *DEFERRED.lock().unwrap_or_else(|e| e.into_inner()));
+    if waiting.is_empty() {
+        return;
+    }
+    let _call = call("store", "pipelines made during a save");
+    for Deferred(name, pso) in &waiting {
+        store(library, name, pso);
+    }
+}
+
+/// After a save: stores what waited for it, unless another save holds the
+/// library already (that one stores them after itself).
+fn store_deferred_after_save(library: &Library) {
+    let _all = one_call();
+    let held = match library.saving.try_read() {
+        Ok(held) => held,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    store_deferred(library);
+    drop(held);
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -615,6 +865,7 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
+    store_deferred_after_save(library);
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
@@ -644,6 +895,9 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            retried_out_of_memory = OOM_RETRIED.load(Ordering::Relaxed),
+            recovered_out_of_memory = OOM_RECOVERED.load(Ordering::Relaxed),
+            deferred_stores = DEFERRED_STORES.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
@@ -783,6 +1037,65 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store never waits for a save: while one holds the library alone,
+    /// the store lock cannot be had shared without waiting, which is what
+    /// sends a store to the deferred list (bounded).
+    #[test]
+    fn a_store_during_a_save_does_not_wait() {
+        let saving = RwLock::new(());
+        let alone = saving.write().unwrap();
+        assert!(matches!(saving.try_read(), Err(std::sync::TryLockError::WouldBlock)));
+        drop(alone);
+        assert!(saving.try_read().is_ok());
+        assert!(defer_room(0));
+        assert!(defer_room(DEFERRED_MAX - 1));
+        assert!(!defer_room(DEFERRED_MAX));
+    }
+
+    fn out_of_memory() -> windows::core::Error {
+        windows::Win32::Foundation::E_OUTOFMEMORY.into()
+    }
+
+    /// A creation refused with `E_OUTOFMEMORY` is tried again until one
+    /// attempt makes it; a first success is not repeated.
+    #[test]
+    fn out_of_memory_is_tried_again() {
+        let serial = Mutex::new(());
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || {
+            calls += 1;
+            if calls < 3 { Err(out_of_memory()) } else { Ok(calls) }
+        });
+        assert_eq!(made.unwrap(), 3);
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || {
+            calls += 1;
+            Ok::<_, windows::core::Error>(calls)
+        });
+        assert_eq!(made.unwrap(), 1);
+    }
+
+    /// Retries stop after the immediate one and the serial ones; other
+    /// errors are not retried at all.
+    #[test]
+    fn retries_are_bounded_and_only_for_out_of_memory() {
+        let serial = Mutex::new(());
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || -> windows::core::Result<()> {
+            calls += 1;
+            Err(out_of_memory())
+        });
+        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_OUTOFMEMORY);
+        assert_eq!(calls, 2 + OOM_SERIAL_ATTEMPTS);
+        let mut calls = 0;
+        let made = retry_out_of_memory(&serial, || -> windows::core::Result<()> {
+            calls += 1;
+            Err(windows::Win32::Foundation::E_INVALIDARG.into())
+        });
+        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

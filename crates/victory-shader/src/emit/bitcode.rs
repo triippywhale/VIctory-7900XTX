@@ -377,10 +377,11 @@ impl Module {
     }
 
     /// Notes what instruction `v` is for (see [`Tag`]); only when modules
-    /// are counted.
+    /// are counted, except clamps, which the clean-up keeps one per use
+    /// (`opt`, [`opt::REUSE`]).
     pub fn tag(&mut self, v: V, tag: Tag) {
         if let V::Inst(i) = v
-            && census::enabled()
+            && (tag == Tag::Clamp || census::enabled())
         {
             self.tags.insert(i, tag);
         }

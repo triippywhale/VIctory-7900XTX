@@ -479,6 +479,28 @@ impl Shader {
         props: (u32, u32),
         bounded: bool,
     ) -> V {
+        self.heap_handle_inner(block, index, sampler, nonuniform, props, bounded, nonuniform)
+    }
+
+    /// A buffer `getDimensions` handle emitted with `nonUniformIndex = true`
+    /// to avoid an AMD DXIL compiler crash (`amdxc64.dll+0x861b9f`), without
+    /// counting toward `nonuniform_handles` when the index itself is uniform
+    /// (from MalfoyDraco99 f80fd266).
+    pub fn heap_handle_for_buffer_dim(&mut self, block: usize, index: V, props: (u32, u32), bounded: bool) -> V {
+        self.heap_handle_inner(block, index, false, true, props, bounded, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn heap_handle_inner(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+        count_nonuniform: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
         let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
@@ -508,7 +530,7 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
+        self.nonuniform_handles += u32::from(count_nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
