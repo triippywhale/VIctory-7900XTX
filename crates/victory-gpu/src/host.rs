@@ -8796,6 +8796,16 @@ impl Meter {
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
                 );
+                {
+                    let [made, elsewhere] = [0, 1].map(|i| crate::descriptor::host::UNMADE_SHADER_TEXTURES[i].load(Ordering::Relaxed));
+                    let [read, same, other] =
+                        [0, 1, 2].map(|i| crate::descriptor::host::UNPLACED_SLOTS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "placed texture views at address 0: {made} made (neutral or null), {read} reads of such slots by draws \
+                         and passes, {same} slots written later with the same texture at an address ({other} with \
+                         another); {elsewhere} views elsewhere the host could not make"
+                    );
+                }
                 crate::tiles::status();
                 {
                     let [queued, due, away, partly, oldest] =
