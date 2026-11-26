@@ -198,6 +198,9 @@ pub(crate) struct HostHeap {
     textures: Mutex<TextureQueue>,
     /// Its slots ([`Queued`]).
     queued: std::sync::Arc<Queued>,
+    /// Per title slot, how often what the queue is to hold for it changed
+    /// ([`HostHeap::queue_batch`]).
+    turns: Vec<std::sync::atomic::AtomicU32>,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -392,6 +395,35 @@ fn note_before(index: u32, was: u64, by: &'static str) {
     if crate::book::on() {
         let entry = (was, crate::host::now_ms(), crate::host::submissions(), by);
         BEFORE[index as usize % 64].lock().unwrap_or_else(|e| e.into_inner()).insert(index, entry);
+    }
+}
+
+/// A change of the queue of textures kept for a batch's end: the title
+/// slot, its change's number, and the write (frame, due, seen; none: out of
+/// the queue).
+type QueueOp = (u32, u32, Option<(u64, u64, bool)>);
+
+thread_local! {
+    /// This thread's open batch ([`HostHeap::queue_batch`]): the heap it is
+    /// of, and what it holds.
+    static QUEUE_BATCH: std::cell::RefCell<Option<(usize, Vec<QueueOp>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether [`HostHeap::queue_batch`] keeps anything (`VICTORY_QUEUE_BATCH=0`:
+/// no).
+fn queue_batches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// An open [`HostHeap::queue_batch`]; done when dropped.
+pub(crate) struct QueueBatch<'a>(Option<&'a HostHeap>);
+
+impl Drop for QueueBatch<'_> {
+    fn drop(&mut self) {
+        if let Some(heap) = self.0 {
+            heap.queue_batch_end();
+        }
     }
 }
 
@@ -1700,6 +1732,9 @@ impl HostHeap {
             changed: Slots::new(count as usize),
             textures: Mutex::new(TextureQueue { queued: queued.clone(), ..Default::default() }),
             queued,
+            turns: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -2514,7 +2549,8 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() && self.queued.may(index) {
+            // (A change a batch still holds for the slot is older.)
+            if tabled_out() && (self.queue_turn(index), self.queued.may(index)).1 {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.take_out(index) {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
@@ -2552,20 +2588,104 @@ impl HostHeap {
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
         // (A slot is written by one thread at a time.)
+        // Whatever a batch still holds for the slot is older than this.
+        let turn = self.queue_turn(index);
         if !(texture && !read_now) && !self.queued.may(index) {
             return;
         }
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        if texture && !read_now {
+        let write = (texture && !read_now).then(|| {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
             } else {
                 0
             };
-            textures.written(index, frame, due, seen);
-        } else {
-            textures.remove(index);
+            (frame, due, seen)
+        });
+        if self.queue_later(index, turn, write) {
+            return;
+        }
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        match write {
+            Some((frame, due, seen)) => textures.written(index, frame, due, seen),
+            None => textures.remove(index),
+        }
+    }
+
+    /// Counts a change of what the queue is to hold for title slot `index`
+    /// and returns its number ([`HostHeap::queue_batch`]).
+    fn queue_turn(&self, index: u32) -> u32 {
+        self.turns
+            .get(index as usize)
+            .map_or(0, |t| t.fetch_add(1, std::sync::atomic::Ordering::AcqRel).wrapping_add(1))
+    }
+
+    /// With a batch open on this thread for this heap
+    /// ([`HostHeap::queue_batch`]): the queue's change for slot `index`
+    /// (`write`: frame, due, seen; none: out of the queue), numbered `turn`,
+    /// is kept for the batch's end. Whether it was.
+    fn queue_later(&self, index: u32, turn: u32, write: Option<(u64, u64, bool)>) -> bool {
+        if (index as usize) >= self.turns.len() {
+            return false;
+        }
+        QUEUE_BATCH.with_borrow_mut(|batch| match batch {
+            Some((heap, ops)) if *heap == std::ptr::from_ref(self) as usize => {
+                ops.push((index, turn, write));
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// From here until the value returned is dropped, on this thread: what
+    /// writes of slots change in the queue of textures
+    /// ([`HostHeap::queue_texture`], the slots a write makes stale) is kept
+    /// and done together at the end, behind the queue's lock once
+    /// (`VICTORY_QUEUE_BATCH=0`: each at once, as before).
+    ///
+    /// The threads that mirror the heaps' records took that lock once per
+    /// record, six of them at a time: they waited for it 18 ms a frame
+    /// together, a third of the time the mirroring took them, and the
+    /// submitting thread waits for the mirroring (timeline of 2026-11-26,
+    /// the world: 17 waits a frame of 1.8 ms each).
+    ///
+    /// A slot's changes are numbered ([`HostHeap::queue_turn`], counted
+    /// while the slot's lock is held): a change kept here is dropped at the
+    /// end if the slot was changed again meanwhile, by any thread, so the
+    /// queue ends with what the last change says, as without batches. Until
+    /// the end the queue holds what it held: a pass that runs meanwhile
+    /// finds the slot a frame later.
+    pub(crate) fn queue_batch(&self) -> QueueBatch<'_> {
+        let own = queue_batches()
+            && !self.turns.is_empty()
+            && QUEUE_BATCH.with_borrow_mut(|batch| {
+                let free = batch.is_none();
+                if free {
+                    *batch = Some((std::ptr::from_ref(self) as usize, Vec::new()));
+                }
+                free
+            });
+        QueueBatch(own.then_some(self))
+    }
+
+    /// The end of [`HostHeap::queue_batch`].
+    fn queue_batch_end(&self) {
+        let Some((_, ops)) = QUEUE_BATCH.with_borrow_mut(Option::take) else {
+            return;
+        };
+        if ops.is_empty() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Acquire;
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for (index, turn, write) in ops {
+            if self.turns.get(index as usize).is_none_or(|t| t.load(Acquire) != turn) {
+                continue;
+            }
+            match write {
+                Some((frame, due, seen)) => textures.written(index, frame, due, seen),
+                None => textures.remove(index),
+            }
         }
     }
 
@@ -2676,9 +2796,18 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            let mut now = Vec::new();
             for &(slot, _) in &stale {
-                textures.remove(slot);
+                let turn = self.queue_turn(slot);
+                if !self.queue_later(slot, turn, None) {
+                    now.push(slot);
+                }
+            }
+            if !now.is_empty() {
+                let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+                for slot in now {
+                    textures.remove(slot);
+                }
             }
         }
         let stride = view.and_then(view_stride);
@@ -5758,6 +5887,48 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A batch does the queue's changes at its end, and drops those of a
+    /// slot changed again meanwhile.
+    #[test]
+    fn a_batch_ends_with_what_the_last_change_says() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let frame = 100;
+        let slots = |at: u64| -> Vec<u32> {
+            let mut slots: Vec<u32> = heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect();
+            slots.sort_unstable();
+            slots
+        };
+        heap.queue_texture(1, true, false, frame);
+        {
+            let _batch = heap.queue_batch();
+            heap.queue_texture(2, true, false, frame);
+            heap.queue_texture(3, true, false, frame);
+            // Out again inside the batch: the write before it counts no more.
+            heap.queue_texture(3, false, false, frame);
+            // Out of the queue it is still in.
+            heap.queue_texture(1, false, false, frame);
+            // Until the end the queue holds what it held.
+            assert_eq!(slots(frame), [1]);
+            // Another thread writes slot 4 after this batch took it out, and
+            // takes slot 5 out after this batch wrote it.
+            heap.queue_texture(4, false, false, frame);
+            heap.queue_texture(5, true, false, frame);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    heap.queue_texture(4, true, false, frame);
+                    heap.queue_texture(5, false, false, frame);
+                });
+            });
+            assert_eq!(slots(frame), [1, 4]);
+        }
+        assert_eq!(slots(frame), [2, 4]);
+        // With none open, at once.
+        heap.queue_texture(2, false, false, frame);
+        assert_eq!(slots(frame), [4]);
     }
 
     #[test]

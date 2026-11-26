@@ -498,6 +498,7 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let phase = crate::timeline::span("the heaps' records: made");
         crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+            let _queue = host.queue_batch();
             for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
