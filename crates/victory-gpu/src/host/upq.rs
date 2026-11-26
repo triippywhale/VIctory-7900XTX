@@ -47,6 +47,24 @@ const MOST: u64 = 512 << 20;
 /// Our buffers are made in sizes of powers of two from this on.
 const LEAST: u64 = 4 << 20;
 
+/// The most card memory all slots' buffers together may take
+/// (`VICTORY_UP_QUEUE_MB`, 128 if not given); a submission that would need
+/// more sends as before.
+///
+/// Each slot kept a buffer as big as the most it ever sent, and there is a
+/// slot for every submission in the air: with ray tracing on (RX 7900 XT,
+/// runs card-ab and card-ab2) the card's memory went from under its budget
+/// to 18-19.8 GB of 17.4 within minutes, and every frame then took 400 ms.
+/// 512 MB of them (run barrier-ab) still took the card to 17.2 GB, at the edge
+/// of its budget, where frames take 220 ms; a frame sends 40-50 MB this way.
+fn most_bytes() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_UP_QUEUE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128u64)) << 20
+}
+
+/// The bytes of all slots' buffers.
+static BOUNCE_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// One submission's: a copy list and our buffer in the card's memory.
 pub(super) struct Slot {
     allocator: ID3D12CommandAllocator,
@@ -149,18 +167,29 @@ pub(super) unsafe fn send(
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
-    let Some(mut slot) = q.free.pop().or_else(|| make_slot(&host.device)) else {
+    // A free slot whose buffer holds it all, else any free slot, else a new one.
+    let fits = q.free.iter().position(|s| s.bounce.as_ref().is_some_and(|b| b.1 >= total));
+    let Some(mut slot) = fits.map(|i| q.free.swap_remove(i)).or_else(|| q.free.pop()).or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
     if slot.bounce.as_ref().is_none_or(|b| b.1 < total) {
         let size = total.next_power_of_two().max(LEAST);
+        let old = slot.bounce.as_ref().map_or(0, |b| b.1);
+        // Within the card memory all of them may take: else as before.
+        if BOUNCE_BYTES.load(Relaxed) - old + size > most_bytes() {
+            q.free.push(slot);
+            STATS[3].fetch_add(1, Relaxed);
+            return None;
+        }
         slot.bounce = None;
+        BOUNCE_BYTES.fetch_sub(old, Relaxed);
         let Some(made) = host.uav_buffer(size) else {
             q.free.push(slot);
             STATS[3].fetch_add(1, Relaxed);
             return None;
         };
+        BOUNCE_BYTES.fetch_add(size, Relaxed);
         super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
     }
@@ -223,8 +252,11 @@ pub(super) fn line(frames: f64) {
     if subs + before > 0.0 {
         tracing::info!(
             "copies in the card's memory brought up on a copy queue per frame (VICTORY_UP_QUEUE): {subs:.1} submissions, \
-             {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with)",
-            bytes / 1048576.0
+             {copies:.0} ranges, {:.1} MB; {before:.1} submissions sent up on the drawing queue (too big, or nothing to send with); \
+             our buffers in the card's memory {} MB of at most {} (VICTORY_UP_QUEUE_MB)",
+            bytes / 1048576.0,
+            BOUNCE_BYTES.load(Relaxed) >> 20,
+            most_bytes() >> 20
         );
     }
 }
