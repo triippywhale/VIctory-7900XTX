@@ -139,15 +139,16 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
-pub(crate) fn available_physical_ram() -> Option<u64> {
+/// Available physical RAM and commit headroom in bytes, from
+/// `GlobalMemoryStatusEx`.
+pub(crate) fn available_system_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some((m.ullAvailPhys, m.ullAvailPageFile))
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -162,6 +163,26 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_at(budget, used, vram_early())
+}
+
+/// Whether host copies of textures the title fills are let go earlier
+/// (`VICTORY_VRAM_EARLY=1`; off by default): from 82 % of the card's budget
+/// down to 78 %, and from 90 % the shortly idle ones down to 80 %, where
+/// [`vram_keep`] otherwise starts at 88 and 95 %; and a slot keeps the
+/// texture it showed (`keep_shown` of the host heap) only while the card
+/// has room. After Belobug 81ebb7b (its RX 9070 XT branch, a 16 GB card).
+/// On a 7900 XT the title fills the budget: 94 to 97 % of 17 to 19.6 GB was
+/// in use in the warm run of 2026-11-26, with 70,600 waits for new card
+/// memory. Off by default: the earlier marks let go of more that is made
+/// again (see [`vram_keep`]), so it is to be measured first.
+pub(crate) fn vram_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// [`vram_keep`] with its marks said: `early` as [`vram_early`].
+fn vram_keep_at(budget: u64, used: u64, early: bool) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -169,12 +190,15 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    // From where the idle ones go, from where the shortly idle ones go, and
+    // what each comes down to.
+    let (from, past, to, short_to) = if early { (82, 90, 78, 80) } else { (88, 95, 85, 85) };
+    if used < share(from) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(past) {
+        (IDLE_MS, used - share(to))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(short_to))
     }
 }
 
@@ -406,6 +430,36 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     } else {
         NORMAL_MS
     }
+}
+
+/// Idle timeout for system-RAM caches when commit headroom is low.
+/// `ullAvailPageFile` is the remaining system commit capacity; physical RAM
+/// can still be available after the commit limit has nearly been reached.
+pub(crate) fn commit_idle_ms(avail_commit: Option<u64>) -> u64 {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    let Some(avail) = avail_commit else {
+        return 10_000;
+    };
+    if avail < 512 * MIB {
+        250
+    } else if avail < GIB {
+        500
+    } else if avail < 2 * GIB {
+        1_000
+    } else if avail < 4 * GIB {
+        2_500
+    } else {
+        10_000
+    }
+}
+
+/// Effective idle timeout for caches backed by system memory.
+pub(crate) fn system_ram_idle_ms(available: Option<(u64, u64)>) -> u64 {
+    let Some((avail_phys, avail_commit)) = available else {
+        return ram_idle_ms(None).min(commit_idle_ms(None));
+    };
+    ram_idle_ms(Some(avail_phys)).min(commit_idle_ms(Some(avail_commit)))
 }
 
 /// How many references are held on a host object (its COM count): ours
@@ -3663,6 +3717,7 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -7307,6 +7362,7 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7322,6 +7378,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::port::filled(src, len);
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;
@@ -8727,103 +8784,110 @@ impl Meter {
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
-        // Of a frame, ms preparing submissions and ms waiting for the GPU.
-        let [cpu, gpu] = [0, 1].map(|i| {
-            SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
-        });
-        let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
-            let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
-            PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
-        });
-        let [back_ms, back_mb] = [0, 1].map(|i| {
-            COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
-        });
-        let dropped = crate::draw::take_dropped() as f64 / frames;
-        let indirect = crate::list::take_indirect() as f64 / frames;
-        let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
-        let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
-        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
-        tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
-        );
-        crate::shadow::exact_line(frames);
-        crate::descriptor::sync_line(frames);
-        late_line(frames);
-        crate::queue::behind_line(frames);
-        card_clock_line(frames, ms);
-        upq::line(frames);
-        rec::line(frames);
-        #[cfg(feature = "diagnostics")]
-        spans::line(frames);
-        crate::shadow::back_line(frames);
-        #[cfg(feature = "diagnostics")]
-        split_line(frames);
-        {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
-                tracing::info!(
-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
-                );
-            }
-        }
-        {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
-                tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
-                );
-            }
-            let [through, left, filled, short] =
-                [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left + filled > 0.0 {
-                tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT, on by default): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
-                     {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
-                     with less than was mapped (looked at again)"
-                );
-            }
-        }
-        {
-            let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if copies > 0.0 {
-                tracing::info!(
-                    "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
-                     (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
-                    if join_copies() { "on" } else { "off" }
-                );
-            }
-        }
-        // Passes over the heap's buffer views for shaders that pick them by index.
-        let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
-        let picked_ms =
-            crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
-        // Copies between depth textures and their colour twins, each way.
-        let [twin_to_depth, twin_to_colour] =
-            [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
-        // Depth planes drawn from their twins.
-        let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
-        // Copies in the card's memory (`crate::shadow::cards`).
-        let card = crate::shadow::card_stats();
-        #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
-        // The lines of every 5 s (sorting, system calls and some forty lines
-        // written: a hitch of about 30 ms on the presenting thread, the lane,
-        // once every 5 s) are made by a thread of ours ([`meter_lines`]).
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // The lines (every second, and more every 5 s: sorting, system
+        // calls, some forty lines written) are made by a thread of ours
+        // ([`meter_lines`]), not by the presenting thread, the lane: about
+        // 3 ms each second there (run ask-1), and 30 ms each 5 s (lane2-0).
+        // Their counters are taken there, a moment after the frames counted.
+        let five = self.logged.elapsed() >= std::time::Duration::from_secs(5);
+        if five {
             self.logged = std::time::Instant::now();
+        }
+        #[cfg(feature = "diagnostics")]
+        let copy_stats_frames = if five { std::mem::take(&mut self.copy_stats_frames) as f64 } else { 0.0 };
+        meter_lines(move || {
+            // Of a frame, ms preparing submissions and ms waiting for the GPU.
+            let [cpu, gpu] = [0, 1].map(|i| {
+                SUBMISSION_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+            });
+            let [copy_ms, copy_mb, texture_ms, texture_mb] = [0, 1, 2, 3].map(|i| {
+                let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
+                PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+            });
+            let [back_ms, back_mb] = [0, 1].map(|i| {
+                COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
+            });
+            let dropped = crate::draw::take_dropped() as f64 / frames;
+            let indirect = crate::list::take_indirect() as f64 / frames;
+            let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+            let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+            let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+            let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
+            tracing::info!(
+                "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
+            );
+            crate::shadow::exact_line(frames);
+            crate::descriptor::sync_line(frames);
+            late_line(frames);
+            crate::queue::behind_line(frames);
+            card_clock_line(frames, ms);
+            upq::line(frames);
+            rec::line(frames);
             #[cfg(feature = "diagnostics")]
-            let copy_stats_frames = std::mem::take(&mut self.copy_stats_frames) as f64;
-            meter_lines(move || {
+            spans::line(frames);
+            crate::shadow::back_line(frames);
+            #[cfg(feature = "diagnostics")]
+            split_line(frames);
+            {
+                let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if passes + compares > 0.0 {
+                    tracing::info!(
+                        "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
+                         ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                        if rehash_runs() { "on" } else { "off" }
+                    );
+                }
+            }
+            {
+                let [own, asking, still, all] =
+                    [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+                if all >= 1.0 {
+                    tracing::info!(
+                        "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                         is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                         hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                    );
+                }
+                let [through, left, filled, short] =
+                    [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if through + left + filled > 0.0 {
+                    tracing::info!(
+                        "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT, on by default): \
+                         {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                         {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
+                         with less than was mapped (looked at again)"
+                    );
+                }
+            }
+            {
+                let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if copies > 0.0 {
+                    tracing::info!(
+                        "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
+                         (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
+                        if join_copies() { "on" } else { "off" }
+                    );
+                }
+            }
+            // Passes over the heap's buffer views for shaders that pick them by index.
+            let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
+            let picked_ms =
+                crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+            // Copies between depth textures and their colour twins, each way.
+            let [twin_to_depth, twin_to_colour] =
+                [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            // Depth planes drawn from their twins.
+            let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+            // Copies in the card's memory (`crate::shadow::cards`).
+            let card = crate::shadow::card_stats();
+            #[cfg(feature = "diagnostics")]
+            let slow = crate::watch::slow_asks();
+            // Over the same frames as the counts above.
+            #[cfg(feature = "diagnostics")]
+            let drops = crate::pipeline::take_drops();
+            if !five {
+                return;
+            }
                 tracing::info!(
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -8973,8 +9037,7 @@ impl Meter {
                         );
                     }
                 }
-            });
-        }
+        });
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
@@ -10576,14 +10639,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::vram_keep_at;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
+        assert_eq!(vram_keep_at(100 * gib, 87 * gib, false).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
+        let (ms, bytes) = vram_keep_at(100 * gib, 90 * gib, false);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep_at(100 * gib, 120 * gib, false), (1_500, 35 * gib));
+        assert_eq!(vram_keep_at(0, 7, false).0, 5_000);
+        // `VICTORY_VRAM_EARLY=1` (after Belobug 81ebb7b): from 82 and 90 %.
+        assert_eq!(vram_keep_at(100 * gib, 81 * gib, true).0, 600_000);
+        assert_eq!(vram_keep_at(100 * gib, 85 * gib, true), (5_000, 7 * gib));
+        assert_eq!(vram_keep_at(100 * gib, 95 * gib, true), (1_500, 15 * gib));
+        assert_eq!(vram_keep_at(100 * gib, 120 * gib, true), (1_500, 40 * gib));
     }
 
     #[test]
@@ -10604,6 +10672,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn commit_idle_ms_scales_with_commit_headroom() {
+        use super::commit_idle_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        assert_eq!(commit_idle_ms(Some(4 * gib)), 10_000);
+        assert_eq!(commit_idle_ms(Some(2 * gib)), 2_500);
+        assert_eq!(commit_idle_ms(Some(gib)), 1_000);
+        assert_eq!(commit_idle_ms(Some(903 * mib)), 500);
+        assert_eq!(commit_idle_ms(Some(267 * mib)), 250);
+        assert_eq!(commit_idle_ms(Some(0)), 250);
+        assert_eq!(commit_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn system_ram_idle_ms_responds_to_commit_pressure() {
+        use super::system_ram_idle_ms;
+        let mib = 1024 * 1024;
+        let gib = 1024 * mib;
+        let enough_memory = Some((8 * gib, 8 * gib));
+        let low_commit = Some((4 * gib, 903 * mib));
+        assert_eq!(system_ram_idle_ms(enough_memory), 10_000);
+        // The failing run had substantial physical RAM available, but less
+        // than 1 GiB left to commit.
+        assert_eq!(system_ram_idle_ms(low_commit), 500);
     }
 }
 

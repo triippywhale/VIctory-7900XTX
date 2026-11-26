@@ -1657,7 +1657,9 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // The strides, then the views' title addresses
+                // (`victory_shader::emit::VIEW_ADDRESSES`).
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_BYTES);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -2292,7 +2294,8 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                // (`VICTORY_VRAM_EARLY=1`: only while the card has room.)
+                kin => (!crate::host::vram_early() || crate::resource::room_lately()) && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -2718,6 +2721,7 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            write_view_address(*data, index, view);
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -3252,7 +3256,8 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept =
+                        (!crate::host::vram_early() || crate::resource::room_lately()) && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -3588,6 +3593,26 @@ pub(crate) fn view_address(view: &View) -> Option<u64> {
             Some(u64::from(desc[4]) | u64::from(desc[5]) << 32)
         }
         _ => buffer_range(view).map(|range| range.0),
+    }
+}
+
+/// Enters the title address of `view` (0 for none, or a view that is no
+/// buffer's or structure's) at title slot `index` of the view addresses
+/// after the strides in the mapping at `data`
+/// (`victory_shader::emit::VIEW_ADDRESSES`): shaders that pick a view at a
+/// computed index and read its address as a pointer read it there.
+fn write_view_address(data: usize, index: u32, view: Option<&View>) {
+    use victory_shader::emit::{SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
+    if index >= SLOT_STRIDES_COUNT {
+        return;
+    }
+    let address = view.and_then(view_address).unwrap_or(0);
+    let at = (data + VIEW_ADDRESSES as usize) as *mut u32;
+    // SAFETY: inside the mapping (`SLOT_STRIDES_BYTES`); shaders read it
+    // while we write (each dword is one the slot had or has).
+    unsafe {
+        at.add(2 * index as usize).write_volatile(address as u32);
+        at.add(2 * index as usize + 1).write_volatile((address >> 32) as u32);
     }
 }
 
@@ -5138,6 +5163,32 @@ mod tests {
         assert_eq!(ranges, [(1, 1), (10, 20), (30, 61)]);
         join(&mut ranges);
         assert_eq!(ranges.len(), 3);
+    }
+
+    /// A view's title address goes after the strides, at two dwords per
+    /// slot; a view that is no buffer's, and none, enter 0.
+    #[test]
+    fn view_addresses_follow_the_strides() {
+        use victory_shader::emit::{SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES};
+        let mut table = vec![0xdead_beefu32; SLOT_STRIDES_BYTES as usize / 4];
+        let data = table.as_mut_ptr() as usize;
+        // A ray-tracing structure's view: its address in words 4 and 5.
+        const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+        let mut desc = [0u32; 10];
+        (desc[1], desc[4], desc[5]) = (STRUCTURE, 0x1234_5600, 0x42);
+        let view = View::Shader(0, Some(desc));
+        assert_eq!(view_address(&view), Some(0x42_1234_5600));
+        write_view_address(data, 7, Some(&view));
+        write_view_address(data, 8, None);
+        write_view_address(data, SLOT_STRIDES_COUNT - 1, Some(&view));
+        // Past the table: nothing written.
+        write_view_address(data, SLOT_STRIDES_COUNT, Some(&view));
+        let at = VIEW_ADDRESSES as usize / 4;
+        assert_eq!(table[at + 14..at + 18], [0x1234_5600, 0x42, 0, 0]);
+        assert_eq!(table[at + 12..at + 14], [0xdead_beef; 2], "slot 6 untouched");
+        let last = at + 2 * (SLOT_STRIDES_COUNT as usize - 1);
+        assert_eq!(table[last..], [0x1234_5600, 0x42]);
+        assert_eq!(table[..at].iter().filter(|&&w| w != 0xdead_beef).count(), 0, "the strides untouched");
     }
 
     /// Typed buffer views of integer formats are marked in the table of
