@@ -8892,6 +8892,16 @@ impl Meter {
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
                 );
+                {
+                    let [made, elsewhere] = [0, 1].map(|i| crate::descriptor::host::UNMADE_SHADER_TEXTURES[i].load(Ordering::Relaxed));
+                    let [read, same, other] =
+                        [0, 1, 2].map(|i| crate::descriptor::host::UNPLACED_SLOTS[i].load(Ordering::Relaxed));
+                    tracing::info!(
+                        "placed texture views at address 0: {made} made (neutral or null), {read} reads of such slots by draws \
+                         and passes, {same} slots written later with the same texture at an address ({other} with \
+                         another); {elsewhere} views elsewhere the host could not make"
+                    );
+                }
                 crate::tiles::status();
                 {
                     let [queued, due, away, partly, oldest] =
@@ -8904,7 +8914,7 @@ impl Meter {
                          the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                          as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                          {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                         {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                         {} ranges of memory mapped, unmapped or written under texture views ({} made coarser while no pass took them), {} slots made due by them, \
                          {} made slots found unmapped and made null",
                         crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                         crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
