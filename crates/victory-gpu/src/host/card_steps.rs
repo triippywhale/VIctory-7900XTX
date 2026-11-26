@@ -933,16 +933,15 @@ static BEHIND: Mutex<Option<std::collections::BTreeMap<(bool, &'static str, usiz
 #[cfg(feature = "diagnostics")]
 fn note_behind(runs: &[&HostList], placed: (usize, usize), reader: (usize, usize)) {
     let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == reader.0);
-    let (kind, len) = match list.and_then(|l| l.deferred().copies.get(reader.1).map(|s| match s {
+    let (kind, len) = list
+        .and_then(|l| l.deferred().copies.get(reader.1).map(|s| match s {
         Step::Fill(_, _, len, Some(FillTo::Slot(..))) => ("a constant view's fill", *len),
         Step::Fill(_, _, len, Some(FillTo::Buffer(_))) => ("a fill of a buffer of ours", *len),
         Step::Fill(_, _, len, None) => ("a fill of scratch memory", *len),
         &Step::Copy(_, _, len) => ("a buffer copy", len),
         _ => ("another step", 0),
-    })) {
-        Some(k) => k,
-        None => ("not found", 0),
-    };
+    }))
+        .unwrap_or(("not found", 0));
     let mut all = BEHIND.lock().unwrap_or_else(|e| e.into_inner());
     *all.get_or_insert_with(Default::default).entry((placed.0 == reader.0, kind, len)).or_default() += 1;
 }
