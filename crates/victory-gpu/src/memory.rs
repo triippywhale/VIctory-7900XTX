@@ -123,6 +123,33 @@ fn faults_all() -> usize {
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
+/// With [`arenas_told`]: how many frames a page of an arena written here is
+/// brought up by every list that comes to this memory, and how often (in
+/// frames) the arenas are brought up whole anyway.
+const TOLD_FRAMES: u64 = 8;
+const TOLD_WHOLE: u64 = 64;
+const TOLD_GAP: u64 = 16;
+
+/// Whether a list brings up only the arena pages this module wrote in the
+/// last [`TOLD_FRAMES`] frames, not every arena whole
+/// (`VICTORY_ARENAS_TOLD=0`: whole, as before).
+///
+/// Only this module writes an arena (`bring`, `take`, a page newly held);
+/// what shaders store there stays on the card. Brought up whole, each of
+/// the 29 arenas of a ray-traced world (1.75 GB) was asked of the write
+/// watch by itself, as a range of its own, once for every list that came
+/// here: 290-300 kernel askings a frame, 6.9 ms of the submitting thread
+/// (run rt-placed-fills-ab, 7900 XT), for some 180-680 KB that changed.
+/// Every [`TOLD_WHOLE`] frames they are brought up whole all the same.
+fn arenas_told() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ARENAS_TOLD") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ARENAS_TOLD").is_none_or(|v| v != "0"))
+}
+
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
@@ -167,6 +194,9 @@ struct Memory {
     numbers: HashMap<usize, usize>,
     /// Arenas: place in `copies`, address.
     arenas: Vec<(usize, usize)>,
+    /// With [`arenas_told`]: per arena (its place in `copies`), the pages of
+    /// it (offset / [`PAGE`]) this module wrote, and the last frame it did.
+    told: HashMap<usize, std::collections::BTreeMap<usize, u64>>,
     /// By title page.
     pages: HashMap<u64, Held>,
     /// Their numbers in the order they came, and where the sweep is.
@@ -222,6 +252,8 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Runs of arena pages lists were given to bring up ([`arenas_told`]).
+    told_runs: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -259,6 +291,7 @@ impl Memory {
             copies: Vec::new(),
             numbers: HashMap::new(),
             arenas: Vec::new(),
+            told: HashMap::new(),
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
@@ -429,6 +462,35 @@ impl Memory {
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
     }
 
+    /// With [`arenas_told`]: the page at `at` of the arena that is `copy` was
+    /// written (or newly held) in this frame, so the lists recorded over the
+    /// next [`TOLD_FRAMES`] frames bring it up.
+    fn tell(&mut self, copy: usize, at: usize) {
+        // (Noted with the switch off too: `VICTORY_AB` turns it on and off.)
+        let offset = (at - self.copies[copy].span().0 as usize) / PAGE as usize;
+        self.told.entry(copy).or_default().insert(offset, self.frame);
+    }
+
+    /// The runs (byte offsets) of the pages of the arena that is `copy` told
+    /// in the last [`TOLD_FRAMES`] frames; older notes go.
+    fn told_runs(&mut self, copy: usize) -> Vec<(u64, u64)> {
+        let frame = self.frame;
+        let Some(pages) = self.told.get_mut(&copy) else {
+            return Vec::new();
+        };
+        pages.retain(|_, at| at.saturating_add(TOLD_FRAMES) >= frame);
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for &page in pages.keys() {
+            let (from, to) = (page as u64 * PAGE, (page as u64 + 1) * PAGE);
+            match runs.last_mut() {
+                // Gaps of up to [`TOLD_GAP`] pages joined: fewer, longer refreshes.
+                Some(last) if from <= last.1 + TOLD_GAP * PAGE => last.1 = to,
+                _ => runs.push((from, to)),
+            }
+        }
+        runs
+    }
+
     /// The packed structure at `address` is gone: the pages it alone had are
     /// given back.
     fn gone(&mut self, address: u64) {
@@ -529,6 +591,7 @@ impl Memory {
         }
         let started = std::time::Instant::now();
         let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
+        let mut wrote_here: Vec<(usize, usize)> = Vec::new();
         for page in first..end {
             let Some(held) = self.pages.get_mut(&page) else {
                 continue;
@@ -550,17 +613,25 @@ impl Memory {
             let shadow = &self.copies[held.copy];
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
+            let mut changed = 0;
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                changed += merge(&title, ours, never) as u64 * 4;
             }
+            self.stats.changed += changed;
             if never {
                 shadow.resend(base, base + PAGE as usize);
             }
+            if never || changed > 0 {
+                wrote_here.push((held.copy, held.at));
+            }
+        }
+        for (copy, at) in wrote_here {
+            self.tell(copy, at);
         }
         self.stats.micros += started.elapsed().as_micros() as u64;
     }
@@ -659,6 +730,7 @@ impl Memory {
         let base = held.at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
         let mut at = from;
+        let mut changed = false;
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
@@ -667,11 +739,16 @@ impl Memory {
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
                 crate::watch::wrote(held.at + at, n);
+                changed = true;
             }
             at += n;
         }
         if whole {
             shadow.resend(base + from, base + to);
+        }
+        if changed || whole {
+            let (copy, at) = (held.copy, held.at);
+            self.tell(copy, at);
         }
     }
 
@@ -773,12 +850,24 @@ impl Memory {
 
     /// Every copy is brought up to date when `list` is submitted, after what
     /// it deferred so far (once until a copy of the title's intervenes).
-    fn bring_up(&self, list: &HostList) {
+    fn bring_up(&mut self, list: &HostList) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        // With `arenas_told`: an arena's pages this module wrote lately, and
+        // all of it every `TOLD_WHOLE` frames.
+        let whole = !arenas_told() || self.frame % TOLD_WHOLE == 0;
+        for n in 0..self.copies.len() {
+            let shadow = self.copies[n].clone();
             let (start, len) = shadow.span();
-            shadow.refresh(list, start, len);
+            if whole || !self.arenas.iter().any(|a| a.0 == n) {
+                shadow.refresh(list, start, len);
+                continue;
+            }
+            let runs = self.told_runs(n);
+            self.stats.told_runs += runs.len() as u64;
+            for (from, to) in runs {
+                shadow.refresh(list, start + from, (to - from).min(len.saturating_sub(from)));
+            }
         }
     }
 
@@ -795,7 +884,8 @@ impl Memory {
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; {:.1} runs of arena pages brought up \
+             (VICTORY_ARENAS_TOLD=0: arenas whole)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -817,7 +907,8 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            s.told_runs as f64 / frames
         );
         self.stats.from = Some((now, self.frame));
     }
