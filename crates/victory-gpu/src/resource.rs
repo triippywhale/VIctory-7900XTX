@@ -2044,7 +2044,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(85, |percent| percent.clamp(50, 97))
+            .map_or(90, |percent| percent.clamp(50, 97))
     })
 }
 

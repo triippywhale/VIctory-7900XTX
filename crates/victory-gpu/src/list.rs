@@ -297,7 +297,22 @@ fn trim_idle(most: usize) {
         idle.1 -= gone.iter().map(|g| g.1).sum::<u64>();
         gone
     };
+    // What they held of the PC's memory shared with the card, as the
+    // system counts it (for sizing the pool).
+    let shared = || crate::host::host().and_then(|h| h.video_memory()).map_or(0, |m| m[3]);
+    let (n, before) = (gone.len(), shared());
     drop(gone);
+    let after = shared();
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+        tracing::info!(
+            lists = n,
+            shared_before_mb = before >> 20,
+            shared_after_mb = after >> 20,
+            per_list_kb = before.saturating_sub(after) / n.max(1) as u64 >> 10,
+            "idle host lists let go: the PC's memory shared with the card before and after"
+        );
+    }
 }
 
 /// Whether host lists that have run are used again (on by default;

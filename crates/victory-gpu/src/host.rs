@@ -6890,11 +6890,13 @@ impl HostList {
             }
         }
         // SAFETY: the list is not executing.
-        let reset = unsafe {
+        // Again after `relieve` while the driver has no memory for the
+        // list's commands (a 16 GB PC, run 7900-s13).
+        let reset = again_on_oom(|| unsafe {
             self.allocator
                 .Reset()
                 .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
+        });
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
