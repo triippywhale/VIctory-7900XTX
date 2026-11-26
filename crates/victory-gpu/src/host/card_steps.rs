@@ -85,10 +85,15 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
-/// the case did not come up once in runs submit-1 to submit-3, so it has only
-/// its tests behind it.
+/// them (on by default; `VICTORY_PLACED_ORDER=0`: wherever it stands), and a
+/// submission where it does is cut behind the copy's list ([`cut_for`]).
+///
+/// On since run rt-behind-ab (ray tracing on, with
+/// [`HostList::placed_constants`] taking the readers in the copy's own list):
+/// the readers left are constant fills in later lists (0xf0 and 0x220 bytes,
+/// about one a frame); with the cut the submitting thread's waits for flights
+/// fell from 11-19 ms a frame to under 1 ms, and frames at about 4,800 draws
+/// took 69.7 ms against 75.2 (four pairs of 20 s phases).
 ///
 /// The fills of constant buffers read the title's ring (7,500 a frame in the
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
@@ -100,7 +105,7 @@ fn placed_order() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
 }
 
 /// Why [`plan`] refuses for [`place`].
@@ -110,8 +115,28 @@ const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads,
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
 
-/// The most steps of a submission done this way.
+/// The most steps of a submission done this way (`VICTORY_CARD_STEPS_MOST`
+/// to change it; in diagnostics builds `VICTORY_AB=..,VICTORY_STEPS_MANY`
+/// switches between this and four times as many while the title runs).
+///
+/// Why it can be raised: with ray tracing on, one fill of the title's ring a
+/// frame was refused for this ("too many steps depend on it") and the
+/// submitting thread stood ~16 ms for the flights instead (run rt-vram2).
+/// What bounds the work is [`BETWEEN`], the bytes our buffer holds, which
+/// refuses on its own ("too much at once").
 const MOST: usize = 12288;
+
+fn most() -> usize {
+    static MOST_SET: OnceLock<usize> = OnceLock::new();
+    let most = *MOST_SET.get_or_init(|| {
+        std::env::var("VICTORY_CARD_STEPS_MOST").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(MOST)
+    });
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_STEPS_MANY") == Some(true) {
+        return most * 4;
+    }
+    most
+}
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -287,7 +312,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         if writes.iter().any(|w| w.0 < w.1) {
             join_ranges(&mut written, writes);
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
+        if taken.iter().filter(|t| **t).count() > most() {
             return Err("too many steps depend on it");
         }
         for (i, d) in does.iter().enumerate() {
@@ -682,7 +707,15 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let mut behind = None;
+        let chosen = plan(&does, stage(), placed_order(), &mut behind);
+        #[cfg(feature = "diagnostics")]
+        if chosen == Err(BEHIND_PLACED)
+            && let Some((p, i)) = behind
+        {
+            note_behind(runs, steps[p], steps[i]);
+        }
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -891,10 +924,41 @@ fn noted(ops: &[Op]) {
     }
 }
 
+/// Diagnostics: refusals for [`BEHIND_PLACED`], by the step in the way: in the
+/// copy's own list or a later one, and what it is (a constant view's fill,
+/// a fill of a buffer of ours, another fill, a buffer copy), and its bytes.
+#[cfg(feature = "diagnostics")]
+static BEHIND: Mutex<Option<std::collections::BTreeMap<(bool, &'static str, usize), u64>>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn note_behind(runs: &[&HostList], placed: (usize, usize), reader: (usize, usize)) {
+    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == reader.0);
+    let (kind, len) = match list.and_then(|l| l.deferred().copies.get(reader.1).map(|s| match s {
+        Step::Fill(_, _, len, Some(FillTo::Slot(..))) => ("a constant view's fill", *len),
+        Step::Fill(_, _, len, Some(FillTo::Buffer(_))) => ("a fill of a buffer of ours", *len),
+        Step::Fill(_, _, len, None) => ("a fill of scratch memory", *len),
+        &Step::Copy(_, _, len) => ("a buffer copy", len),
+        _ => ("another step", 0),
+    })) {
+        Some(k) => k,
+        None => ("not found", 0),
+    };
+    let mut all = BEHIND.lock().unwrap_or_else(|e| e.into_inner());
+    *all.get_or_insert_with(Default::default).entry((placed.0 == reader.0, kind, len)).or_default() += 1;
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    for ((same, kind, len), n) in BEHIND.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default() {
+        tracing::info!(
+            "refused for a copy at its place, per frame: {:.2} by {kind} of {len:#x} bytes in {} list",
+            n as f64 / frames,
+            if same { "the copy's own" } else { "a later" },
+        );
     }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(

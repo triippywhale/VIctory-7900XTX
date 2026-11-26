@@ -48,7 +48,7 @@ const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
 /// out of a host copy, and texture copies out of one.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -340,6 +340,63 @@ impl HostList {
             wait_for_all(host, &self.list);
         }
         Some(between)
+    }
+
+    /// For constants that a fill would take out of title memory at
+    /// `[src, src + len)` when the list is submitted, where a copy at its
+    /// place earlier in this list writes some of those bytes: a buffer on the
+    /// card that holds them as the host copy has them at this place of the
+    /// list, and its address (256-aligned, for a constant view). `None`: fill
+    /// as before (`VICTORY_PLACED_FILLS=0` always).
+    ///
+    /// Why: the fill is done on the CPU at submission, and wherever flights
+    /// in the air write the copy's source or destination that read waits
+    /// for them to land ([`read_by`]): one wait of 15-35 ms a frame with
+    /// ray tracing on (run rt-waits-ab, ~7 such fills a frame, all reading
+    /// the title's ring of constants in its 174 MB heap). The steps done on
+    /// the card in front of the lists ([`super::card_steps`]) cannot take
+    /// them: they would run ahead of the copy. Here the card copies the
+    /// bytes behind the copy, in the list's order, as a draw's buffer view
+    /// of the same host copy reads them.
+    ///
+    /// The same bytes: after the copy the host copy holds what it put there,
+    /// and the refresh below brings in what the title's CPU wrote around it
+    /// (as [`HostList::place_copy`] does for the copy's own destination).
+    pub(crate) fn placed_constants(&self, src: usize, len: usize) -> Option<(ID3D12Resource, u64)> {
+        if !on() || len == 0 || !crate::toggled!("VICTORY_PLACED_FILLS") {
+            return None;
+        }
+        let end = src.checked_add(len)?;
+        let shadow = {
+            let deferred = self.deferred();
+            deferred.copies.iter().rev().find_map(|step| match step {
+                Step::Placed(p) if p.dst < end && src < p.dst + p.len => Some(p.shadow.clone()),
+                _ => None,
+            })?
+        };
+        shadow.offset_in(src as u64)?;
+        if shadow.left(src as u64) < len as u64 {
+            return None;
+        }
+        let host = host()?;
+        let buffer = self.between(host, len as u64)?;
+        shadow.refresh(self, src as u64, len as u64);
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        // SAFETY: an open list; live buffers (the list keeps both), ranges
+        // inside them. The new buffer starts in the common state and is
+        // promoted by the copy.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&buffer, 0, &shadow.buffer, shadow.offset(src as u64), len as u64);
+            self.list.ResourceBarrier(&[transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            )]);
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, gpu))
     }
 
     /// A buffer on the card for this recording alone.
