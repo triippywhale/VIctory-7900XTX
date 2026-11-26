@@ -3,6 +3,7 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
+# -Console      series-x (the default) or series-s
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
@@ -13,13 +14,9 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-<<<<<<< HEAD
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [hashtable]$More = @{},
     [switch]$NoPrebuild
-=======
-    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
-    [hashtable]$More = @{}
->>>>>>> d3f132d (GPU: lock all pipeline library calls on AMD by default and pin workers in Safe mode)
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -52,7 +49,6 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-<<<<<<< HEAD
 try {
     if (-not $NoPrebuild) {
         # Every pipeline of the title's shader pack, made before the title needs one (the
@@ -60,8 +56,5 @@ try {
         & $victory translate --cache --pipelines (Split-Path -Parent $Exe)
         if ($LASTEXITCODE -ne 0) { Write-Host "The pipeline pre-build failed ($LASTEXITCODE); starting anyway." }
     }
-    & $victory run $Exe --execute
+    & $victory run $Exe --console $Console --execute
 } finally { Pop-Location }
-=======
-try { & $victory run $Exe --console $Console --execute } finally { Pop-Location }
->>>>>>> d3f132d (GPU: lock all pipeline library calls on AMD by default and pin workers in Safe mode)
