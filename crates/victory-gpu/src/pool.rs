@@ -106,15 +106,34 @@ impl Ripe {
     }
 }
 
+/// Whether a piece is cut from the fullest block it fits in rather than the
+/// first (`VICTORY_POOL_FULLEST=0`: the first, as before).
+fn fullest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_FULLEST").is_none_or(|v| v != "0"))
+}
+
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+/// The free ranges of a block: start and length, never two that touch;
+/// and their bytes in all.
+struct Ranges(BTreeMap<u64, u64>, u64);
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges(BTreeMap::from([(0, size)]), size)
+    }
+
+    /// Whether `len` bytes at a multiple of `align` fit.
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.1 >= len
+            && self.0.iter().any(|(&start, &size)| start.next_multiple_of(align) + len <= start + size)
+    }
+
+    /// The bytes free.
+    fn free(&self) -> u64 {
+        self.1
     }
 
     /// The lowest place for `len` bytes at a multiple of `align`.
@@ -123,6 +142,7 @@ impl Ranges {
             let at = start.next_multiple_of(align);
             (at + len <= start + size).then_some((start, size, at))
         })?;
+        self.1 -= len;
         self.0.remove(&start);
         if at > start {
             self.0.insert(start, at - start);
@@ -134,6 +154,7 @@ impl Ranges {
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
+        self.1 += len;
         if let Some((&before, &size)) = self.0.range(..start).next_back()
             && before + size == start
         {
@@ -210,13 +231,35 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
+        if fullest() {
+            // The fullest ripe block it fits in: blocks most of whose
+            // textures went are left to empty and go back to the card.
+            // (The lowest that fit, as before: their textures stayed spread
+            // over every block, run-addr0 held 7.4 GB of blocks for 5.0 GB
+            // of textures and never gave one back.)
+            let best = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (ripe.is(b) && b.free.fits(len, align)).then_some((b.free.free(), i))
+                })
+                .min();
+            if let Some((_, i)) = best
+                && let Some(start) = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align))
             {
                 found = Some((i, start));
-                break;
+            }
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -689,6 +732,30 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn pieces_go_to_the_fullest_block_so_sparse_ones_empty() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let piece = BLOCK / 8;
+        // Three blocks full.
+        let taken: Vec<Piece> = (0..24).map(|_| pool.take(piece, 65536, 0, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 3);
+        // Most of block 0 goes, one piece of block 1.
+        for p in taken.iter().filter(|p| p.block == 0).skip(1) {
+            pool.give(*p, 0);
+        }
+        let one = *taken.iter().find(|p| p.block == 1).unwrap();
+        pool.give(one, 0);
+        pool.rested(REST);
+        // The next piece fills block 1, not the sparse block 0.
+        let (p, _, _) = pool.take(piece, 65536, REST, make).unwrap();
+        assert_eq!(p.block, if fullest() { 1 } else { 0 });
     }
 
     #[test]
