@@ -4360,6 +4360,10 @@ fn make_twinned(
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
+            let memory = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            if resource[0] != BUFFER && !*unordered {
+                return unmade_shader_texture(view, resource, desc, memory, at);
+            }
             if resource[0] != BUFFER {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
@@ -4370,11 +4374,10 @@ fn make_twinned(
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
+                if (said.len() < 64 && said.insert(memory)) || times.is_power_of_two() {
                     tracing::warn!(
-                        address = format_args!("{at:#x}"),
+                        address = format_args!("{memory:#x}"),
                         times,
                         "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
                         &desc[..10]
@@ -4398,6 +4401,64 @@ fn make_twinned(
             }
         }
     }
+}
+
+/// Shader views of placed textures [`placed_texture`] made nothing for,
+/// since the start: at address 0 (no memory given yet), and elsewhere.
+pub(crate) static UNMADE_SHADER_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a shader view of a placed texture at address 0 shows the
+/// neutral grey texture rather than a null view (black, alpha 0);
+/// `VICTORY_UNPLACED_NEUTRAL=0`: null, as before.
+fn unplaced_neutral() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNPLACED_NEUTRAL").is_none_or(|v| v != "0"))
+}
+
+/// A shader view of a texture the title placed whose host resource could
+/// not be made. Shader views write nothing, so nothing is lost: the slot
+/// reads as the neutral texture (address 0) or as zeros.
+///
+/// The title writes thousands of these at address 0 (BC1/BC5/BC7 2D
+/// textures with full mip chains, 2026-11-26): views written before the
+/// streamer gives the texture memory. A slot a draw reads before the view is
+/// written again read as black; it now reads as grey, as a texture still
+/// uploading does. The log gives all sixteen view words, should the address
+/// turn out to be somewhere else in them.
+fn unmade_shader_texture(
+    view: &View,
+    resource: &[u32; 14],
+    desc: &[u32; 16],
+    memory: u64,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let unplaced = memory == 0;
+    let times = UNMADE_SHADER_TEXTURES[usize::from(!unplaced)].fetch_add(1, Relaxed) + 1;
+    if unplaced {
+        if times.is_power_of_two() {
+            tracing::info!(
+                times,
+                neutral = unplaced_neutral(),
+                "placed shader texture view at address 0 (no memory yet): resource {resource:?}, view {desc:?}"
+            );
+        }
+        if unplaced_neutral() {
+            return neutral_for(view, at).map(Some);
+        }
+        return None;
+    }
+    static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if (said.len() < 64 && said.insert(memory)) || times.is_power_of_two() {
+        tracing::warn!(
+            address = format_args!("{memory:#x}"),
+            times,
+            "placed shader texture view the host could not make (null, reads as zeros): resource {resource:?}, view {desc:?}"
+        );
+    }
+    None
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
