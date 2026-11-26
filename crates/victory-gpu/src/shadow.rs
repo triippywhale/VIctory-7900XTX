@@ -5653,11 +5653,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    // In the card's memory when there is room (`Host::window_buffer`): then
+    // no second copy on the card.
+    let (buffer, data, in_card) = host()?.window_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
+    let card_side = if in_card { None } else { window_card_for(len) };
+    let (buffer, card) = match card_side {
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {

@@ -206,6 +206,97 @@ fn vram_keep_at(budget: u64, used: u64, early: bool) -> (u64, u64) {
     }
 }
 
+/// Until this moment (`now_ms`) the host is short of memory ([`relieve`]):
+/// idle host objects go after the shortest rest.
+static RELIEF_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn relieving() -> bool {
+    let until = RELIEF_UNTIL.load(Ordering::Relaxed);
+    until != 0 && now_ms() < until
+}
+
+/// The host refused memory: what is kept spare goes (scratch chunks, staging
+/// buffers of textures no list holds, the pipeline library's mapping), and
+/// for three seconds idle copies and textures go after the shortest rest.
+/// On a 16 GB PC the PC's memory shared with the card (7.1 GB) fills as the
+/// world loads, and a refused list ended the run ("no host list for a state
+/// prelude").
+pub(crate) fn relieve() {
+    RELIEF_UNTIL.store(now_ms() + 3_000, Ordering::Relaxed);
+    let spare = std::mem::replace(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()), Spare::new());
+    let (count, bytes) = (spare.kept.len() as u64, spare.bytes);
+    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    drop(spare);
+    let staging = crate::texture::relieve();
+    let lists = crate::list::relieve();
+    crate::pipeline::trim_library();
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if TOLD.fetch_add(1, Ordering::Relaxed) < 32 {
+        tracing::warn!(
+            spare_chunks = count,
+            spare_mb = bytes >> 20,
+            staging_mb = staging >> 20,
+            idle_lists = lists,
+            "out of host memory: spare memory let go, trying again"
+        );
+    }
+}
+
+const OOM: windows::core::HRESULT = windows::core::HRESULT(0x8007_000E_u32 as i32);
+
+/// `make` again after [`relieve`] while the host has no memory for it: up
+/// to five times over about two seconds (the card finishing work gives
+/// memory back too).
+pub(crate) fn again_on_oom<T>(mut make: impl FnMut() -> windows::core::Result<T>) -> windows::core::Result<T> {
+    let mut result = make();
+    for wait in [10u64, 50, 200, 500, 1_000] {
+        match &result {
+            Err(e) if e.code() == OOM => {
+                relieve();
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+                result = make();
+            }
+            _ => break,
+        }
+    }
+    result
+}
+
+/// [`again_on_oom`] for makers that say only `None` (and log why): tried
+/// again while memory is short ([`short_of_memory`]).
+fn again_while_none<T>(mut make: impl FnMut() -> Option<T>) -> Option<T> {
+    let mut result = make();
+    for wait in [10u64, 50, 200, 500, 1_000] {
+        if result.is_some() || !short_of_memory() {
+            break;
+        }
+        relieve();
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        result = make();
+    }
+    result
+}
+
+/// Whether a refusal is likely for lack of memory: the system has under a
+/// gigabyte left to commit, or the card's own memory or the PC's memory
+/// shared with it is at 95 % of its budget.
+fn short_of_memory() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } != 0 && m.ullAvailPageFile < 1 << 30 {
+        return true;
+    }
+    host().and_then(|h| h.video_memory()).is_none_or(|[budget, used, shared_budget, shared_used]| {
+        used >= budget / 100 * 95 || shared_used >= shared_budget / 100 * 95
+    })
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -217,6 +308,9 @@ fn vram_keep_at(budget: u64, used: u64, early: bool) -> (u64, u64) {
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
     static KEEP: OnceLock<bool> = OnceLock::new();
     let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
+    if relieving() {
+        return 1_000;
+    }
     vram_idle_for(video_memory, keep)
 }
 
@@ -420,6 +514,9 @@ pub(crate) fn keep_freed() -> bool {
 /// when free physical RAM is low. Never returns less than 2,000 ms.
 /// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    if relieving() {
+        return 2_000;
+    }
     // (`VICTORY_RESIDENCY=1`: the smaller of free RAM and free commit.)
     let effective = match (avail_phys, crate::residency::headroom()) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -914,6 +1011,17 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// For the memory line: against what is alive, they show what was let go.
 pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
+/// Windows of title memory put in the card's memory: count, bytes.
+pub(crate) static WINDOWS_VRAM: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Upload buffers put in the card's memory because the PC's had no room.
+pub(crate) static UPLOADS_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Set while a refused shared buffer has a fallback (`window_buffer`).
+    static QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What of that is alive now, for the memory line (`MADE` counts what was
 /// ever made: 42,607 upload buffers, 77.9 GB, in five minutes of run 60,
 /// and nothing said how many were alive): host lists; the lists' scratch
@@ -1384,6 +1492,9 @@ pub(crate) struct HostList {
     epoch: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Its `Close` was refused for lack of memory: it is not sent, and is
+    /// whole again after its next reset.
+    broken: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -4366,7 +4477,7 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let before = private_bytes();
-        let list = self.make_list();
+        let list = again_on_oom(|| self.make_list());
         LISTS[0].fetch_add(1, Ordering::Relaxed);
         // (May shrink while a list is made, on another thread's account:
         // added as it is, the sum is what counts.)
@@ -4384,7 +4495,7 @@ impl Host {
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
+        let made: windows::core::Result<Prelude> = again_on_oom(|| unsafe {
             (|| {
                 let allocator: ID3D12CommandAllocator =
                     self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -4394,7 +4505,7 @@ impl Host {
                 list.Close()?;
                 Ok((allocator, list))
             })()
-        };
+        });
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
@@ -4463,6 +4574,7 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
+                broken: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes,
                 #[cfg(feature = "diagnostics")]
@@ -6037,15 +6149,18 @@ impl Host {
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
                 lists.push(Some(prelude));
             }
-            #[cfg(feature = "diagnostics")]
-            marks.push((
-                lists.len(),
-                match &own {
-                    Some(own) if std::ptr::eq(own.list(), *list) => crate::copystat::Timed::Steps,
-                    _ => crate::copystat::Timed::Title(_run),
-                },
-            ));
-            lists.push(list.list.cast().ok());
+            // (a list whose Close was refused for lack of memory is left out)
+            if !list.broken.load(Ordering::Relaxed) {
+                #[cfg(feature = "diagnostics")]
+                marks.push((
+                    lists.len(),
+                    match &own {
+                        Some(own) if std::ptr::eq(own.list(), *list) => crate::copystat::Timed::Steps,
+                        _ => crate::copystat::Timed::Title(_run),
+                    },
+                ));
+                lists.push(list.list.cast().ok());
+            }
         }
         batch.fill();
         stage.next("submit: the last refreshes");
@@ -6705,6 +6820,19 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            // Out of memory (the driver's for the list's commands): the list
+            // is left out of its submission, the rest of the frame goes on.
+            // On a 16 GB PC this ended runs 7900-s4 and -s7; a frame's
+            // part missing is a glitch, not the end of the title.
+            if e.code() == OOM {
+                self.broken.store(true, Ordering::Relaxed);
+                relieve();
+                static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if TOLD.fetch_add(1, Ordering::Relaxed) < 16 {
+                    tracing::warn!(error = %e, "a host command list did not close for lack of memory: it is left out of its submission");
+                }
+                return;
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -6736,6 +6864,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.broken.store(false, Ordering::Relaxed);
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -8990,7 +9119,27 @@ impl Host {
         }
     }
 
+    /// An upload buffer: in the PC's memory as before, else in the card's
+    /// (a GPU upload heap, Resizable BAR) while the card is under 95 % of its
+    /// budget, else again after [`relieve`]. Upload memory is held in the
+    /// PC's physical memory while the card may read it; on a 16 GB PC with
+    /// the title's 29 GB mostly paged out a 4 MiB one was refused in the
+    /// world (run 7900-s3) and the title went down with it.
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        QUIET.with(|q| q.set(true));
+        let first = self.upload_buffer_once(size);
+        QUIET.with(|q| q.set(false));
+        if first.is_some() {
+            return first;
+        }
+        if let Some(made) = self.card_buffer(size, 95, D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_FLAG_NONE) {
+            UPLOADS_VRAM.fetch_add(1, Ordering::Relaxed);
+            return Some(made);
+        }
+        again_while_none(|| self.upload_buffer_once(size))
+    }
+
+    fn upload_buffer_once(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9039,7 +9188,9 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 crate::residency::allocation_error(&e);
-                tracing::warn!(error = %e, size, "no upload buffer");
+                if !QUIET.with(std::cell::Cell::get) {
+                    tracing::warn!(error = %e, size, "no upload buffer");
+                }
                 None
             }
         }
@@ -9994,7 +10145,134 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// A buffer for a window of title memory, and whether it is in the
+    /// card's memory: there first (a GPU upload heap, Resizable BAR) while
+    /// the card is under 85 % of its budget, then in the PC's memory shared
+    /// with the card, then the card again up to 92 %. On a 16 GB PC the
+    /// shared memory (7.1 GB, half the PC's) filled at the first world
+    /// frames with 2.7 GB of windows while 8.5 GB of the card stood free,
+    /// and the run ended. The CPU writes a window (its refreshes) and reads
+    /// one back only where shaders wrote it. `VICTORY_WINDOWS_VRAM=0`: the
+    /// shared memory only; `=late`: the card only once that refused.
+    pub(crate) fn window_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, bool)> {
+        static MODE: OnceLock<u8> = OnceLock::new();
+        let mode = *MODE.get_or_init(|| {
+            let wanted = if cfg!(test) || std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+                0
+            } else {
+                match std::env::var("VICTORY_WINDOWS_VRAM").as_deref() {
+                    Ok("0") => 0,
+                    Ok("late") => 1,
+                    _ => 2,
+                }
+            };
+            let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a plain query into a local of its size.
+            let supported = wanted > 0
+                && unsafe {
+                    self.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut options16).cast(),
+                        size_of_val(&options16) as u32,
+                    )
+                }
+                .is_ok()
+                && options16.GPUUploadHeapSupported.as_bool();
+            tracing::info!(wanted, supported, "windows of title memory in the card's memory (GPU upload heap): 2 first, 1 when the shared memory is full");
+            if supported { wanted } else { 0 }
+        });
+        if mode == 0 {
+            return self.shared_buffer(size).map(|(b, d)| (b, d, false));
+        }
+        if mode == 2
+            && let Some((b, d)) = self.card_window(size, 85)
+        {
+            return Some((b, d, true));
+        }
+        if let Some((b, d)) = self.shared_buffer_quiet(size) {
+            return Some((b, d, false));
+        }
+        self.card_window(size, 92).map(|(b, d)| (b, d, true)).or_else(|| {
+            tracing::warn!(size, "no window buffer: neither the shared memory nor the card had room");
+            None
+        })
+    }
+
+    /// A GPU upload heap buffer (the card's memory, CPU-mapped write-combined)
+    /// while the card is under `percent` of its budget.
+    fn card_window(&self, size: u64, percent: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let made = self.card_buffer(size, percent, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
+        let n = WINDOWS_VRAM[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = WINDOWS_VRAM[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n.is_power_of_two() || n % 1000 == 0 {
+            tracing::info!(made = n, mb = bytes >> 20, uploads = UPLOADS_VRAM.load(Ordering::Relaxed), "windows of title memory put in the card's memory (and upload buffers)");
+        }
+        Some(made)
+    }
+
+    /// A buffer in a GPU upload heap (the card's memory, CPU-mapped
+    /// write-combined) while the card is under `percent` of its budget.
+    fn card_buffer(
+        &self,
+        size: u64,
+        percent: u64,
+        state: D3D12_RESOURCE_STATES,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some([budget, used, ..]) = self.video_memory()
+            && used + size > budget / 100 * percent
+        {
+            return None;
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(_) => None,
+        }
+    }
+
+    /// [`Self::shared_buffer`] without the warning and the retries on a refusal.
+    fn shared_buffer_quiet(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        QUIET.with(|q| q.set(true));
+        let made = self.shared_buffer_once(size);
+        QUIET.with(|q| q.set(false));
+        made
+    }
+
+    /// [`Self::shared_buffer_once`], again after [`relieve`] while memory is short.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        again_while_none(|| self.shared_buffer_once(size))
+    }
+
+    fn shared_buffer_once(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10046,7 +10324,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                if !QUIET.with(std::cell::Cell::get) {
+                    tracing::warn!(error = %e, size, "no shared buffer");
+                }
                 None
             }
         }
@@ -10138,6 +10418,10 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        again_while_none(|| self.uav_buffer_once(size))
+    }
+
+    fn uav_buffer_once(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

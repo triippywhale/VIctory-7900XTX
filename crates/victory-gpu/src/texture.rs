@@ -520,6 +520,27 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// them, 2.1 GB, at the end of run 24). The next list that samples such a
 /// texture makes a staging buffer anew, detiles and uploads once more.
 /// Called before a submission starts, by the thread that submits.
+/// The host is short of memory (`crate::host::relieve`): the staging
+/// buffers no list holds go (an unchanged texture is detiled and uploaded
+/// again when next sampled). Gives the bytes let go.
+pub(crate) fn relieve() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut bytes = 0;
+    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.retain(|_, s| {
+            let keep = Arc::strong_count(s) > 1;
+            if !keep {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                bytes += s.bytes;
+            }
+            keep
+        });
+    }
+    bytes
+}
+
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
