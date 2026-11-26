@@ -27,7 +27,7 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
     # What goes up to copies in the card's memory on a copy queue of its own (buffers capped
-    # at 512 MB): with ray tracing on, 61.0 against 63.1 ms a frame with the arena fix alone
+    # at 128 MB): with ray tracing on, 61.0 against 63.1 ms a frame with the arena fix alone
     # (A/B run upq-ab, RX 7900 XT).
     $settings.VICTORY_UP_QUEUE = '1'
 }

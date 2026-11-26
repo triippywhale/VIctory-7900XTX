@@ -48,16 +48,18 @@ const MOST: u64 = 512 << 20;
 const LEAST: u64 = 4 << 20;
 
 /// The most card memory all slots' buffers together may take
-/// (`VICTORY_UP_QUEUE_MB`, 512 if not given); a submission that would need
+/// (`VICTORY_UP_QUEUE_MB`, 128 if not given); a submission that would need
 /// more sends as before.
 ///
 /// Each slot kept a buffer as big as the most it ever sent, and there is a
 /// slot for every submission in the air: with ray tracing on (RX 7900 XT,
 /// runs card-ab and card-ab2) the card's memory went from under its budget
 /// to 18-19.8 GB of 17.4 within minutes, and every frame then took 400 ms.
+/// 512 MB of them (run barrier-ab) still took the card to 17.2 GB, at the edge
+/// of its budget, where frames take 220 ms; a frame sends 40-50 MB this way.
 fn most_bytes() -> u64 {
     static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| std::env::var("VICTORY_UP_QUEUE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512u64)) << 20
+    *MB.get_or_init(|| std::env::var("VICTORY_UP_QUEUE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128u64)) << 20
 }
 
 /// The bytes of all slots' buffers.
