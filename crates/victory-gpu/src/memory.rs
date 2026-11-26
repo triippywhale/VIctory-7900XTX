@@ -284,7 +284,12 @@ impl Memory {
         unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
-        tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        // Arenas to come, on the card while it has room ([`crate::shadow::by_address_ahead`]).
+        crate::shadow::by_address_ahead(ARENA, crate::shadow::arenas_ahead());
+        tracing::info!(
+            ahead = crate::shadow::arenas_ahead(),
+            "title memory by address: a shader reads or writes through raw addresses"
+        );
         Some(Memory {
             directory: (entries as *mut u32, directory),
             faults: (faults, data.cast::<u32>(), gpu),
@@ -880,12 +885,13 @@ impl Memory {
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
         let s = std::mem::take(&mut self.stats);
+        let off_card = crate::shadow::by_address_off_card();
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; {:.1} runs of arena pages brought up \
-             (VICTORY_ARENAS_TOLD=0: arenas whole)",
+             (VICTORY_ARENAS_TOLD=0: arenas whole); {} copies ({} MB) in the PC's memory, not on the card",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -908,7 +914,9 @@ impl Memory {
             s.came[2],
             s.came[3],
             self.faulted,
-            s.told_runs as f64 / frames
+            s.told_runs as f64 / frames,
+            off_card.0,
+            off_card.1 >> 20
         );
         self.stats.from = Some((now, self.frame));
     }

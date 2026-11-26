@@ -5550,6 +5550,73 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// Bytes of [`by_address`] copies on the card, kept ready ones included.
+static CARD_USED: AtomicU64 = AtomicU64::new(0);
+
+/// [`by_address`] copies that went to the PC's memory: how many, bytes.
+static OFF_CARD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Buffers on the card made ahead for [`by_address`] copies, and their sizes.
+static AHEAD: Mutex<Vec<(ID3D12Resource, u64)>> = Mutex::new(Vec::new());
+
+/// The most of [`by_address`] copies on the card's own memory
+/// (`VICTORY_MEMORY_CARD_MB`, 4 GiB).
+fn card_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(4096) << 20
+    })
+}
+
+/// How many buffers of an arena's size [`by_address_ahead`] keeps ready on
+/// the card (`VICTORY_ARENAS_AHEAD`, 4; 0: none, as before).
+pub(crate) fn arenas_ahead() -> usize {
+    static AHEAD_N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AHEAD_N.get_or_init(|| std::env::var("VICTORY_ARENAS_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// [`by_address`] copies that went to the PC's memory so far: how many, and
+/// their bytes.
+pub(crate) fn by_address_off_card() -> (u64, u64) {
+    (OFF_CARD[0].load(Ordering::Relaxed), OFF_CARD[1].load(Ordering::Relaxed))
+}
+
+/// Makes buffers of `len` bytes on the card for [`by_address`] copies to
+/// come, until `count` are ready, while the card's memory is under 90 % of
+/// its budget.
+///
+/// An arena is made when the pages run out, which with ray tracing on is a
+/// minute or more into the run, as a rule just when the card's memory is
+/// near its budget: past 97 % the arena went to the PC's memory, for good,
+/// and every step of every ray through the structures in it read over the
+/// bus (the card 97-100 % busy at 5 fps). Made ahead, while there is room,
+/// the next arenas are on the card whatever the budget says then.
+pub(crate) fn by_address_ahead(len: u64, count: usize) {
+    let Some(host) = host() else { return };
+    if !cards() || !host.card_ready() {
+        return;
+    }
+    loop {
+        if AHEAD.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, size)| *size == len).count() >= count {
+            return;
+        }
+        let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 90);
+        if !room || CARD_USED.fetch_add(len, Ordering::Relaxed) + len > card_most() {
+            if room {
+                CARD_USED.fetch_sub(len, Ordering::Relaxed);
+            }
+            return;
+        }
+        let Some(buffer) = host.uav_buffer(len) else {
+            CARD_USED.fetch_sub(len, Ordering::Relaxed);
+            return;
+        };
+        crate::host::name(&buffer, || "title memory by address: made ahead".into());
+        AHEAD.lock().unwrap_or_else(|e| e.into_inner()).push((buffer, len));
+    }
+}
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5563,26 +5630,62 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
-    let most = *MOST.get_or_init(|| {
-        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
-    });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
-    } else {
-        None
+    // One kept ready on the card ([`by_address_ahead`]) if there is one of
+    // this size; else made now, at most so much on the card's own memory
+    // (4 GiB unless `VICTORY_MEMORY_CARD_MB` says otherwise), and while it
+    // has room; past that the side shaders see is in the PC's memory.
+    let ready = {
+        let mut ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+        ahead.iter().position(|(_, size)| *size == len).map(|i| ahead.swap_remove(i).0)
+    };
+    let from_ahead = ready.is_some();
+    let memory = host.video_memory();
+    let room = memory.is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let on_card = match ready {
+        Some(buffer) => Some(buffer),
+        None if !room => None,
+        None if CARD_USED.fetch_add(len, Ordering::Relaxed) + len > card_most() => {
+            CARD_USED.fetch_sub(len, Ordering::Relaxed);
+            None
+        }
+        None => host.uav_buffer(len).or_else(|| {
+            CARD_USED.fetch_sub(len, Ordering::Relaxed);
+            None
+        }),
     };
     let buffer = match on_card {
         Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+        None => {
+            // Rays read it over the bus for the rest of the run: the one
+            // thing in the log that says so.
+            let n = OFF_CARD[0].fetch_add(1, Ordering::Relaxed) + 1;
+            OFF_CARD[1].fetch_add(len, Ordering::Relaxed);
+            let [budget, used, ..] = memory.unwrap_or_default();
+            let why = if !room {
+                "the card's memory is over 97 % of its budget"
+            } else if CARD_USED.load(Ordering::Relaxed) + len > card_most() {
+                "VICTORY_MEMORY_CARD_MB is reached"
+            } else {
+                "the card refused a buffer"
+            };
+            tracing::warn!(
+                start = format_args!("{start:#x}"),
+                mb = len >> 20,
+                n,
+                budget_mb = budget >> 20,
+                used_mb = used >> 20,
+                frame = crate::frame::current(),
+                "title memory by address: a copy is in the PC's memory, not on the card, for the rest of the run ({why}); \
+                 rays read it over the bus (VICTORY_ARENAS_AHEAD keeps more ready on the card)"
+            );
+            host.shared_buffer(len)?.0
+        }
     };
+    // Another kept ready in place of the one taken, while there is room.
+    if from_ahead {
+        by_address_ahead(len, 1);
+    }
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
     // (Counted down with the windows' on the card when it goes.)

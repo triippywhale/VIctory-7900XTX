@@ -99,6 +99,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_ARENAS_AHEAD=<n>` | arenas kept ready on the card, made while it is under 90 % of its budget (4; 0: none). An arena made past 97 % goes to the PC's memory for the rest of the run, and rays then read it over the bus: each one is a warning in the log, and the 10 s line counts them |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
 | `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
 
