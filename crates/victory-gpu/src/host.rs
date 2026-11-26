@@ -8561,6 +8561,16 @@ impl Batch {
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
+        // Diagnostics: a refresh of 2 ms or more, now and then, with what
+        // its copy is and how many bytes it copied.
+        #[cfg(feature = "diagnostics")]
+        if us >= 2_000 {
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SAID.fetch_add(1, Ordering::Relaxed);
+            if n < 50 || n.is_multiple_of(200) {
+                tracing::info!(n, us, copied, "slow refresh of {:#x}+{:#x}: {}", from, to - from, shadow.describe(from, to));
+            }
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }
