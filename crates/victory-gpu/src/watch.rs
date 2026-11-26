@@ -306,6 +306,33 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// Puts page range `[first, last)` into `ahead`, which stays in order and
+/// joined (`a.1 < b.0` for neighbours): a range that overlaps or touches
+/// others becomes one with them. With one asking for a submission
+/// ([`ask_rest`]) `ahead` holds thousands of ranges, and every [`writes`]
+/// looked through all of them (after PalmVIDev 86e7eddab).
+fn ahead_insert(ahead: &mut Vec<(usize, usize)>, (mut first, mut last): (usize, usize)) {
+    if first >= last {
+        return;
+    }
+    // The first range that ends at or after `first` (touching counts).
+    let from = ahead.partition_point(|r| r.1 < first);
+    let mut to = from;
+    while to < ahead.len() && ahead[to].0 <= last {
+        first = first.min(ahead[to].0);
+        last = last.max(ahead[to].1);
+        to += 1;
+    }
+    ahead.splice(from..to, [(first, last)]);
+}
+
+/// Whether `[first, last)` lies in one range of `ahead` (in order and
+/// joined, [`ahead_insert`]).
+fn ahead_contains(ahead: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let at = ahead.partition_point(|r| r.1 < last);
+    ahead.get(at).is_some_and(|&(a, b)| a <= first && last <= b)
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -349,7 +376,11 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    let mut ahead = Vec::with_capacity(asked.len());
+    for range in asked {
+        ahead_insert(&mut ahead, range);
+    }
+    j.ahead = ahead;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -555,11 +586,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead_contains(&ahead, first, last)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            ahead_insert(&mut ahead, (first, last));
         }
     }
     note_hot(&written);
@@ -647,9 +678,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    ahead_contains(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -662,7 +691,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| ahead_contains(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -746,7 +775,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !ahead_contains(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -4407,5 +4436,32 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::{ahead_contains, ahead_insert};
+
+    /// Ranges put in out of order, overlapping and touching come out in
+    /// order and joined, and a look finds what a look through all of them
+    /// finds.
+    #[test]
+    fn ahead_ranges_are_kept_in_order_and_joined() {
+        let mut ahead = Vec::new();
+        let put = [(50, 60), (10, 20), (20, 25), (70, 80), (15, 18), (58, 72), (100, 101), (5, 5)];
+        for &r in &put {
+            ahead_insert(&mut ahead, r);
+        }
+        assert_eq!(ahead, vec![(10, 25), (50, 80), (100, 101)]);
+        for first in 0..110 {
+            for last in first + 1..112 {
+                let linear = ahead.iter().any(|&(a, b)| a <= first && last <= b);
+                assert_eq!(ahead_contains(&ahead, first, last), linear, "{first}..{last}");
+            }
+        }
+        // One range over several joins them all.
+        ahead_insert(&mut ahead, (0, 200));
+        assert_eq!(ahead, vec![(0, 200)]);
     }
 }
