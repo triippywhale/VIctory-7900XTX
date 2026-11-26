@@ -39,6 +39,57 @@ std::arch::global_asm!(
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
+    ".globl victory_safe_stream",
+    ".globl victory_safe_stream_at",
+    ".globl victory_safe_stream_after",
+    ".globl victory_safe_stream_failed",
+    // As victory_safe_copy, the destination written with streaming stores:
+    // bytes up to its next 32-byte boundary, then blocks of 32, then the
+    // rest, each part as the one before left the registers; fenced.
+    "victory_safe_stream:",
+    "mov r10, rsi",
+    "mov r11, rdi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, rdi",
+    "neg rcx",
+    "and rcx, 31",
+    "cmp rcx, r8",
+    "jbe 2f",
+    "mov rcx, r8",
+    "2:",
+    "sub r8, rcx",
+    "victory_safe_stream_at:",
+    "rep movsb",
+    "mov r9, r8",
+    "shr r9, 5",
+    "and r8, 31",
+    "test r9, r9",
+    "jz 4f",
+    "3:",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovntdq ymmword ptr [rdi], ymm0",
+    "add rsi, 32",
+    "add rdi, 32",
+    "dec r9",
+    "jnz 3b",
+    "4:",
+    "mov rcx, r8",
+    "rep movsb",
+    "victory_safe_stream_after:",
+    "sfence",
+    "vzeroupper",
+    "mov eax, 1",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
+    "victory_safe_stream_failed:",
+    "sfence",
+    "vzeroupper",
+    "xor eax, eax",
+    "mov rsi, r10",
+    "mov rdi, r11",
+    "ret",
     ".globl victory_safe_put",
     ".globl victory_safe_put_at",
     ".globl victory_safe_put_after",
@@ -178,6 +229,10 @@ unsafe extern "system" {
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
     fn victory_safe_copy_failed();
+    fn victory_safe_stream(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    fn victory_safe_stream_at();
+    fn victory_safe_stream_after();
+    fn victory_safe_stream_failed();
     fn victory_safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
     fn victory_safe_put_at();
     fn victory_safe_put_after();
@@ -401,12 +456,29 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
+/// [`copy`], the destination written with streaming stores: for many bytes
+/// that the CPU does not read again soon (a host copy refreshed from title
+/// memory, which the card reads). On this PC a plain copy (`rep movsb`, as
+/// `memcpy`) moved 14-15 GB/s on one thread and no more on several, this one
+/// 24 GB/s: the plain one reads each destination line before writing it.
+///
+/// # Safety
+/// As [`copy`].
+pub(crate) unsafe fn copy_streaming(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    // SAFETY: as [`copy`]'s.
+    unsafe { victory_safe_stream(dst, src, len) != 0 }
+}
+
 /// For the fault handler: where a fault at instruction `at` is to go on, if
 /// it is [`copy`]'s.
 pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_copy_at as *const () as usize, victory_safe_copy_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_copy_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_stream_at as *const () as usize, victory_safe_stream_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_stream_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
@@ -511,6 +583,61 @@ mod tests {
         assert_eq!(found, [0]);
         assert_eq!(seen[..32], title[..32]);
         assert_ne!(seen[200 * 32..201 * 32], title[200 * 32..201 * 32]);
+    }
+
+    /// The streaming copy as [`copies_every_length_and_alignment`]: the
+    /// head, the blocks and the tail, with either side unaligned.
+    #[test]
+    fn streams_every_length_and_alignment() {
+        assert!(on());
+        let (a, b) = (Pages::new(1 << 17), Pages::new(1 << 17));
+        a.fill();
+        for len in [0usize, 1, 3, 31, 32, 33, 64, 95, 4095, 4096, 4097, 60_000, 100_003] {
+            for (da, sa) in [(0usize, 0usize), (1, 0), (0, 3), (5, 2), (31, 31), (32, 7), (17, 64)] {
+                // SAFETY: inside the two allocations.
+                unsafe {
+                    std::ptr::write_bytes(b.0, 0xEE, b.1);
+                    assert!(copy_streaming(b.0.add(da), a.0.add(sa), len));
+                    let (to, from) = (std::slice::from_raw_parts(b.0, b.1), std::slice::from_raw_parts(a.0, a.1));
+                    assert!(to[da..da + len] == from[sa..sa + len], "len {len} at {da} from {sa}");
+                    assert!(to[..da].iter().chain(&to[da + len..]).all(|&x| x == 0xEE), "len {len} at {da} from {sa}");
+                }
+            }
+        }
+    }
+
+    /// A source page that is not there, or not readable, fails the
+    /// streaming copy wherever it falls (in the head, the blocks or the
+    /// tail), and the same copy works once the page is back.
+    #[test]
+    fn a_stream_from_missing_memory_fails() {
+        assert!(on());
+        let (a, b) = (Pages::new(4 << 12), Pages::new(4 << 12));
+        a.fill();
+        let mut old = 0;
+        // (Where the copy starts, how long it is): the missing second page
+        // is met in the blocks, in the tail, in the head.
+        for (from, len) in [(0usize, 3 * 4096usize), (4096 - 100, 120), (4096 - 5, 10), (4090, 40)] {
+            for missing in [true, false] {
+                // SAFETY: our allocations; the second page of `a` is put back.
+                unsafe {
+                    std::ptr::write_bytes(b.0, 0xEE, b.1);
+                    if missing {
+                        VirtualFree(a.0.add(4096).cast(), 4096, MEM_DECOMMIT);
+                    } else {
+                        VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_NOACCESS, &mut old);
+                    }
+                    let done = copy_streaming(b.0.add(from), a.0.add(from), len);
+                    VirtualAlloc(a.0.add(4096).cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
+                    VirtualProtect(a.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
+                    assert!(!done, "from {from} len {len} missing {missing}");
+                    a.fill();
+                    assert!(copy_streaming(b.0.add(from), a.0.add(from), len));
+                    let (to, src) = (std::slice::from_raw_parts(b.0, b.1), std::slice::from_raw_parts(a.0, a.1));
+                    assert!(to[from..from + len] == src[from..from + len]);
+                }
+            }
+        }
     }
 
     /// The dwords that changed are stored, and no byte of any other, at

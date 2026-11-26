@@ -13,8 +13,13 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+<<<<<<< HEAD
     [hashtable]$More = @{},
     [switch]$NoPrebuild
+=======
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [hashtable]$More = @{}
+>>>>>>> d3f132d (GPU: lock all pipeline library calls on AMD by default and pin workers in Safe mode)
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -24,6 +29,7 @@ $settings = @{
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_PIPELINE_WORKERS = '1'; $settings.VICTORY_LIBRARY_LOCK = '1'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
@@ -46,6 +52,7 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+<<<<<<< HEAD
 try {
     if (-not $NoPrebuild) {
         # Every pipeline of the title's shader pack, made before the title needs one (the
@@ -55,3 +62,6 @@ try {
     }
     & $victory run $Exe --execute
 } finally { Pop-Location }
+=======
+try { & $victory run $Exe --console $Console --execute } finally { Pop-Location }
+>>>>>>> d3f132d (GPU: lock all pipeline library calls on AMD by default and pin workers in Safe mode)
