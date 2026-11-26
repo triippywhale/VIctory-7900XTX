@@ -1559,6 +1559,21 @@ pub(super) fn host_rdna() -> u32 {
     if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
 }
 
+/// VICTORY_PORTABLE_FLOAT_FAST=1: experiment with cheaper floating-point
+/// clamps on non-RDNA hosts. The shader fingerprint includes the switch.
+/// The ordered-constant median uses the host's min/max NaN and zero rules;
+/// validate those on the target GPU before enabling this for normal play.
+fn portable_float_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORTABLE_FLOAT_FAST").is_some_and(|v| v == "1"))
+}
+
+/// A normal nonzero literal rules out the case where both operands are
+/// signed zeros. Subnormals are excluded because a host may flush them.
+fn excludes_zero(value: Option<f32>) -> bool {
+    value.is_some_and(f32::is_normal)
+}
+
 /// The refusal of a first half of an interpolation whose result is read
 /// as data ([`Lower::interp`]).
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
@@ -4349,7 +4364,10 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
-        if host_rdna() & super::rdna::MAX_MIN != 0 {
+        if host_rdna() & super::rdna::MAX_MIN != 0
+            || portable_float_fast()
+                && (excludes_zero(self.s.m.float_k(a)) || excludes_zero(self.s.m.float_k(b)))
+        {
             return r;
         }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
@@ -4486,7 +4504,7 @@ impl<'a> Lower<'a> {
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         // Between two constants in order: the lower one for a NaN either way.
-        if host_rdna() & super::rdna::MED3 != 0 {
+        if host_rdna() & super::rdna::MED3 != 0 || portable_float_fast() {
             let k = [a, b, third].map(|x| self.s.m.float_k(x));
             let ordered = match k {
                 [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
@@ -14090,6 +14108,18 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn only_normal_literals_prove_signed_zero_fixup_unnecessary() {
+        use super::excludes_zero;
+        for value in [1.0, -1.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE, f32::MAX] {
+            assert!(excludes_zero(Some(value)));
+        }
+        for value in [0.0, -0.0, f32::from_bits(1), f32::NAN, f32::INFINITY] {
+            assert!(!excludes_zero(Some(value)));
+        }
+        assert!(!excludes_zero(None));
+    }
 
     #[test]
     fn shifted_thread_ids_are_uniform_only_when_every_lane_agrees() {
