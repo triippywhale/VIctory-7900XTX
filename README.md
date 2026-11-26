@@ -2,38 +2,53 @@
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+
+## The goal
+
+**A stable 30 fps or more without ray tracing, then as high a frame rate and as
+low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
+32 GB (later 16 GB) of RAM.
+
+The way there is **porting, not emulating**: patching the title's renderer so it
+behaves the way a PC renderer does, rather than having the layer watch and copy
+the console's shared memory every frame. Shaders are translated ahead of time
+into a versioned store that is kept between builds. Ray tracing stays optional
+and off by default. The picture comes after the frame rate: texture pop-in and
+lighting that is too bright or too dark when walking indoors are next in line.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+RX 7900 XTX, the Series X profile, ray tracing off.
 
 | | |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| City street, renderer patches 1+2 on | about 53 ms a frame (about 19 fps) |
+| Same scene before the patches | 57-75 ms (13-17 fps) |
+| Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
+| Memory | about 35 GB of private memory: **64 GB of RAM recommended** for now |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+It started at 280 ms a frame in the same scenes three days earlier.
+
+### Renderer patches (off by default while they are tested)
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
+| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
 
 What is known to be wrong:
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
+- Trees, signs and far objects flicker in the distance in some places.
+- Lighting is too bright or too dark after walking indoors, until the title has
+  run for a while; rooms with little direct light are too dark without `-RayTracing`.
 - Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
+- The first run of a new build stutters while the driver makes pipelines
+  (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
 ## How to run it
