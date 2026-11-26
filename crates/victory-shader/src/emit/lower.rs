@@ -6517,7 +6517,20 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's DXIL compiler (`amdxc64.dll+0x861b9f`) dereferences null when
+        // lowering `dx.op.getDimensions` on some heap-indexed `ByteAddressBuffer`
+        // handles marked uniform (`nonUniformIndex = false`). A buffer's size
+        // query takes a non-uniform handle of its own, not kept in
+        // `self.handles`, so the loads and stores stay uniform (from
+        // MalfoyDraco99 f80fd266).
+        let per_lane = self.x.res.waterfall.loads.contains(&site);
+        let h = if image.is_none() && !per_lane {
+            let index = self.heap_index(site, first, false)?;
+            let (index, bounded) = self.raw_twin(&src, index, false, props);
+            self.s.heap_handle_for_buffer_dim(self.cur, index, props, bounded)
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);

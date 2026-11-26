@@ -2955,3 +2955,80 @@ mod barycentric_tests {
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
 }
+
+#[cfg(all(test, windows))]
+#[test]
+fn raw_buffer_get_dimensions_compiles_on_host() {
+    use bitcode::{Attr, Cast, Term};
+    use host::Host;
+    use shader::Shader;
+    let mut s = Shader::new(false);
+    s.threads = Some([32, 1, 1]);
+    s.user_data = 4;
+    let e = s.entry;
+    let i32t = s.t.i32;
+    let cb = s.user_data_handle();
+    let zero = s.m.i32(0);
+    let four = s.m.i32(4);
+    let u = s.m.undef(i32t);
+    let cb_ret = s.op(
+        e,
+        "cbufferLoadLegacy.i32",
+        Attr::ReadOnly,
+        s.t.cbuf_ret,
+        59,
+        &[cb, zero],
+    );
+    let idx = s.m.extract(e, cb_ret, 0);
+    let idx2 = s.m.extract(e, cb_ret, 1);
+    let h_dim = s.heap_handle_for_buffer_dim(e, idx, (11, 0), false);
+    let dims_ty = s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+    let d = s.op(e, "getDimensions", Attr::ReadOnly, dims_ty, 72, &[h_dim, u]);
+    let dim = s.m.extract(e, d, 0);
+    let h_load = s.heap_handle(e, idx, false, false, (11, 0));
+    let mask1 = s.m.i8(1);
+    let res = s.op(
+        e,
+        "rawBufferLoad.f32",
+        Attr::ReadOnly,
+        s.t.res_ret,
+        139,
+        &[h_load, dim, u, mask1, four],
+    );
+    let val = s.m.extract(e, res, 0);
+    let val_i = s.m.cast(e, Cast::Bitcast, val, i32t);
+    let uav = s.heap_handle(e, idx2, false, false, (11 | 0x1000, 0));
+    s.op(
+        e,
+        "rawBufferStore.i32",
+        Attr::NoUnwind,
+        s.t.void,
+        140,
+        &[uav, zero, u, val_i, u, u, u, mask1, four],
+    );
+    s.m.terminate(e, Term::Ret);
+    let dxil = s.finish();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil,
+        user_data: vec![],
+        samplers: vec![],
+        static_samplers: vec![],
+        root_cbvs: vec![],
+        root_srvs: vec![],
+        root_uavs: vec![],
+        root_indexed_views: vec![],
+    };
+    host.compute_pipeline(&shader)
+        .expect("raw buffer getDimensions compute pipeline should compile");
+}
