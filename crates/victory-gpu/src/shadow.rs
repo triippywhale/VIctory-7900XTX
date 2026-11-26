@@ -4490,7 +4490,7 @@ impl Shadow {
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
             });
         } else {
-            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+            crate::host::copy_streamed(at, from as *const u8, to - from);
         }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
