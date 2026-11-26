@@ -6391,10 +6391,12 @@ mod tests {
             let size = if raw == 0 { null + 1 } else { 2 * raw };
             // SAFETY: a plain query of a live heap.
             assert_eq!(unsafe { heap.heap.GetDesc().NumDescriptors }, size);
-            assert_eq!(heap.dynamic, DYNAMIC);
+            // (The fork gives big heaps up to 4 x DYNAMIC dynamic slots: `dynamic_slots`.)
+            let dynamic = dynamic_slots(count, null);
+            assert_eq!(heap.dynamic, dynamic);
             assert!(heap.count + heap.dynamic <= null);
-            let first = heap.dynamic(DYNAMIC).expect("the whole dynamic range");
-            assert!(first + DYNAMIC - 1 < null);
+            let first = heap.dynamic(dynamic).expect("the whole dynamic range");
+            assert!(first + dynamic - 1 < null);
             assert_eq!(heap.dynamic(1), None);
         }
         // SAFETY: a plain query of the live device after the allocations.
