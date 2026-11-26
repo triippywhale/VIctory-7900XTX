@@ -110,8 +110,28 @@ const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads,
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
 
-/// The most steps of a submission done this way.
+/// The most steps of a submission done this way (`VICTORY_CARD_STEPS_MOST`
+/// to change it; in diagnostics builds `VICTORY_AB=..,VICTORY_STEPS_MANY`
+/// switches between this and four times as many while the title runs).
+///
+/// Why it can be raised: with ray tracing on, one fill of the title's ring a
+/// frame was refused for this ("too many steps depend on it") and the
+/// submitting thread stood ~16 ms for the flights instead (run rt-vram2).
+/// What bounds the work is [`BETWEEN`], the bytes our buffer holds, which
+/// refuses on its own ("too much at once").
 const MOST: usize = 12288;
+
+fn most() -> usize {
+    static MOST_SET: OnceLock<usize> = OnceLock::new();
+    let most = *MOST_SET.get_or_init(|| {
+        std::env::var("VICTORY_CARD_STEPS_MOST").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(MOST)
+    });
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_STEPS_MANY") == Some(true) {
+        return most * 4;
+    }
+    most
+}
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -291,7 +311,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         if writes.iter().any(|w| w.0 < w.1) {
             join_ranges(&mut written, writes);
         }
-        if taken.iter().filter(|t| **t).count() > MOST {
+        if taken.iter().filter(|t| **t).count() > most() {
             return Err("too many steps depend on it");
         }
         for (i, d) in does.iter().enumerate() {
