@@ -39,13 +39,15 @@ It started at 280 ms a frame in the same scenes three days earlier. What sets
 the frame now is the one thread that submits the title's work to the card
 (about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
 
-### Renderer patches (off by default while they are tested)
+### Renderer patches
+
+Ports 1 and 5 are on by default (`=0` turns either off): in ray-traced A/B runs they gave about 16 fps against 13-14, with prep 34 ms instead of ~60. The others stay off while they are tested.
 
 | Switch | What it does |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
+| `VICTORY_PORT_CONSTANTS` (on; `=0` off) | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
+| `VICTORY_PORT_CBV` (on; `=0` off) | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
 | `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
 
