@@ -3976,6 +3976,27 @@ impl Shadow {
         })
     }
 
+    /// Diagnostics: what a slow refresh of this copy had to go through.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn describe(&self, from: usize, to: usize) -> String {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let busy = pending.iter().filter(|&&(a, e)| a < to && e > from).count();
+        let busy_bytes: usize = pending.iter().filter(|&&(a, e)| a < to && e > from).map(|&(a, e)| e.min(to) - a.max(from)).sum();
+        format!(
+            "copy {} {:#x}+{:#x}: watched {}, on the card {}, changes only {}, window {}, {} ranges shaders write ({} of them over the refresh, {} KB)",
+            self.id,
+            self.start,
+            self.len,
+            self.watched.load(Ordering::Relaxed),
+            self.card.is_some(),
+            self.changes_only.load(Ordering::Relaxed),
+            self.window,
+            pending.len(),
+            busy,
+            busy_bytes >> 10
+        )
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
