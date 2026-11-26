@@ -3531,6 +3531,53 @@ fn land() {
     }
 }
 
+/// Whether [`land_after_submission`] hands the landing to a thread of its
+/// own (`VICTORY_LAND_ASIDE=1`; off unless set; `VICTORY_AB` can name it).
+fn land_aside() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_LAND_ASIDE") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"))
+}
+
+/// [`land`] at the end of a submission; with [`land_aside`] on a thread of
+/// its own (`victory-land-aside`, asked for no cores: on a 7900X3D it may
+/// run on the other complex, away from the submitting thread and its
+/// helpers). Resetting the lists of landed flights is the host's and the
+/// driver's work on their allocators, a tenth of the submitting thread's
+/// time in gameplay on a six-thread processor (fxceless profile of
+/// 2026-11-25), and nothing the submission that follows waits for: it takes
+/// a list from the idle ones, or makes one. [`land`] already runs on the
+/// thread that settles flights too, so two at once is nothing new. Port of
+/// PalmVIDev 1e0333e83's half (fxceless/victory-fork pull request #1146).
+fn land_after_submission() {
+    if !land_aside() {
+        land();
+        return;
+    }
+    static ASIDE: OnceLock<Option<Mutex<std::sync::mpsc::Sender<()>>>> = OnceLock::new();
+    let aside = ASIDE.get_or_init(|| {
+        let (send, asked) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("victory-land-aside".to_owned())
+            .spawn(move || {
+                while asked.recv().is_ok() {
+                    // One landing for all the asks so far.
+                    while asked.try_recv().is_ok() {}
+                    land();
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(send))
+    });
+    let sent = aside.as_ref().is_some_and(|send| send.lock().unwrap_or_else(|e| e.into_inner()).send(()).is_ok());
+    if !sent {
+        land();
+    }
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -5604,7 +5651,7 @@ impl Host {
         }
         drop(submitted);
         let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        land_after_submission();
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
