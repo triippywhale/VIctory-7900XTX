@@ -837,6 +837,124 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
+    let op_nonzero = |inst: &Inst, op: &Operand, d: u8, nonzero: &std::collections::HashSet<Value>| {
+        match *op {
+            Operand::Scalar { code: gfx10::NULL, .. }
+            | Operand::Const(128)
+            | Operand::Literal(0) => false,
+            Operand::Scalar { code, dwords } => {
+                let reg = Reg::S(code + if dwords > 1 { d } else { 0 });
+                inst.read(reg).is_none_or(|v| nonzero.contains(&v))
+            }
+            _ => true,
+        }
+    };
+    let scalar_side_effect = |inst: &Inst| -> bool {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Smem { .. } => name.contains("_store_") || name.contains("_atomic_"),
+            Fields::Sopp { .. } => matches!(
+                name,
+                "s_sendmsg" | "s_sendmsghalt" | "s_barrier" | "s_round_mode" | "s_denorm_mode"
+            ),
+            _ => false,
+        }
+    };
+    let section_side_effect = |inst: &Inst| -> bool {
+        let name = inst.name();
+        match &inst.fields {
+            Fields::Exp { .. } => true,
+            Fields::Ds { .. } => {
+                !(name.starts_with("ds_read")
+                    || name.starts_with("ds_swizzle")
+                    || name.contains("permute"))
+            }
+            Fields::Buffer { lds, .. } | Fields::Flat { lds, .. } => {
+                *lds || name.contains("store") || name.contains("atomic")
+            }
+            Fields::Image { .. } | Fields::Smem { .. } => {
+                name.contains("store") || name.contains("atomic")
+            }
+            Fields::Sopp { .. } => matches!(
+                name,
+                "s_barrier"
+                    | "s_sendmsg"
+                    | "s_sendmsghalt"
+                    | "s_wakeup"
+                    | "s_round_mode"
+                    | "s_denorm_mode"
+                    | "s_endpgm"
+                    | "s_endpgm_saved"
+                    | "s_endpgm_ordered_ps_done"
+                    | "s_code_end"
+            ),
+            Fields::Sop { .. } => {
+                name.starts_with("s_setpc")
+                    || name.starts_with("s_swappc")
+                    || name.starts_with("s_call")
+                    || name.starts_with("s_rfe")
+            }
+            Fields::Valu(_) | Fields::Vintrp { .. } => false,
+        }
+    };
+    let restore_name = if p.wave64 { "s_mov_b64" } else { "s_mov_b32" };
+    // Pure whole-wave sections inside a block: (start -> end, saved register code).
+    let pure_sections = |x: usize| -> std::collections::HashMap<usize, (usize, u8)> {
+        let insts = &p.blocks[x].insts;
+        let mut out = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < insts.len() {
+            let inst = &insts[i];
+            let all = match (p.wave64, inst.name()) {
+                (true, "s_or_saveexec_b64") | (false, "s_or_saveexec_b32") => {
+                    Some(Operand::Const(193))
+                }
+                (true, "s_nand_saveexec_b64") | (false, "s_nand_saveexec_b32") => {
+                    Some(Operand::Const(128))
+                }
+                _ => None,
+            };
+            let saved = match &inst.fields {
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code, .. }),
+                    src,
+                    ..
+                } if all.is_some_and(|k| src.first() == Some(&k)) => {
+                    inst.write(Reg::S(*code)).and_then(|lo| {
+                        if p.wave64 {
+                            inst.write(Reg::S(*code + 1)).map(|hi| (*code, lo, Some(hi)))
+                        } else {
+                            Some((*code, lo, None))
+                        }
+                    })
+                }
+                _ => None,
+            };
+            let Some((code, lo, hi)) = saved else {
+                i += 1;
+                continue;
+            };
+            let end = (i + 1..insts.len()).find(|&j| {
+                let c = &insts[j];
+                c.name() == restore_name
+                    && c.write(Reg::S(EXEC)).is_some()
+                    && (!p.wave64 || c.write(Reg::S(EXEC + 1)).is_some())
+                    && c.read(Reg::S(code)) == Some(lo)
+                    && hi.is_none_or(|h| c.read(Reg::S(code + 1)) == Some(h))
+            });
+            let Some(end) = end else {
+                i += 1;
+                continue;
+            };
+            if insts[i + 1..end].iter().any(section_side_effect) {
+                i += 1;
+                continue;
+            }
+            out.insert(i, (end, code));
+            i = end + 1;
+        }
+        out
+    };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -860,16 +978,271 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 return None;
             }
         }
-        // the join sees no scalar the region changed
+        // No EXEC-independent scalar side effects inside the skipped region,
+        // and EXEC must stay 0 throughout when entered with EXEC == 0 (except
+        // inside a pure whole-wave section whose restore returns EXEC to 0).
+        let branch = p.blocks[b].insts.last()?;
+        let entry_exec = [branch.read(Reg::S(EXEC)), branch.read(Reg::S(EXEC + 1))];
+        let mut inside_defs = std::collections::HashSet::new();
+        let mut block_sections = vec![std::collections::HashMap::new(); n];
+        let mut section_vgpr_writes = std::collections::HashSet::new();
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                inside_defs.insert(phi.value);
+            }
+            let secs = pure_sections(x);
+            let mut i = 0;
+            while i < p.blocks[x].insts.len() {
+                let inst = &p.blocks[x].insts[i];
+                for &(_, w) in &inst.writes {
+                    inside_defs.insert(w);
+                }
+                if let Some(&(end, _)) = secs.get(&i) {
+                    for j in i + 1..end {
+                        for &(r, w) in &p.blocks[x].insts[j].writes {
+                            inside_defs.insert(w);
+                            if matches!(r, Reg::V(_)) {
+                                section_vgpr_writes.insert(w);
+                            }
+                        }
+                    }
+                    for &(_, w) in &p.blocks[x].insts[end].writes {
+                        inside_defs.insert(w);
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                if scalar_side_effect(inst) {
+                    return None;
+                }
+                i += 1;
+            }
+            block_sections[x] = secs;
+        }
+        // Least fixpoint of values that may be nonzero when EXEC enters `inside` as 0.
+        // External values are conservatively nonzero except the branch's own EXEC dwords.
+        let mut nonzero: std::collections::HashSet<Value> = std::collections::HashSet::new();
+        let mark_external = |v: Value, nz: &mut std::collections::HashSet<Value>| {
+            if !inside_defs.contains(&v) && !entry_exec.contains(&Some(v)) {
+                nz.insert(v);
+            }
+        };
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                for &a in &phi.args {
+                    mark_external(a, &mut nonzero);
+                }
+            }
+            for inst in &p.blocks[x].insts {
+                for &(_, v) in &inst.reads {
+                    mark_external(v, &mut nonzero);
+                }
+            }
+        }
+        let mut nz_changed = true;
+        while nz_changed {
+            nz_changed = false;
+            for x in (0..n).filter(|&x| inside[x]) {
+                for phi in &p.blocks[x].phis {
+                    if phi.args.iter().any(|a| nonzero.contains(a)) {
+                        nz_changed |= nonzero.insert(phi.value);
+                    }
+                }
+                let secs = &block_sections[x];
+                let insts = &p.blocks[x].insts;
+                let mut i = 0;
+                while i < insts.len() {
+                    let inst = &insts[i];
+                    if let Some(&(end, code)) = secs.get(&i) {
+                        // Whole-wave section: saved scalar gets incoming EXEC; restore sets EXEC from saved.
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                            if let (Some(e_in), Some(sv)) =
+                                (inst.read(exec_r), inst.write(Reg::S(code + d as u8)))
+                                && nonzero.contains(&e_in)
+                            {
+                                nz_changed |= nonzero.insert(sv);
+                            }
+                        }
+                        for j in i + 1..end {
+                            for &(_, w) in &insts[j].writes {
+                                nz_changed |= nonzero.insert(w);
+                            }
+                        }
+                        let rest = &insts[end];
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                            if let Some(e_out) = rest.write(exec_r)
+                                && rest
+                                    .read(Reg::S(code + d as u8))
+                                    .is_none_or(|sv| nonzero.contains(&sv))
+                            {
+                                nz_changed |= nonzero.insert(e_out);
+                            }
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                    let name = inst.name();
+                    let exec_in_nz = [
+                        inst.read(Reg::S(EXEC))
+                            .is_none_or(|v| nonzero.contains(&v)),
+                        inst.read(Reg::S(EXEC + 1))
+                            .is_none_or(|v| nonzero.contains(&v)),
+                    ];
+                    match &inst.fields {
+                        Fields::Valu(_) if name.starts_with("v_cmpx") => {
+                            for (d, r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
+                                if let Some(w) = inst.write(r)
+                                    && exec_in_nz[d]
+                                {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                        }
+                        Fields::Sop { dst, src, .. }
+                            if matches!(
+                                name,
+                                "s_and_saveexec_b32"
+                                    | "s_and_saveexec_b64"
+                                    | "s_andn2_saveexec_b32"
+                                    | "s_andn2_saveexec_b64"
+                                    | "s_and_wrexec_b32"
+                                    | "s_and_wrexec_b64"
+                                    | "s_andn2_wrexec_b32"
+                                    | "s_andn2_wrexec_b64"
+                            ) =>
+                        {
+                            let dst_code = match dst {
+                                Some(Operand::Scalar { code, .. }) => Some(*code),
+                                _ => None,
+                            };
+                            for &(r, w) in &inst.writes {
+                                let is_nz = if r == Reg::S(EXEC) {
+                                    exec_in_nz[0]
+                                } else if r == Reg::S(EXEC + 1) {
+                                    exec_in_nz[1]
+                                } else if dst_code.is_some_and(|c| r == Reg::S(c)) {
+                                    exec_in_nz[0]
+                                } else if dst_code.is_some_and(|c| r == Reg::S(c + 1)) {
+                                    exec_in_nz[1]
+                                } else {
+                                    true
+                                };
+                                if is_nz {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                            let _ = src;
+                        }
+                        Fields::Sop {
+                            dst: Some(Operand::Scalar { code, .. }),
+                            src,
+                            ..
+                        } if matches!(
+                            name,
+                            "s_mov_b32"
+                                | "s_mov_b64"
+                                | "s_and_b32"
+                                | "s_and_b64"
+                                | "s_andn2_b32"
+                                | "s_andn2_b64"
+                        ) =>
+                        {
+                            for &(r, w) in &inst.writes {
+                                let lane_d = if r == Reg::S(*code) {
+                                    Some(0u8)
+                                } else if r == Reg::S(*code + 1) {
+                                    Some(1u8)
+                                } else {
+                                    None
+                                };
+                                let is_nz = match (lane_d, name, &src[..]) {
+                                    (Some(d), "s_mov_b32" | "s_mov_b64", [s0]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                    }
+                                    (Some(d), "s_and_b32" | "s_and_b64", [s0, s1]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                            && op_nonzero(inst, s1, d, &nonzero)
+                                    }
+                                    (Some(d), "s_andn2_b32" | "s_andn2_b64", [s0, _]) => {
+                                        op_nonzero(inst, s0, d, &nonzero)
+                                    }
+                                    _ => true,
+                                };
+                                if is_nz {
+                                    nz_changed |= nonzero.insert(w);
+                                }
+                            }
+                        }
+                        _ => {
+                            for &(_, w) in &inst.writes {
+                                nz_changed |= nonzero.insert(w);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        // Reject if EXEC can become nonzero anywhere outside a pure whole-wave section.
+        for x in (0..n).filter(|&x| inside[x]) {
+            for phi in &p.blocks[x].phis {
+                if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                    && nonzero.contains(&phi.value)
+                {
+                    return None;
+                }
+            }
+            let secs = &block_sections[x];
+            let insts = &p.blocks[x].insts;
+            let mut i = 0;
+            while i < insts.len() {
+                if let Some(&(end, _)) = secs.get(&i) {
+                    for &(r, w) in &insts[end].writes {
+                        if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                            && nonzero.contains(&w)
+                        {
+                            return None;
+                        }
+                    }
+                    i = end + 1;
+                    continue;
+                }
+                for &(r, w) in &insts[i].writes {
+                    if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) && nonzero.contains(&w) {
+                        return None;
+                    }
+                }
+                i += 1;
+            }
+        }
+        // the join sees no scalar (or non-zero EXEC, or whole-wave-clobbered VGPR) the region changed
         let join = &p.blocks[target];
         for phi in &join.phis {
-            let scalar = match phi.reg {
-                Reg::S(c) => c != 126 && c != 127,
-                Reg::Scc => true,
-                Reg::V(_) => false,
-            };
+            if matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                if (!deep || live.contains(&phi.value))
+                    && join
+                        .preds
+                        .iter()
+                        .zip(&phi.args)
+                        .any(|(q, a)| inside[*q] && nonzero.contains(a))
+                {
+                    return None;
+                }
+                continue;
+            }
+            if matches!(phi.reg, Reg::V(_)) {
+                if join
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .any(|(q, a)| inside[*q] && section_vgpr_writes.contains(a))
+                {
+                    return None;
+                }
+                continue;
+            }
             // (a join nothing reads shows no one the difference)
-            if !scalar || deep && !live.contains(&phi.value) {
+            if deep && !live.contains(&phi.value) {
                 continue;
             }
             let before: Vec<Value> =
@@ -982,12 +1355,29 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     post
 }
 
-/// Recomputes every block's predecessors from the exits.
+/// Recomputes reachable blocks' predecessors from reachable exits and clears
+/// unreachable blocks so dead edges cannot pollute `preds` or SSA renaming.
 fn link(blocks: &mut [Block]) {
-    for block in blocks.iter_mut() {
-        block.preds.clear();
+    if blocks.is_empty() {
+        return;
     }
-    for b in 0..blocks.len() {
+    let order = reverse_postorder(blocks);
+    let mut reachable = vec![false; blocks.len()];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        block.preds.clear();
+        if !reachable[b] {
+            block.insts.clear();
+            block.phis.clear();
+            block.exit = Exit::End;
+        }
+    }
+    for (b, &live) in reachable.iter().enumerate() {
+        if !live {
+            continue;
+        }
         for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
         }
@@ -1079,7 +1469,8 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
         let Some((from, _)) = irreducible_edge(blocks, &order, &index) else {
             return Ok(());
         };
-        let found = multi_entry_loop(blocks, &vec![true; blocks.len()]);
+        let reachable: Vec<bool> = index.iter().map(|&i| i != usize::MAX).collect();
+        let found = multi_entry_loop(blocks, &reachable);
         let Some((region, mut entries)) = found.filter(|_| blocks.len() < limit) else {
             return Err(ShaderError::Unsupported {
                 offset: blocks[from].offset,
@@ -1467,8 +1858,37 @@ fn effects(
             } else if let Some(d) = &v.dst {
                 if dst_indexed {
                     indexed(d, &mut w)?;
+                    indexed(d, &mut r)?;
                 } else {
                     regs(d, &mut w)?;
+                    let reads_dst = matches!(
+                        name,
+                        "v_fmac_f32"
+                            | "v_mac_f32"
+                            | "v_mac_legacy_f32"
+                            | "v_fmac_f16"
+                            | "v_mac_f16"
+                            | "v_pk_fmac_f16"
+                            | "v_dot2c_f32_f16"
+                            | "v_dot4c_i32_i8"
+                            | "v_writelane_b32"
+                    ) || (matches!(name, "v_permlane16_b32" | "v_permlanex16_b32")
+                        && v.opsel & 2 == 0)
+                        || v.opsel & 8 != 0
+                        || matches!(
+                            v.dpp,
+                            Some(gfx10::Dpp::Row {
+                                row_mask,
+                                bank_mask,
+                                bound_ctrl,
+                                ..
+                            }) if row_mask != 0xF || bank_mask != 0xF || !bound_ctrl
+                        )
+                        || matches!(v.sdwa, Some(sd) if sd.dst_unused == 2 && sd.dst_sel < 6)
+                        || (v.sdwa.is_none_or(|sd| sd.dst_unused == 2) && valu_writes_half(name));
+                    if reads_dst {
+                        regs(d, &mut r)?;
+                    }
                 }
             }
             if let Some(c) = &v.carry {
@@ -1483,9 +1903,6 @@ fn effects(
                 }
                 "v_swaprel_b32" => {
                     indexed(&v.src[0], &mut w)?;
-                    if let Some(d) = &v.dst {
-                        indexed(d, &mut r)?;
-                    }
                 }
                 "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
@@ -1497,6 +1914,9 @@ fn effects(
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
             r.push(Reg::S(M0));
+            if name == "v_interp_p2_f32" {
+                regs(dst, &mut r)?;
+            }
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -1510,6 +1930,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_d16") {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
             if *gds
@@ -1542,6 +1965,9 @@ fn effects(
             if let Some(d) = data {
                 if name.contains("_load_") {
                     if !lds {
+                        if load_preserves_half(name) {
+                            regs(d, &mut r)?;
+                        }
                         regs(d, &mut w)?;
                     }
                 } else if name.contains("_store_") {
@@ -1561,6 +1987,8 @@ fn effects(
             addr,
             rsrc,
             sampler,
+            dmask,
+            d16,
             cache,
             ..
         } => {
@@ -1575,6 +2003,9 @@ fn effects(
                     regs(&atomic_result(data, name), &mut w)?;
                 }
             } else {
+                if *d16 && !name.starts_with("image_gather4") && dmask.count_ones() % 2 == 1 {
+                    regs(data, &mut r)?;
+                }
                 regs(data, &mut w)?;
             }
         }
@@ -1589,6 +2020,9 @@ fn effects(
                 regs(o, &mut r)?;
             }
             if let Some(d) = dst {
+                if name.contains("_load_") && load_preserves_half(name) {
+                    regs(d, &mut r)?;
+                }
                 regs(d, &mut w)?;
             }
         }
@@ -1608,6 +2042,45 @@ fn effects(
         new
     });
     Ok(Some((r, w)))
+}
+
+/// Whether a VALU opcode writes a single 16-bit half of its destination VGPR
+/// (preserving the other 16-bit half on GFX10 unless overridden by SDWA).
+fn valu_writes_half(name: &str) -> bool {
+    if name.starts_with("v_cmp")
+        || name.starts_with("v_pk_")
+        || name.starts_with("v_pack_")
+        || name.starts_with("v_cvt_pk")
+        || name.starts_with("v_sad_")
+        || name.starts_with("v_dot")
+        || matches!(
+            name,
+            "v_mad_u32_u16" | "v_mad_i32_i16" | "v_interp_p1ll_f16" | "v_interp_p1lv_f16"
+        )
+    {
+        return false;
+    }
+    if let Some(rest) = name.strip_prefix("v_cvt_") {
+        return rest.starts_with("f16_")
+            || rest.starts_with("u16_")
+            || rest.starts_with("i16_")
+            || rest.starts_with("norm_i16_")
+            || rest.starts_with("norm_u16_");
+    }
+    name.ends_with("_f16")
+        || name.ends_with("_u16")
+        || name.ends_with("_i16")
+        || name.ends_with("_b16")
+}
+
+/// Whether a D16 memory load writes an odd number of 16-bit halves, preserving
+/// the untouched half of its final destination VGPR.
+fn load_preserves_half(name: &str) -> bool {
+    name.ends_with("_d16")
+        || name.ends_with("_d16_hi")
+        || name.ends_with("_d16_x")
+        || name.ends_with("_d16_hi_x")
+        || name.ends_with("_d16_xyz")
 }
 
 /// Scalar ALU opcodes that set SCC (carry, overflow, comparison, or "result
@@ -1762,6 +2235,55 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn a_skip_is_kept_when_body_resurrects_exec_or_has_scalar_side_effects() {
+        // Restoring an outer saved EXEC inside the skipped body resurrects skipped lanes.
+        let restore_outer = skip(&[0xBEFE_040C, 0x7E02_0285], &[]); // s_mov_b64 exec, s[12:13]; v_mov_b32 v1, 5
+        assert!(without_skips(&restore_outer, false).is_none());
+        assert!(without_skips(&restore_outer, true).is_none());
+
+        // Widening EXEC via s_or_b64 or s_andn2_b64 with non-zero src0 resurrects lanes.
+        let or_exec = skip(&[0x88FE_0C7E, 0x7E02_0285], &[]); // s_or_b64 exec, exec, s[12:13]; v_mov_b32 v1, 5
+        assert!(without_skips(&or_exec, false).is_none());
+        assert!(without_skips(&or_exec, true).is_none());
+
+        let andn2_swapped = skip(&[0x8AFE_7E0C, 0x7E02_0285], &[]); // s_andn2_b64 exec, s[12:13], exec
+        assert!(without_skips(&andn2_swapped, false).is_none());
+        assert!(without_skips(&andn2_swapped, true).is_none());
+
+        // Narrowing EXEC and restoring the inner saved mask keeps EXEC == 0: skip may be dropped.
+        let inner_narrow = skip(
+            &[
+                0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            ],
+            &[],
+        );
+        assert_eq!(skips(&without_skips(&inner_narrow, false).expect("left out")), 0);
+
+        // EXEC-independent scalar side effects (s_sendmsg, s_barrier, s_buffer_store_dword)
+        // must keep the skip.
+        let with_sendmsg = skip(&[0xBF90_0001], &[]); // s_sendmsg 1
+        assert!(without_skips(&with_sendmsg, false).is_none());
+        assert!(without_skips(&with_sendmsg, true).is_none());
+
+        let with_barrier = skip(&[0xBF8A_0000], &[]); // s_barrier
+        assert!(without_skips(&with_barrier, false).is_none());
+        assert!(without_skips(&with_barrier, true).is_none());
+
+        let with_sstore = skip(&[0xF460_0180, 0xFA00_0000], &[]); // s_buffer_store_dword s6, s[0:3], 0
+        assert!(
+            with_sstore
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_buffer_store_dword")
+        );
+        assert!(without_skips(&with_sstore, false).is_none());
+        assert!(without_skips(&with_sstore, true).is_none());
     }
 
     #[test]
@@ -2144,5 +2666,93 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn unreachable_block_falling_through_to_live_block_does_not_corrupt_ssa() {
+        // 0: s_branch +1 -> jumps over the unreachable s_mov at offset 4 into offset 8.
+        let p = build_words(
+            &[
+                0xBF82_0001, // 0: s_branch +1 (-> 8)
+                0xBE81_0381, // 4: s_mov_b32 s1, 1 (unreachable, falls through to 8)
+                0xBE80_0300, // 8: s_mov_b32 s0, s0
+                S_ENDPGM,    // 12: s_endpgm
+            ],
+            false,
+        );
+        let target = p.blocks.iter().find(|b| b.offset == 8).expect("live target block");
+        assert_eq!(target.preds, [0]);
+        assert!(target.phis.is_empty());
+        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.inputs[0].0, Reg::S(0));
+        assert_eq!(target.insts[0].read(Reg::S(0)), Some(p.inputs[0].1));
+    }
+
+    #[test]
+    fn unreachable_block_branching_to_entry_does_not_break_entry_inputs() {
+        // 8: dead s_branch -3 targeting offset 0 after s_endpgm.
+        let p = build_words(
+            &[
+                0xBE80_0300, // 0: s_mov_b32 s0, s0
+                S_ENDPGM,    // 4: s_endpgm
+                0xBF82_FFFD, // 8: s_branch -3 (-> 0, unreachable)
+            ],
+            false,
+        );
+        assert!(p.blocks[0].preds.is_empty());
+        assert!(p.blocks[0].phis.is_empty());
+        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.inputs[0].0, Reg::S(0));
+        assert_eq!(p.blocks[0].insts[0].read(Reg::S(0)), Some(p.inputs[0].1));
+    }
+
+    #[test]
+    fn operand_reads_includes_implicit_destination_reads_for_rmw_and_partial_writes() {
+        let words: &[u32] = &[
+            0x560A_0401, // 0: v_fmac_f32 v5, s1, v2 (reads accumulator v5)
+            0x060A_0401, // 1: v_add_f32 v5, s1, v2 (overwrites v5)
+            0xD761_0005,
+            0x0001_0001, // 2: v_writelane_b32 v5, s1, 0 (keeps other lanes of v5)
+            0xC815_0001, // 3: v_interp_p2_f32 v5, v1, attr0.x (accumulates into v5)
+            0xC814_0001, // 4: v_interp_p1_f32 v5, v1, attr0.x (overwrites v5)
+            0x640A_0401, // 5: v_add_f16 v5, s1, v2 (preserves high half of v5)
+            0x7E0A_02FA,
+            0xFF00_1101, // 6: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:0 (preserves v5 on OOB)
+            0x7E0A_02FA,
+            0xFF08_1101, // 7: v_mov_b32 v5, v1 row_shr:1 bound_ctrl:1 (writes all active lanes)
+            0xD778_0005,
+            0x0201_0101, // 8: v_permlanex16_b32 v5, v1, 0, 0 (BOUND_CTRL=0 preserves v5)
+            0xD778_1005,
+            0x0201_0101, // 9: v_permlanex16_b32 v5, v1, 0, 0 bound_ctrl:1 (overwrites active lanes)
+            0x7E0A_02F9,
+            0x0606_1401, // 10: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+            0x7E0A_02F9,
+            0x0606_0401, // 11: v_mov_b32_sdwa v5, v1 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+            0xDA98_0000,
+            0x0500_0001, // 12: ds_read_u16_d16 v5, v1 (preserves high half of v5)
+            0xD8D8_0000,
+            0x0500_0001, // 13: ds_read_b32 v5, v1 (overwrites v5)
+            S_ENDPGM,
+        ];
+        let p = build_words(words, false);
+        let insts = &p.blocks[0].insts;
+        let reads_v5 = |idx: usize, expected_name: &str| {
+            assert_eq!(insts[idx].name(), expected_name);
+            operand_reads(&p, &insts[idx]).contains(&Reg::V(5))
+        };
+        assert!(reads_v5(0, "v_fmac_f32"));
+        assert!(!reads_v5(1, "v_add_f32"));
+        assert!(reads_v5(2, "v_writelane_b32"));
+        assert!(reads_v5(3, "v_interp_p2_f32"));
+        assert!(!reads_v5(4, "v_interp_p1_f32"));
+        assert!(reads_v5(5, "v_add_f16"));
+        assert!(reads_v5(6, "v_mov_b32"));
+        assert!(!reads_v5(7, "v_mov_b32"));
+        assert!(reads_v5(8, "v_permlanex16_b32"));
+        assert!(!reads_v5(9, "v_permlanex16_b32"));
+        assert!(reads_v5(10, "v_mov_b32"));
+        assert!(!reads_v5(11, "v_mov_b32"));
+        assert!(reads_v5(12, "ds_read_u16_d16"));
+        assert!(!reads_v5(13, "ds_read_b32"));
     }
 }

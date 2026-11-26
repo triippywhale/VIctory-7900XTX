@@ -96,6 +96,8 @@ mod own_bits;
 mod permlane_tests;
 mod rect;
 mod sampler;
+#[cfg(all(test, windows))]
+mod image_lod_tests;
 mod shader;
 mod threading;
 #[cfg(windows)]
@@ -709,6 +711,11 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
+    // DXIL reads SV_Coverage via `dx.op.coverage` (NotInSig); keep it out of
+    // pixel ISG1 if a console container listed it there.
+    if pixel {
+        inputs.retain(|e| e.kind != 14);
+    }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
@@ -1507,6 +1514,33 @@ mod tests {
     fn a_backward_permute_reads_the_lane_its_address_names() {
         // v_mov_b32 v2, 11; ds_bpermute_b32 v1, v0, v2
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// `ds_permute_b32` scatters through the console's zero-initialized
+    /// scratch: each lane gives its data register to the lane its address
+    /// names, within the calling lane's 32-lane half, and reads the slot of
+    /// its own name. It stopped as "an LDS operation".
+    #[test]
+    fn a_scatter_permute_writes_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// The scatter's barriers need every lane of the group: in a branch
+    /// this refuses (a wave-wide structuring of the block would open it).
+    #[test]
+    fn a_scatter_permute_in_a_branch_is_refused() {
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
+            0xBF88_0002, // s_cbranch_execz 2
+            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+            0x0100_0200,
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        ];
+        let e = stores_v1(&body).unwrap_err().to_string();
+        assert!(e.contains("a scatter permute in a branch"), "{e}");
     }
 
     /// A carry-in reading a join of compares after a divergent branch. A
@@ -2313,7 +2347,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -2341,21 +2375,53 @@ mod tests {
             v.validate(&mut dxil).unwrap();
         }
         #[cfg(windows)]
-        if let Ok(host) = super::host::Host::new(false) {
+        for warp in [false, true] {
+            let Ok(host) = super::host::Host::new(warp) else {
+                continue;
+            };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
-                dxil,
-                user_data: l.user_data,
+                dxil: dxil.clone(),
+                user_data: l.user_data.clone(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                7.0f32,
+                3.0,
+                -1.0,
+                1e-40,
+                1.0,
+                1e35,
+                1e-35,
+                1e-36,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                -1e35,
+                1e35,
+                0.0,
+                1.0,
+                -0.0,
+                1.0,
+                0.0,
+                -2.0,
+                1.0,
+                f32::INFINITY,
+                -1.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                1e38,
+                1e-38,
+                -1e38,
+                1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -2378,29 +2444,37 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
-            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
             assert!(
                 (got[2] - 1e-35).abs() <= 1e-40,
-                "lane 2 got {:?} ({:#x})",
+                "warp={warp} lane 2 got {:?} ({:#x})",
                 got[2],
                 out[0][2]
             );
             assert!(
                 (got[3] - 10.0).abs() < 1e-5,
-                "lane 3 got {:?} ({:#x})",
+                "warp={warp} lane 3 got {:?} ({:#x})",
                 got[3],
                 out[0][3]
             );
-            assert_eq!(out[0][4], 0xFFC0_0000);
-            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert_eq!(out[0][4], 0xFFC0_0000, "warp={warp} 0/0");
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits(), "warp={warp} -1/0");
             assert!(
                 (got[6] - (-1.0)).abs() < 1e-6,
-                "lane 6 got {:?} ({:#x})",
+                "warp={warp} lane 6 got {:?} ({:#x})",
                 got[6],
                 out[0][6]
             );
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "warp={warp} +0/1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "warp={warp} -0/1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "warp={warp} +0/-2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
         }
     }
 }

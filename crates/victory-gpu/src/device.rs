@@ -75,10 +75,10 @@ const LEVEL_IIDS: [Iid; 9] = [
         [0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b],
     ),
     guid(
-        0x728f1fa2,
-        0xea11,
-        0x4a9f,
-        [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9],
+        0x9218_e6bb,
+        0xf944,
+        0x4f7e,
+        [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
     ),
     guid(
         0x5405c344,
@@ -90,8 +90,17 @@ const LEVEL_IIDS: [Iid; 9] = [
 
 /// Whether `iid` names the device: its first interface or a newer level.
 pub(crate) fn is_device(iid: *const Iid) -> bool {
-    object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
+    object::is(iid, &[IID, DEVICE8_EARLIER]) || object::is(iid, &LEVEL_IIDS)
 }
+
+/// The `ID3D12Device8` IID this table held before the released one: still
+/// answered, in case a caller was built against it.
+const DEVICE8_EARLIER: Iid = guid(
+    0x728f1fa2,
+    0xea11,
+    0x4a9f,
+    [0x9b, 0x52, 0x9b, 0x42, 0xa4, 0x84, 0xd5, 0xc9],
+);
 
 /// The interface version these layouts were checked against (2.4). Both
 /// Minecraft (March 2022) and the title (April 2026) pass it.
@@ -556,6 +565,21 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    #[test]
+    fn device8_uses_the_released_sdk_iid() {
+        let device8 = guid(
+            0x9218_e6bb,
+            0xf944,
+            0x4f7e,
+            [0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3],
+        );
+        assert_eq!(
+            guid_text(&LEVEL_IIDS[7]),
+            "9218e6bb-f944-4f7e-a75c-b1b2c7b701f3"
+        );
+        assert_eq!(create_as(&device8), (S_OK, super::device()));
     }
 
     #[test]

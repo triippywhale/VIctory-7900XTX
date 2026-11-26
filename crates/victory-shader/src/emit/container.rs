@@ -235,15 +235,12 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
-        let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+        // As the PSV writer does: each arbitrary semantic name, repeats
+        // included; system values and empty names at offset 0.
+        let name = if e.kind == 0 && !e.name.is_empty() {
+            let at = strings.len();
+            strings.extend(e.name.bytes().chain([0]));
+            at
         } else {
             0
         };
@@ -300,10 +297,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -488,5 +481,39 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn psv_repeats_arbitrary_semantic_names() {
+        let bytes = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[element(0, 0, 4), element(1, 0, 4)],
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            geometry: None,
+        });
+        let strings = b"\0TEXCOORD\0TEXCOORD\0\0";
+        assert_eq!(bytes[56..60], (strings.len() as u32).to_le_bytes());
+        assert_eq!(&bytes[60..60 + strings.len()], strings);
     }
 }

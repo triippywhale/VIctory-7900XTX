@@ -892,6 +892,36 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The source pair of two adjacent dword moves in one block.
+    fn moved_pair(&self, k: Key) -> Option<Key> {
+        let moved = |v| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
+                return None;
+            };
+            if inst.write(Reg::S(*dst)) != Some(v) {
+                return None;
+            }
+            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
+        };
+        let (lb, ld, ls, lv) = moved(k.0)?;
+        let (hb, hd, hs, hv) = moved(k.1)?;
+        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs))
+            .then_some((lv, hv))
+    }
+
     fn exec(&mut self, inst: &Inst) -> Bool {
         match self.key(|r| inst.read(r), EXEC) {
             Some(k) => self.mask(k).0,
@@ -914,26 +944,37 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let (m, derived) = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => {
+                        let m = def(lo)
+                            .and_then(|i| self.sop(i))
+                            .and_then(|r| r.dst)
+                            .map(|d| d.1);
+                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
+                    }
+                    _ => {
+                        let copied = self.moved_pair(k).and_then(|source| {
+                            let (m, derived) = self.mask(source);
+                            self.b
+                                .support(m)
+                                .iter()
+                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .then_some((m, derived))
+                        });
+                        copied.map_or_else(
+                            || (None, exec_write(lo, k.0) || exec_write(hi, k.1)),
+                            |(m, derived)| (Some(m), derived),
+                        )
+                    }
+                };
                 // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // lowering takes the high dword written beside it.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)
@@ -1247,10 +1288,11 @@ impl<'a> Lanes<'a> {
                     }
                 }
                 // `s_bcnt1` of a mask every running lane sees alike (EXEC under a scalar
-                // condition, or EXEC itself): its SCC, "some lane is set", is each lane's own
-                // bit. A branch on it then reads no ballot.
+                // condition, or EXEC itself): its SCC, "some lane is set", is `m` itself
+                // (`finish` simplifies `given(when, cond[b])` when EXEC matches block reach,
+                // while preserving narrowed EXEC for both exits and `scc_some`).
                 if takes_mask
-                    && name.starts_with("s_bcnt1_i32_b")
+                    && name.strip_prefix("s_bcnt1_i32_b") == Some(width)
                     && let Some(scc) = inst.write(Reg::Scc)
                     && let [a] = &src[..]
                     && let Some((m, true)) = self.operand(inst, a)
@@ -1260,7 +1302,7 @@ impl<'a> Lanes<'a> {
                     if self.b.implies(m, e)
                         && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
                     {
-                        self.scc_lane.insert(scc, own);
+                        self.scc_lane.insert(scc, m);
                     }
                 }
             }
@@ -1733,6 +1775,47 @@ mod tests {
     }
 
     #[test]
+    fn paired_dword_moves_keep_exec_mask_provenance() {
+        let p = build(
+            &[
+                0xBE82_047E, // s_mov_b64 s[2:3], exec
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0303, // s_mov_b32 s5, s3
+                0xBE86_0304, // s_mov_b32 s6, s4
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xBEFE_0406, // s_mov_b64 exec, s[6:7]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn paired_dword_moves_do_not_make_unknown_values_into_masks() {
+        let p = build(
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0301, // s_mov_b32 s5, s1
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let guard = s.guards[0][3].expect("unknown mask still guards the vector op");
+        assert!(
+            s.bools
+                .support(guard)
+                .iter()
+                .any(|a| matches!(a, Atom::Opaque(_)))
+        );
+    }
+
+    #[test]
     fn a_mask_joined_over_a_back_edge_with_a_rewritten_high_dword_is_not_the_compare() {
         let p = build(
             &[
@@ -1885,6 +1968,96 @@ mod tests {
                 .iter()
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_preserves_narrowed_exec_in_exits_and_scc_some() {
+        // Wave32: narrow EXEC inside block 0, count active lanes with s_bcnt1_i32_b32,
+        // restore EXEC, and branch on SCC == 0.
+        let p = build(
+            &[
+                0x7D84_0080, // 0: v_cmp_eq_u32 vcc, 0, v0
+                0xBE80_3C6A, // 4: s_and_saveexec_b32 s0, vcc_lo
+                0xBE81_0F7E, // 8: s_bcnt1_i32_b32 s1, exec_lo
+                0xBEFE_0300, // 12: s_mov_b32 exec_lo, s0
+                0xBF84_0001, // 16: s_cbranch_scc0 +1 -> 24
+                0x7E02_0280, // 20: v_mov_b32 v1, 0
+                S_ENDPGM,    // 24: s_endpgm
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let bcnt_scc = p.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .expect("s_bcnt1 writes SCC");
+        let &scc_bool = s.scc_some.get(&bcnt_scc).expect("s_bcnt1 tracked in scc_some");
+        assert_ne!(scc_bool, Bool::TRUE, "scc_some must not collapse narrowed EXEC to TRUE");
+        assert!(
+            matches!(s.bools.support(scc_bool)[..], [Atom::Lane(_)]),
+            "scc_some must preserve the narrowed lane predicate: {:?}",
+            s.bools.support(scc_bool)
+        );
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("expected branch exit on block 0");
+        };
+        assert_ne!(when, Bool::FALSE, "s_cbranch_scc0 must not become dead (FALSE)");
+        assert!(
+            matches!(s.bools.support(when)[..], [Atom::Lane(_)]),
+            "branch condition must depend on narrowed EXEC lane predicate: {:?}",
+            s.bools.support(when)
+        );
+    }
+
+    #[test]
+    fn s_bcnt1_ignores_mismatched_wave_width() {
+        // Wave32 running s_bcnt1_i32_b64 (counts both s[2:3], wider than wave32).
+        let p32 = build(
+            &[
+                0xBE82_037E, // s_mov_b32 s2, exec_lo
+                0xBE83_0381, // s_mov_b32 s3, 1
+                0xBE81_1002, // s_bcnt1_i32_b64 s1, s[2:3]
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s32 = structure(&p32).unwrap();
+        let bcnt64_scc = p32.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b64")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s32.scc_some.contains_key(&bcnt64_scc),
+            "wave32 must not treat s_bcnt1_i32_b64 as a wave32 lane-mask test"
+        );
+
+        // Wave64 running s_bcnt1_i32_b32 (counts only low 32 lanes of exec).
+        let p64 = build(
+            &[
+                0xBE81_0F7E, // s_bcnt1_i32_b32 s1, exec_lo
+                0xBF84_0001, // s_cbranch_scc0 +1
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s64 = structure(&p64).unwrap();
+        let bcnt32_scc = p64.blocks[0]
+            .insts
+            .iter()
+            .find(|i| i.name() == "s_bcnt1_i32_b32")
+            .and_then(|i| i.write(Reg::Scc))
+            .unwrap();
+        assert!(
+            !s64.scc_some.contains_key(&bcnt32_scc),
+            "wave64 must not treat s_bcnt1_i32_b32 as a full wave64 lane-mask test"
         );
     }
 }

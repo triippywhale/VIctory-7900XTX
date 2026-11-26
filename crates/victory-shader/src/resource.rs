@@ -837,6 +837,7 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1034,6 +1035,7 @@ impl<'a> Tracer<'a> {
                     return false;
                 };
                 inst.name() == "v_add_co_ci_u32"
+                    && !f.clamp
                     && f.src[..2.min(f.src.len())]
                         .iter()
                         .any(|o| self.vterm(inst, o).is_some_and(high_of))
@@ -1052,6 +1054,7 @@ impl<'a> Tracer<'a> {
             return false;
         };
         inst.name() == "v_add_co_ci_u32"
+            && !f.clamp
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
@@ -2401,15 +2404,16 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { .. }) => Some(Moved::Const(0)),
         ("s_mov_b32", Operand::Literal(x)) => Some(Moved::Const(x)),
         ("s_mov_b32", Operand::Const(c)) => inline(c).map(Moved::Const),
-        // shortcut: only the one-operand ways the compiler makes a constant
-        // that has no inline form; fold more if descriptors need it.
+        // Unary operations can supply a descriptor word from an immediate.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
+        ("s_brev_b32", Operand::Literal(x)) => Some(Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
         // shortcut: a literal below 2^31, whose high dword is 0 whether the
         // hardware extends it with zeros or with its sign.
         ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
             Some(Moved::Const(if k == 0 { x } else { 0 }))
         }
+        ("s_not_b32", Operand::Literal(x)) if inst.writes.get(k)?.0 != Reg::Scc => Some(Moved::Const(!x)),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
@@ -2476,6 +2480,34 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+        }
+    }
+
+    #[test]
+    fn literal_scalar_operations_can_build_immediate_sampler_words() {
+        for (first, second) in [
+            ([0xBE88_03FF, 0x92], [0xBE89_03FF, 0x00FF_F000]),        // s_mov_b32
+            ([0xBE88_0BFF, 0x4900_0000], [0xBE89_03FF, 0x00FF_F000]), // s_brev_b32
+            ([0xBE88_03FF, 0x92], [0xBE89_07FF, 0xFF00_0FFF]),        // s_not_b32
+        ] {
+            let mut words = vec![
+                0xBE82_0308, // s_mov_b32 s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            ];
+            words.extend(first);
+            words.extend(second);
+            words.extend([
+                0xBE8A_0BA8, // s_brev_b32 s10, 40
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ]);
+            let r = track_words(&words, &[param(Table, 8, 1)], HwStage::Ps);
+            let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
+            assert_eq!(sampler.source, Source::Constant(vec![0x92, 0x00FF_F000, 0x1400_0000, 0]));
         }
     }
 

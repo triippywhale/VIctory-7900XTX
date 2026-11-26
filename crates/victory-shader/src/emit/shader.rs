@@ -97,6 +97,9 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// `[earlydepthstencil]` (`ForceEarlyDepthStencil`): depth and stencil
+    /// are tested before the program runs. It has no feature bit.
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -575,9 +578,11 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
+                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -587,6 +592,10 @@ impl Shader {
                 if !used {
                     self.flags &= !flag;
                 }
+            }
+            let input_usage = self.m.input_usage(self.inputs.len());
+            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
+                e.usage = mask;
             }
         }
         // Unordered views outside pixel and compute programs (memory by
