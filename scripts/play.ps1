@@ -4,13 +4,17 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
+#               otherwise runs first, with the same settings: long once per new build or driver,
+#               then only what is new
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [switch]$NoPrebuild
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -35,4 +39,12 @@ Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-O
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try {
+    if (-not $NoPrebuild) {
+        # Every pipeline of the title's shader pack, made before the title needs one (the
+        # first loading screen otherwise stutters while the driver makes them).
+        & $victory translate --cache --pipelines (Split-Path -Parent $Exe)
+        if ($LASTEXITCODE -ne 0) { Write-Host "The pipeline pre-build failed ($LASTEXITCODE); starting anyway." }
+    }
+    & $victory run $Exe --execute
+} finally { Pop-Location }
