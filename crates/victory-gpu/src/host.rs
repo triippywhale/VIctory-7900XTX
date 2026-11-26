@@ -162,6 +162,26 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    vram_keep_at(budget, used, vram_early())
+}
+
+/// Whether host copies of textures the title fills are let go earlier
+/// (`VICTORY_VRAM_EARLY=1`; off by default): from 82 % of the card's budget
+/// down to 78 %, and from 90 % the shortly idle ones down to 80 %, where
+/// [`vram_keep`] otherwise starts at 88 and 95 %; and a slot keeps the
+/// texture it showed (`keep_shown` of the host heap) only while the card
+/// has room. After Belobug 81ebb7b (its RX 9070 XT branch, a 16 GB card).
+/// On a 7900 XT the title fills the budget: 94 to 97 % of 17 to 19.6 GB was
+/// in use in the warm run of 2026-11-26, with 70,600 waits for new card
+/// memory. Off by default: the earlier marks let go of more that is made
+/// again (see [`vram_keep`]), so it is to be measured first.
+pub(crate) fn vram_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// [`vram_keep`] with its marks said: `early` as [`vram_early`].
+fn vram_keep_at(budget: u64, used: u64, early: bool) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
     const SHORT_MS: u64 = 1_500;
@@ -169,12 +189,15 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    // From where the idle ones go, from where the shortly idle ones go, and
+    // what each comes down to.
+    let (from, past, to, short_to) = if early { (82, 90, 78, 80) } else { (88, 95, 85, 85) };
+    if used < share(from) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(past) {
+        (IDLE_MS, used - share(to))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(short_to))
     }
 }
 
@@ -10534,14 +10557,19 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::vram_keep_at;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
+        assert_eq!(vram_keep_at(100 * gib, 87 * gib, false).0, 600_000);
         // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
+        let (ms, bytes) = vram_keep_at(100 * gib, 90 * gib, false);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        assert_eq!(vram_keep_at(100 * gib, 120 * gib, false), (1_500, 35 * gib));
+        assert_eq!(vram_keep_at(0, 7, false).0, 5_000);
+        // `VICTORY_VRAM_EARLY=1` (after Belobug 81ebb7b): from 82 and 90 %.
+        assert_eq!(vram_keep_at(100 * gib, 81 * gib, true).0, 600_000);
+        assert_eq!(vram_keep_at(100 * gib, 85 * gib, true), (5_000, 7 * gib));
+        assert_eq!(vram_keep_at(100 * gib, 95 * gib, true), (1_500, 15 * gib));
+        assert_eq!(vram_keep_at(100 * gib, 120 * gib, true), (1_500, 40 * gib));
     }
 
     #[test]
