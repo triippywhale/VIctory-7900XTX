@@ -8828,12 +8828,6 @@ impl Meter {
                     "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                     crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
                 );
-                tracing::info!(
-                    "textures made smaller while the card was full (VICTORY_SHRINK_WHEN_FULL={}), since the start: {}, asked to grow again: {}",
-                    crate::resource::shrink_levels(),
-                    crate::resource::SHRUNK_COUNT[0].load(Ordering::Relaxed),
-                    crate::resource::SHRUNK_COUNT[1].load(Ordering::Relaxed)
-                );
                 crate::tiles::status();
                 {
                     let [queued, due, away, partly, oldest] =

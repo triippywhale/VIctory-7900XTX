@@ -1369,102 +1369,6 @@ pub(crate) fn want_level(this: This, first: u32) {
     }
 }
 
-/// Levels left out of new host copies of placed textures while the card is
-/// full ([`shrink_levels`]); 0: none.
-#[cfg(windows)]
-static SHRINK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Host copies made smaller by [`SHRINK`]: the title texture and the first
-/// level its views show, to be grown by [`grow_shrunk`].
-#[cfg(windows)]
-static SHRUNK: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
-
-/// Since the start: host copies made smaller while the card was full, and
-/// such copies asked to grow again.
-#[cfg(windows)]
-pub(crate) static SHRUNK_COUNT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-/// How many levels new host copies of placed textures leave out while the
-/// card has no room for whole ones (`VICTORY_SHRINK_WHEN_FULL`, 2: a
-/// sixteenth of the bytes; 0: none, and such textures wait for room as
-/// before). Waiting, a texture the title streamed in while the card was
-/// full showed black (or grey) until room came, which with every copy held
-/// by a slot of the title's heap was often never (run-addr0: 17,301 slots
-/// waiting at the end).
-#[cfg(windows)]
-pub(crate) fn shrink_levels() -> u32 {
-    static LEVELS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LEVELS.get_or_init(|| {
-        std::env::var("VICTORY_SHRINK_WHEN_FULL").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(2, |l| l.min(4))
-    })
-}
-
-/// Whether new host copies of placed textures are made smaller from now on
-/// ([`shrink_levels`]), by the texture pass.
-#[cfg(windows)]
-pub(crate) fn set_shrink(on: bool) {
-    SHRINK.store(if on { shrink_levels() } else { 0 }, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The card's memory in use as [`room`] counts it, and the budget.
-#[cfg(windows)]
-fn room_used(memory: Option<[u64; 4]>) -> Option<(u64, u64)> {
-    let [budget, used, ..] = memory?;
-    let used = used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept();
-    Some((used, budget))
-}
-
-/// Whether smaller host copies ([`shrink_levels`]) may still be made with
-/// the card past [`room`]'s line: under 97 % of the budget, past which the
-/// system moves the card's memory into the PC's.
-#[cfg(windows)]
-pub(crate) fn room_for_smaller(memory: Option<[u64; 4]>) -> bool {
-    shrink_levels() > 0 && room_used(memory).is_some_and(|(used, budget)| used < budget / 100 * 97)
-}
-
-/// Asks up to `most` host copies made smaller to grow to the levels their
-/// views show ([`want_level`]: made anew at their next use), while the card
-/// is well under [`room`]'s line (8 points under: growing takes room, and
-/// at the line new copies would be made smaller again). Returns how many.
-#[cfg(windows)]
-pub(crate) fn grow_shrunk(memory: Option<[u64; 4]>, most: usize) -> usize {
-    use std::sync::atomic::Ordering::Relaxed;
-    let Some((used, budget)) = room_used(memory) else {
-        return 0;
-    };
-    if used >= budget / 100 * room_percent().saturating_sub(8) {
-        return 0;
-    }
-    let take: Vec<(usize, u32)> = {
-        let mut shrunk = SHRUNK.lock().unwrap_or_else(|e| e.into_inner());
-        let n = shrunk.len().min(most);
-        shrunk.drain(..n).collect()
-    };
-    if take.is_empty() {
-        return 0;
-    }
-    let mut spans = Vec::new();
-    {
-        let all = textures();
-        for (at, first) in take {
-            // Still alive (a texture leaves the table before it is freed,
-            // under this lock).
-            if all.contains(&at) {
-                want_level(at as This, first);
-                spans.extend(crate::texture::title_span(at as This, first));
-            }
-        }
-    }
-    // Their slots are due at the next pass, as if their memory had been
-    // mapped again: made from the copy grown and uploaded then (nothing
-    // else looks at a slot done with its rechecks).
-    for &(at, len) in &spans {
-        crate::descriptor::host::remapped(at as usize, len as usize);
-    }
-    SHRUNK_COUNT[1].fetch_add(spans.len() as u64, Relaxed);
-    spans.len()
-}
-
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
 /// their bytes; made again after that and their bytes; and host copies made
@@ -1906,18 +1810,6 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
-            }
-            // The card is full: a smaller copy now rather than none
-            // ([`shrink_levels`]), grown when there is room again.
-            let drop = SHRINK.load(Relaxed);
-            if drop > 0 {
-                let first = if first == u32::MAX { 0 } else { first };
-                let smaller = base_level(&r.desc, first.saturating_add(drop));
-                if smaller > base {
-                    base = smaller;
-                    SHRUNK.lock().unwrap_or_else(|e| e.into_inner()).push((this as usize, first));
-                    SHRUNK_COUNT[0].fetch_add(1, Relaxed);
-                }
             }
         }
         let texture = match texture {

@@ -2140,11 +2140,6 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
-        // Past the line, new host copies are made smaller while there is
-        // still room for them (`resource::shrink_levels`), rather than
-        // none: the slot shows its texture blurred instead of black.
-        let mut smaller = !room && crate::resource::room_for_smaller(memory);
-        crate::resource::set_shrink(smaller);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2152,20 +2147,13 @@ impl State {
         let mut since_asked = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
-            if smaller {
-                once!("textures picked by index: the card has no room for whole ones; they are made smaller");
-            } else {
-                once!("textures picked by index: the card has no room for more; they wait");
-            }
+            once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
             host.texture_slots_room(frame);
-            // And copies made smaller while it was full grow again, a few
-            // a pass, well under the line.
-            crate::resource::grow_shrunk(memory, 64);
         }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
@@ -2366,7 +2354,7 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room && !smaller {
+            if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
@@ -2600,12 +2588,9 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if (room || smaller) && since_asked >= 32 << 20 {
+            if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                let memory = crate::host::host().and_then(|h| h.video_memory());
-                room = crate::resource::room(memory);
-                smaller = !room && crate::resource::room_for_smaller(memory);
-                crate::resource::set_shrink(smaller);
+                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
