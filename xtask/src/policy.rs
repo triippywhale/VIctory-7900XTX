@@ -11,7 +11,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 // (The translator's one file, emit/lower.rs, is about 655 KiB of source.)
-const MAX_FILE_SIZE: usize = 640 * 1024;
+const MAX_FILE_SIZE: usize = 768 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
