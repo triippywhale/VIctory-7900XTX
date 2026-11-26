@@ -1,5 +1,5 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
-//! memory (`VICTORY_PORT_CONSTANTS`, off by default).
+//! memory (`VICTORY_PORT_CONSTANTS`, on by default; `=0` off).
 //!
 //! What the title does (game_scarlett_master.exe, the routine at image
 //! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
@@ -68,14 +68,14 @@ const LOW: u64 = 1 << 32;
 /// while the heap stands.
 const MOST: u64 = 512 << 20;
 
-/// `VICTORY_PORT_CONSTANTS`: `1` turns renderer port #1 on (title buffers
+/// `VICTORY_PORT_CONSTANTS`: renderer port #1, on by default (title buffers
 /// and windows of title memory in the title's 32-bit graphics memory, view
-/// memory that is one stretch of a section, used in place); unset or
-/// anything else: off, everything as before.
+/// memory that is one stretch of a section, used in place); `0`: off,
+/// everything as before.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| !std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.

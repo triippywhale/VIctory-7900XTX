@@ -1,5 +1,5 @@
 //! Renderer port #5: the title's constant buffers read by the card where the
-//! title has them (`VICTORY_PORT_CBV=1`, off by default; read in [`on`]).
+//! title has them (`VICTORY_PORT_CBV`, on by default and `=0` off; read in [`on`]).
 //!
 //! What the console allows: a constant buffer anywhere on 16 bytes. What
 //! D3D12 asks: a constant buffer view on 256. So the layer made every
