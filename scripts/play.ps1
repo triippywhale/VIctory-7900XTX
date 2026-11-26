@@ -7,6 +7,13 @@
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new
+# -CleanCache   before the pre-build, throw away the made pipelines and the translated shaders
+#               (<cache>\pipelines\host-pipelines.*, prebuilt-pipelines.txt, warm-done.txt and
+#               <cache>\shaders), so that everything is made again from this build. Keeps what
+#               only runs can find out: known-*.bin, early-, slow-, crashed-pipelines.txt and
+#               warm-bad.txt. For artifacts that look like a stale cache, not for every run: the
+#               pre-build after it is a cold one (minutes; far longer with VICTORY_LIBRARY_LOCK=1).
+#               The driver's own shader cache is not touched (AMD Software: Reset Shader Cache).
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -14,7 +21,8 @@ param(
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [switch]$NoPrebuild
+    [switch]$NoPrebuild,
+    [switch]$CleanCache
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -47,6 +55,27 @@ if ($discarded) {
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try {
+    if ($CleanCache) {
+        # A running victory.exe has the library mapped and writes to these folders.
+        if (Get-Process -Name victory -ErrorAction SilentlyContinue) {
+            Write-Host "victory.exe is running; close it before -CleanCache."; exit 1
+        }
+        $line = & $victory config | Where-Object { $_ -match '^cache_dir\s*:' } | Select-Object -First 1
+        if (-not $line) { Write-Host "Could not read cache_dir from 'victory config'."; exit 1 }
+        $cache = ($line -replace '^cache_dir\s*:\s*', '').Trim()
+        $made = Join-Path $cache 'pipelines'
+        $gone = @(
+            'host-pipelines.bin', 'host-pipelines.next', 'prebuilt-pipelines.txt', 'warm-done.txt'
+        ) | ForEach-Object { Join-Path $made $_ }
+        $gone += Join-Path $cache 'shaders'
+        $bytes = 0
+        foreach ($path in $gone | Where-Object { Test-Path $_ }) {
+            $bytes += (Get-ChildItem $path -Recurse -File -Force | Measure-Object Length -Sum).Sum
+            Remove-Item $path -Recurse -Force
+        }
+        Write-Host ("Cleared {0:N0} MB of made pipelines and translated shaders from {1}." -f ($bytes / 1MB), $cache)
+        if ($NoPrebuild) { Write-Host "-NoPrebuild: the run itself will make every pipeline it meets (stutter)." }
+    }
     if (-not $NoPrebuild) {
         # Every pipeline of the title's shader pack, made before the title needs one (the
         # first loading screen otherwise stutters while the driver makes them).
