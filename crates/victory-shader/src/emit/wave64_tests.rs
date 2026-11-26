@@ -146,6 +146,96 @@ fn lowered_counted(
 }
 
 #[test]
+fn wave32_lds_read_runs_share_a_barrier() {
+    use super::bitcode::census::{self, CAPTURE_FOR_TEST};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    // Each thread reads its own word and its partner's in the other half,
+    // before and after overwriting its LDS word. The second write must
+    // wait for both reads, and the next read must see the new write.
+    let mut native = native(&[
+        0x3402_0082,             // v_lshlrev_b32 v1, 2, v0
+        0x3A04_00A0,             // v_xor_b32 v2, 32, v0
+        0x3404_0482,             // v_lshlrev_b32 v2, 2, v2
+        0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+        0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000,             // s_barrier
+        0xD8D8_0000, 0x0300_0002, // ds_read_b32 v3, v2
+        0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, 0x0400_0001, // ds_read_b32 v4, v1
+        0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+        0x4A0E_00C0,             // v_add_nc_u32 v7, 64, v0
+        0xD834_0000, 0x0000_0701, // ds_write_b32 v1, v7
+        0xD8D8_0000, 0x0500_0002, // ds_read_b32 v5, v2
+        0xD8D8_0000, 0x0600_0001, // ds_read_b32 v6, v1
+        0xBF8C_C07F,             // s_waitcnt lgkmcnt(0)
+        0x4A06_0903,             // v_add_nc_u32 v3, v3, v4
+        0x4A08_0D05,             // v_add_nc_u32 v4, v5, v6
+        0x3402_0083,             // v_lshlrev_b32 v1, 3, v0
+        0xE074_1000, 0x8002_0301, // buffer_store_dwordx2 v[3:4], v1, s[8:11], 0 offen
+    ]);
+    let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+    cs.rsrc2 |= 1 << 15;
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let capture = CAPTURE_FOR_TEST.replace(true);
+    let translate = |host_wave| {
+        let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).expect("lower LDS reads");
+        let stats = census::take(&shader.dxil).expect("census for LDS shader");
+        let barriers = stats.counts[census::KINDS.iter().position(|&kind| kind == "barrier").unwrap()];
+        (shader, barriers)
+    };
+    let (shader, wave32) = translate(32);
+    let (_, wave64) = translate(64);
+    CAPTURE_FOR_TEST.set(capture);
+    let waits = super::group_sync() != 0;
+    assert_eq!(wave64, 1, "native wave64 keeps its explicit barrier");
+    assert_eq!(wave32, if waits { 4 } else { 7 }, "wave32 LDS barriers");
+    eprintln!("wave32 LDS barriers: {wave32}; wave64 LDS barriers: {wave64}");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone()).expect("validate the LDS read runs");
+        eprintln!("DXIL validator accepted the LDS read runs");
+    }
+    if !waits {
+        return;
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; LDS dispatch skipped");
+        return;
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the output has the layout and size required by OPTIONS1.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }.expect("query wave capabilities");
+    if !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32) {
+        eprintln!("the device does not support wave32; LDS dispatch skipped");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 LDS read pipeline");
+    let result = host.dispatch(&root, &pso, &Dispatch {
+        roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+        views: &[View::RawUav(128)],
+        samplers: &[],
+        groups: [1, 1, 1],
+    }).expect("dispatch the LDS read runs");
+    assert_eq!(result[0].len(), 128);
+    for (thread, values) in result[0].chunks_exact(2).enumerate() {
+        let thread = thread as u32;
+        let sum = thread + (thread ^ 32);
+        assert_eq!(values, [sum, sum + 128], "thread {thread}");
+    }
+    eprintln!("all 64 lanes observed the old and new LDS values");
+}
+
+#[test]
 fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     // thread t holds the 16-bit float with bits 0x3C00 + 37 t (1.0 and up, with odd
     // mantissas, so that additions round); all of them store the wave's sum
