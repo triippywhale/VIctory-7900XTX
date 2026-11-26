@@ -164,9 +164,7 @@ pub(super) unsafe fn send(
         super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
     }
-    let Some((bounce, _)) = slot.bounce.clone() else {
-        return None;
-    };
+    let (bounce, _) = slot.bounce.clone()?;
     // SAFETY: the slot's last submission has run (it came back with its
     // plan); the caller's for the buffers.
     let recorded = unsafe {
