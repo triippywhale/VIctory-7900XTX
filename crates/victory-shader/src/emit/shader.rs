@@ -202,7 +202,7 @@ thread_local! {
     pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
+/// Renderer port 5 (`VICTORY_PORT_CBV`; on by default, `=0` off): constant buffers are read as raw
 /// bytes, a table's through the raw twin of its slot ([`raw_views`]), a root one as a root SRV,
 /// so the host can give the card the title's bytes where they are (16-byte aligned, which a
 /// constant buffer view cannot take) instead of a copy made at every submission. The host's
@@ -214,7 +214,7 @@ pub fn constants_raw() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| !std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "0"))
 }
 
 /// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).

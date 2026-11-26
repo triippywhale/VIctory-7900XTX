@@ -1123,10 +1123,10 @@ pub(crate) fn lift_thread() {
     }
 }
 
-/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS`, on unless `=0`; the GPU side's half is
 /// `victory_gpu`'s `port`): read here for xmem's part, [`arrange`].
 fn port_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| !std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "0"));
     *ON
 }
 
