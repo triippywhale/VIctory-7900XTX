@@ -4134,15 +4134,17 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} constants copied on the card behind such a copy (VICTORY_PLACED_FILLS)",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            t[4],
         );
     }
     card_steps::log(frames);
     crate::port::log(frames);
+    crate::port_cbv::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -7543,6 +7545,13 @@ impl HostList {
         let known = self.deferred().filled.get(&key).copied();
         if known.is_some() {
             return known;
+        }
+        // Bytes a copy at its place in this list wrote: copied on the card
+        // behind it ([`HostList::placed_constants`]), not filled at
+        // submission. (Not remembered for later asks: a later copy may write
+        // them again.)
+        if let Some((_, gpu)) = self.placed_constants(src as usize, len as usize) {
+            return Some(gpu);
         }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
