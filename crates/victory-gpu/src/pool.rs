@@ -374,6 +374,31 @@ pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
 
+/// Diagnostics, for the memory line: of the texture blocks' free bytes,
+/// those in blocks with nothing in them, and those that lie in whole free
+/// parts of 16, 4 and 1 MiB at their multiples: what blocks of that size
+/// could give back to the card where these cannot.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn free_parts() -> [u64; 5] {
+    let pool = lock(&TEXTURES);
+    let mut out = [0u64; 5];
+    for block in pool.blocks.iter().flatten() {
+        if block.free.whole(BLOCK) {
+            out[1] += BLOCK;
+        }
+        for (&start, &len) in &block.free.0 {
+            out[0] += len;
+            for (i, part) in [16u64 << 20, 4 << 20, 1 << 20].into_iter().enumerate() {
+                let from = start.next_multiple_of(part);
+                if start + len > from {
+                    out[2 + i] += (start + len - from) / part * part;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Part of a block of mapped upload memory, back in the pool when dropped.
 pub(crate) struct StagingPiece(Piece);
 
