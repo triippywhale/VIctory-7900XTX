@@ -124,7 +124,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -394,10 +394,19 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+///
+/// A program refused at a lane mask with lanes elsewhere read as data is
+/// translated once more with mask operations on numbers read as the
+/// numbers they compute (`lower::with_mask_ops_on_numbers`), and only such
+/// a program: with that on for every program, 69 compute programs that
+/// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| translate_plain(container))
         }
         other => other,
     }
@@ -429,6 +438,28 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// [`emit`] with the same second tries as [`translate`] (first halves of
+/// interpolations as pairs, mask operations on numbers), for tools that
+/// run the stages themselves.
+pub fn emit_with_retries(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| emit(c, native, p, st, io, res))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| emit(c, native, p, st, io, res))
+        }
+        other => other,
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -1175,6 +1206,94 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// A level query (`image_get_lod`) of a 2D array passes no array slice:
+    /// DXIL's `CalculateLOD` takes the spatial coordinates only and the
+    /// validator refuses a defined third one ("out of bound coord must be
+    /// undef"), whatever the program left in that register.
+    #[test]
+    fn a_level_query_of_an_array_takes_no_slice() {
+        use crate::native::{ResourceType, RootParam, UsedResource};
+        let mut words = vec![
+            0xBE81_0380u32,
+            0xBE83_0380, // s1, s3 = 0 (upper halves of the tables)
+            0xF40C_0400,
+            0xFA00_0000, // 2D array SRV to s[16:23] from s[0:1]
+            0xF408_0601,
+            0xFA00_0000, // sampler to s[24:27] from s[2:3]
+        ];
+        for (reg, value) in [0.25f32, 0.5, 7.0].iter().enumerate() {
+            words.extend([0x7E00_02FF | ((reg as u32) << 17), value.to_bits()]);
+        }
+        words.extend([
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            // image_get_lod v[10:11], v[0:2], s[16:23], s[24:27] dmask:0x3 dim:2D_ARRAY
+            0xF000_0328 | (0x60 << 18),
+            0x00C4_0A00,
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xF800_180F,
+            0x0B0A_0B0A, // exp mrt0, v10, v11, v10, v11 done vm
+            0xBF81_0000,
+        ]);
+        let table = |slot, user_data| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let range = |kind, words, slot, user_data| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: words,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 12,
+            layout: vec![table(0, 0), table(1, 2)],
+            used: vec![range(ResourceType::Srv, 8, 0, 0), range(ResourceType::Sampler, 4, 1, 2)],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let osg1 = container::signature(&[target], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).expect("the level query validates");
+        }
     }
 
     /// A pixel program with an ordered section, as the console compiler

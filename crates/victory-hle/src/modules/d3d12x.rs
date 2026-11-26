@@ -51,6 +51,20 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Of the cached translations met since the start: those an earlier build
+/// of the translator made, those translated again, and those that came out
+/// different (`victory_gpu::shader_cache`).
+pub fn stale_shaders() -> (u64, u64, u64) {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::stale_counts()
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0, 0)
+    }
+}
+
 /// The fork's offline warm-up (`victory translate --warm`), by
 /// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {

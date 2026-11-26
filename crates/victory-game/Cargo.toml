@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 memchr.workspace = true
 zlib-rs.workspace = true
+# The shader pack's zlib streams are found by inflating at each candidate
+# offset (`shaderpack`), as upstream does.
+miniz_oxide.workspace = true
 
 [lints]
 workspace = true

@@ -110,8 +110,13 @@ use):
 Tools and diagnostics:
 - `victory translate <shader file> --warm all --jobs N` translates every
   shader ahead of a run, on the processor only (about 4.5 to 6.5 minutes
-  here); the shader cache is keyed on the translator's source, so a new
-  build that does not touch the translator starts warm.
+  here); the shader cache is keyed on the translator's version
+  (`victory_shader::TRANSLATOR_VERSION`, bumped with any change of what it
+  makes), so a new build starts warm unless the version moved. Entries an
+  earlier build of the same version made are served; `victory shaders`
+  translates them again and says how many came out different
+  (`VICTORY_SHADER_FRESH=1` does so in a run, `VICTORY_SHADER_KEY=source`
+  keys by the translator's source as before).
 - Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
   a copy-back is about to put back to older values: none found in 138,000
   copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census

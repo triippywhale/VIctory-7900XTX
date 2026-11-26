@@ -233,6 +233,98 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+/// `translate --cache`: every distinct container found goes through the
+/// shader cache a run reads (`<cache>/shaders`), by the run's code, so a
+/// run finds it translated or refused. With `pipelines`, the host device
+/// is made first (a run translates with the facts it gives: wave size,
+/// view heap clamp and heap map), and then the shader pack's pipelines go
+/// into the pipeline library (`prebuild`). Without it no device is made
+/// and, as for `--warm`, `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` must
+/// say what the run's log says of the host.
+pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let cfg = victory_core::Config::load()?;
+    // The shader cache, and the pipeline library beside it, as a run
+    // sets them (`d3d12x::use_shader_cache`).
+    let shaders = cfg.cache_subdir("shaders")?;
+    victory_hle::modules::d3d12x::use_shader_cache(shaders.clone());
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
+    if pipelines {
+        if std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
+            // The key listing (diagnostics) translates nothing.
+            return crate::prebuild::run(&paths, threads);
+        }
+        anyhow::ensure!(
+            victory_gpu::pipeline::start_prebuild(),
+            "no host device: the pre-build makes pipelines on the host GPU"
+        );
+    }
+    let started = std::time::Instant::now();
+    let seen = Mutex::new(HashSet::new());
+    // Containers translated now, already cached, refused.
+    let counts = [const { AtomicUsize::new(0) }; 3];
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            if jobs.is_empty() {
+                continue;
+            }
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            // As the title passes it: the container's own size
+                            // (a raw source runs on to the end of the file).
+                            let size = bytes
+                                .get(0x18..0x1c)
+                                .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4")) as usize);
+                            let container = &bytes[..size.min(bytes.len())];
+                            if !lock(&seen).insert(blake3::hash(container)) {
+                                continue;
+                            }
+                            let k = match victory_hle::modules::d3d12x::warm_shader(container) {
+                                Ok(true) => 0,
+                                Ok(false) => 1,
+                                Err(_) => 2,
+                            };
+                            counts[k].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            let n = |i: usize| counts[i].load(Ordering::Relaxed);
+            eprintln!(
+                "{}: {} containers; all files so far: {} translated, {} cached already, {} refused, {:.0} s",
+                entry.path().display(),
+                jobs.len(),
+                n(0),
+                n(1),
+                n(2),
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let [translated, cached, refused] = counts.map(AtomicUsize::into_inner);
+    println!("cache        {}", shaders.display());
+    println!(
+        "containers   {} in {:.1} s on {threads} threads: {cached} already cached, {translated} translated, {refused} refused",
+        translated + cached + refused,
+        started.elapsed().as_secs_f64()
+    );
+    if pipelines {
+        crate::prebuild::run(&paths, threads)?;
+    }
+    Ok(())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -394,7 +486,7 @@ pub fn run(
 }
 
 /// Every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -404,6 +496,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
+    let lines = Mutex::new(Vec::<String>::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -431,8 +524,13 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                                     }
                                 }
                                 Err(why) => {
+                                    let hex = hash.to_hex()[..16].to_owned();
+                                    if list.is_some() {
+                                        let line = format!("{hex}	{}{}	{why}", entry.path().display(), job.label());
+                                        lock(&lines).push(line);
+                                    }
                                     let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
+                                    failed.entry(why).or_insert((0, hex)).0 += 1;
                                 }
                             }
                         }
@@ -442,12 +540,30 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
         }
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some(list) = &list {
+        let mut lines = lines.into_inner().unwrap_or_else(|e| e.into_inner());
+        lines.sort();
+        std::fs::write(list, lines.join("
+") + "
+")?;
+    }
     println!(
         "{} shaders in the cache, {} do not translate, {:.0} s",
         done.load(Ordering::Relaxed),
         failed.values().map(|f| f.0).sum::<usize>(),
         started.elapsed().as_secs_f64()
     );
+    let (stale, refreshed, changed) = victory_hle::modules::d3d12x::stale_shaders();
+    if stale > 0 {
+        println!(
+            "{refreshed} of {stale} translations an earlier build of the translator had cached translated again, {changed} came out different{}",
+            if changed > 0 {
+                " (a change of the translator's output: victory_shader::TRANSLATOR_VERSION should have been bumped)"
+            } else {
+                ""
+            }
+        );
+    }
     for (why, (n, hash)) in failed {
         println!("  {n:>5}  {why}  (e.g. {hash})");
     }
@@ -605,7 +721,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    match emit::emit_with_retries(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
