@@ -222,6 +222,7 @@ impl<B, F: FenceProbe> UploadPoolCore<B, F> {
     /// queue that touched it). Immediately trims completed LRU buffers down to
     /// the 90% hysteresis target if `total_bytes > max_bytes`. Caller drops the
     /// returned `Vec<B>` outside the pool lock.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn release(
         &mut self,
         kind: HeapKind,

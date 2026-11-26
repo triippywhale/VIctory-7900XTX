@@ -309,7 +309,7 @@ fn trim_idle(most: usize) {
             lists = n,
             shared_before_mb = before >> 20,
             shared_after_mb = after >> 20,
-            per_list_kb = before.saturating_sub(after) / n.max(1) as u64 >> 10,
+            per_list_kb = (before.saturating_sub(after) / n.max(1) as u64) >> 10,
             "idle host lists let go: the PC's memory shared with the card before and after"
         );
     }

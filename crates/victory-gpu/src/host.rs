@@ -10310,7 +10310,7 @@ impl Host {
         let made = self.card_buffer(size, percent, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)?;
         let n = WINDOWS_VRAM[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = WINDOWS_VRAM[1].fetch_add(size, Ordering::Relaxed) + size;
-        if n.is_power_of_two() || n % 1000 == 0 {
+        if n.is_power_of_two() || n.is_multiple_of(1000) {
             tracing::info!(made = n, mb = bytes >> 20, uploads = UPLOADS_VRAM.load(Ordering::Relaxed), "windows of title memory put in the card's memory (and upload buffers)");
         }
         Some(made)
