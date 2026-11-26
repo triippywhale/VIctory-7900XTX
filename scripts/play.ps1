@@ -4,6 +4,11 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
+# -Ports        which renderer patches run, for A/B runs (README.md, "Renderer patches"):
+#               1 = VICTORY_PORT_CONSTANTS, 2 = VICTORY_PORT_DESCRIPTORS, 5 = VICTORY_PORT_CBV,
+#               6 = VICTORY_PORT_GUARD, 7 = VICTORY_PORT_JOURNAL. The listed ones are set to 1 and
+#               the others to 0: -Ports 1,5, -Ports all, or -Ports none (all five off). Without it
+#               each keeps the build's default (1 and 5 on, the rest off). -More still wins over it.
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new
@@ -22,7 +27,8 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$NoPrebuild,
-    [switch]$CleanCache
+    [switch]$CleanCache,
+    [ValidateSet('1', '2', '5', '6', '7', 'all', 'none')][string[]]$Ports = @()
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -36,6 +42,17 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192' }
+$portSwitches = [ordered]@{
+    '1' = 'VICTORY_PORT_CONSTANTS'; '2' = 'VICTORY_PORT_DESCRIPTORS'; '5' = 'VICTORY_PORT_CBV'
+    '6' = 'VICTORY_PORT_GUARD'; '7' = 'VICTORY_PORT_JOURNAL'
+}
+if ($Ports) {
+    if (($Ports -contains 'none') -and $Ports.Count -gt 1) { Write-Host "-Ports none goes alone."; exit 1 }
+    $wanted = if ($Ports -contains 'all') { @($portSwitches.Keys) } else { @($Ports | Where-Object { $_ -ne 'none' }) }
+    foreach ($n in $portSwitches.Keys) { $settings[$portSwitches[$n]] = if ($wanted -contains $n) { '1' } else { '0' } }
+    $on = if ($wanted) { ($wanted | Sort-Object -Unique) -join ', ' } else { 'none' }
+    Write-Host "Renderer patches on: $on (the others set to 0)"
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
