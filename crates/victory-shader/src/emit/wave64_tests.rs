@@ -1464,3 +1464,84 @@ fn both_host_waves_observe_the_lds_flag_after_the_join() {
     }
     eprintln!("all 14 flag dispatches passed on a 32-lane hardware adapter");
 }
+
+/// One console wave whose lanes 0..31 leave a loop after its first turn and lanes 32..63 after
+/// the second, each setting v8 to the turn's number while it is in the loop; after it, with
+/// every lane back in EXEC, every thread stores the first lane's v8: 1, lane 0's. (A read of
+/// lane 63 before the loop makes the two host waves exchange.) The value is alike in each turn,
+/// not after the loop: there the upper host wave's own first lane holds 2, which every thread
+/// of it stored while `lane_uniform` took a value made in the loop as alike after it.
+#[test]
+fn a_first_lane_read_after_a_loop_the_lanes_left_at_different_turns() {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let native = native(&[
+        0x2C12_0085, // v_lshrrev_b32 v9, 5, v0       (0 below lane 32, 1 from it)
+        0xD760_0013,
+        0x0201_7F09, // v_readlane_b32 s19, v9, 63
+        0x4A12_1281, // v_add_nc_u32 v9, 1, v9        (the turn after which the lane leaves)
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0xBE86_047E, // s_mov_b64 s[6:7], exec        (the lanes still in the loop)
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBF82_0001, // s_branch BODY
+        0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
+        0x8112_8112, // BODY: s_add_i32 s18, s18, 1
+        0x7E10_0212, // v_mov_b32 v8, s18
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7DA4_1212, // v_cmpx_eq_u32 s18, v9         (the lanes that leave now)
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF9, // s_cbranch_scc1 LOOPTOP
+        0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
+        0x7E20_0508, // v_readfirstlane_b32 s16, v8
+        0x7E02_0210, // v_mov_b32 v1, s16
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xE070_1000,
+        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the output has the layout and size required by OPTIONS1.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut waves).cast(),
+            size_of_val(&waves) as u32,
+        )
+    }
+    .expect("query wave capabilities");
+    if !(waves.WaveLaneCountMin..=waves.WaveLaneCountMax).contains(&32) {
+        eprintln!("the device does not support wave32; hardware dispatch skipped");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    assert_eq!(out[0][..64], [1u32; 64], "every thread stores lane 0's v8");
+    eprintln!("ran on the hardware device: both host waves read lane 0's value after the loop");
+}
