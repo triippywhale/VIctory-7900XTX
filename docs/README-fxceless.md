@@ -338,6 +338,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_PIPELINE_LOW_MEMORY=1` | pipelines known to take long to make (1 s or more in an earlier run) count against the slow-build limit at first use and for passes over the screen too, not only when started early: at most a quarter of the pipeline workers (`VICTORY_PIPELINE_WORKERS` included) are in them at once. Requested ones take the next free slot before early ones, and quick ones go on meanwhile. Lowers the memory concurrent driver compiles hold; a requested pipeline can wait longer for a long one being made. No effect with `VICTORY_PIPELINE_SLOW=0` |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |

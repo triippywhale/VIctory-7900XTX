@@ -38,9 +38,9 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
-/// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// Sets how many empty blocks stay, by the card's remaining headroom below
+/// 85 % of its DXGI budget ([`crate::host::keep_freed`]), clamped to
+/// `SPARE..=SPARE_KEPT`. Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     if !crate::residency::on() {
         SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
@@ -69,10 +69,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
+    let Some([budget, used, ..]) = memory else {
+        return SPARE;
+    };
+    if !keep {
+        return SPARE;
     }
+    let ceiling = (u128::from(budget) * 85 / 100) as u64;
+    let headroom = ceiling.saturating_sub(used);
+    let fit = (headroom / 2 / BLOCK) as usize;
+    fit.clamp(SPARE, SPARE_KEPT)
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -876,9 +882,20 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        // 24 GiB card with ample headroom: unchanged at SPARE_KEPT (64 blocks = 4 GiB).
+        assert_eq!(spares(Some([24 * GIB, 10 * GIB, 0, 0]), true), SPARE_KEPT);
+        // 16 GiB-class card (15.3 GiB budget) at 12 GiB used: ~8 blocks (~512 MiB) instead of 4 GiB.
+        assert_eq!(spares(Some([15_300 << 20, 12 * GIB, 0, 0]), true), 5);
+        assert_eq!(spares(Some([15_667 << 20, 12 * GIB, 0, 0]), true), 8);
+        // 8 GiB-class card (7.25 GiB budget) at 5.5 GiB used: 5 blocks (320 MiB) instead of 4 GiB.
+        assert_eq!(spares(Some([7424 << 20, 5632 << 20, 0, 0]), true), 5);
+        // Tight headroom, at/above 85 %, zero budget, keep=false, or None: floor at SPARE (2 blocks).
+        assert_eq!(spares(Some([24 * GIB, 20 * GIB, 0, 0]), true), 3);
+        assert_eq!(spares(Some([100 * GIB, 85 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100 * GIB, 95 * GIB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([0, 0, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([24 * GIB, 2 * GIB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 

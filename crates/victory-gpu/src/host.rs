@@ -2475,6 +2475,14 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// Title memory updated when these texture readbacks land.
+    fn readback_ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.backs
+            .iter()
+            .map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row))
+            .chain(self.texture_backs.iter().map(crate::texback::Back::range))
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2734,6 +2742,52 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 mod relay_tests {
     use super::{flagged_pieces, landable};
 
+    #[test]
+    fn completed_gpu_fences_release_tables_before_lists_are_recycled() {
+        use super::{D3D12_FENCE_FLAG_NONE, Flight, ID3D12Fence, Late, host, release_completed_tables};
+        use crate::draw::State;
+        use crate::list::Detached;
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; descriptor retirement test skipped");
+            return;
+        };
+        crate::descriptor::with_test_view_heap(|heap| {
+            let views = heap.host().unwrap();
+            let capacity = views.dynamic_capacity();
+            let mut state = State::default();
+            let first = state.reserve_dynamic(heap, views, capacity).unwrap();
+            let list = host.new_list().unwrap();
+            list.close();
+            let mut items = [Late::Run(Flight {
+                number: 1,
+                fence: 1,
+                lists: vec![Detached::with_test_state(list, state)],
+                order: vec![0],
+                card: None,
+                back: Vec::new(),
+                own: None,
+                texture_back_ranges: Vec::new(),
+            })];
+            // SAFETY: a private test fence and a live device.
+            let fence: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            // SAFETY: a plain query on the test fence.
+            release_completed_tables(&mut items, unsafe { fence.GetCompletedValue() });
+            assert_eq!(views.dynamic(1), None, "the flight is still using its slots");
+            release_completed_tables(&mut items, u64::MAX);
+            assert_eq!(views.dynamic(1), None, "device removal cannot prove completion");
+            // SAFETY: only this test owns and signals the fence.
+            unsafe { fence.Signal(1) }.unwrap();
+            // SAFETY: a plain query on the test fence.
+            release_completed_tables(&mut items, unsafe { fence.GetCompletedValue() });
+            assert_eq!(views.dynamic(capacity), Some(first), "the list is still held but its slots are reusable");
+            drop(items);
+            assert_eq!(views.dynamic(1), None, "dropping the old list must leave the new allocation alone");
+            views.release(first, capacity);
+            eprintln!("completed fence released {capacity} dynamic descriptor slots before list recycle");
+        });
+    }
+
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
     /// before the flight.
@@ -2840,6 +2894,25 @@ enum Late {
     Write(usize, crate::queue::Written, usize),
     /// A fence signalled behind the flights before it (retaining a COM ref).
     Signal(crate::fence::FenceRef, u64),
+}
+
+/// Return shader-visible descriptor ranges as soon as the GPU has finished
+/// using them. Readback, retirement of resources, and list reset still keep
+/// their original order and may hold the list for several more submissions.
+fn release_completed_tables(items: &mut [Late], completed: u64) {
+    if completed == u64::MAX {
+        // GetCompletedValue reports this if the device has been removed.
+        return;
+    }
+    for item in items {
+        if let Late::Run(flight) = item
+            && flight.fence <= completed
+        {
+            for list in &mut flight.lists {
+                list.release_tables();
+            }
+        }
+    }
 }
 
 struct Line {
@@ -3312,7 +3385,7 @@ pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&H
     for list in &ahead {
         let deferred = list.deferred();
         written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+        written.extend(deferred.readback_ranges());
     }
     let mut joined = Vec::new();
     join_ranges(&mut joined, written);
@@ -3923,6 +3996,55 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 #[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
+
+    #[test]
+    fn a_late_texture_readback_blocks_a_following_cpu_copy() {
+        use super::{INFINITE, WHY_READ, WaitForSingleObject, blocked_by, host, read_backs};
+
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; texture readback dependency not tested");
+            return;
+        };
+        let mut title = [0u8; 64];
+        let producer = host.new_list().unwrap();
+        let (upload, upload_bytes) = host.upload_buffer(512).unwrap();
+        let readback = host.read_back_buffer(512).unwrap();
+        // SAFETY: the live upload mapping holds 512 bytes; the producer is
+        // open and both buffers hold the full transfer range.
+        unsafe {
+            upload_bytes.write_bytes(0x5a, 512);
+            producer.list.CopyBufferRegion(&readback, 0, &upload, 0, 512);
+        }
+        producer.defer_read_back(readback, title.as_mut_ptr(), [16, 2, 32]);
+        producer.close();
+
+        let (submitted, sent) = host.submit(&[&producer], &[], true).unwrap();
+        // SAFETY: the submission lock is held and the event and fence are
+        // ours. The test keeps the producer, upload and destination alive.
+        unsafe {
+            host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
+            WaitForSingleObject(host.event, INFINITE);
+        }
+        if let Some(plan) = sent.card {
+            host.card_done(plan);
+        }
+        if let Some(own) = sent.own {
+            own.landed();
+        }
+        drop(submitted);
+
+        let consumer = host.new_list().unwrap();
+        let mut taken = [0u8; 16];
+        consumer.defer_copy(taken.as_mut_ptr(), title[32..].as_ptr(), taken.len());
+        assert_eq!(blocked_by(&sent.texture_back_ranges, &[&consumer], false), Some(WHY_READ));
+        assert_eq!(sent.texture_back_ranges, [(title.as_ptr() as usize, title.as_ptr() as usize + 48)]);
+        read_backs(&producer);
+        assert_eq!(title[..16], [0x5a; 16]);
+        assert_eq!(title[16..32], [0; 16]);
+        assert_eq!(title[32..48], [0x5a; 16]);
+        consumer.close();
+        eprintln!("the pending texture readback blocked a later CPU copy");
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5111,8 +5233,10 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        // SAFETY: a plain query on this queue's fence.
+        release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5578,7 +5702,7 @@ impl Host {
         let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
-            let items = {
+            let mut items = {
                 let mut line = line();
                 if line.line.is_empty() {
                     line.settling = false;
@@ -5625,6 +5749,9 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
+                // SAFETY: a plain query. Check the completed value even
+                // when the event could not be registered.
+                release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
@@ -6024,7 +6151,7 @@ impl Host {
             let back = crate::picked::with(declared, &picked.written);
             let mut texture_back_ranges = Vec::new();
             for list in runs {
-                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+                texture_back_ranges.extend(list.deferred().readback_ranges());
             }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
@@ -9215,6 +9342,10 @@ impl Meter {
                     u8::from(crate::descriptor::host::show_new_later()),
                     crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
                 );
+                tracing::info!("textures shown, since the start (crate::texlate): {}", crate::texlate::line());
+                if let Some(line) = crate::texstore::line() {
+                    tracing::info!("{line}");
+                }
                 if crate::resource::held_only() {
                     let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                     let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));

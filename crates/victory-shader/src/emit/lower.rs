@@ -1850,7 +1850,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
-        // LDS accesses get a group barrier each (a console wave split in two host waves)
+        // LDS accesses need group barriers where a console wave is split in two host waves.
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
@@ -2878,16 +2878,21 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            // This state is local to the block. A predecessor could have
+            // written LDS or taken a different path to this block.
+            let mut lds_reads_ordered = false;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                lds_reads_ordered = super::group_sync() != 0;
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
+                self.inst(b, i, &mut lds_reads_ordered)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
+                    lds_reads_ordered = false;
                     i = end;
                     continue;
                 }
@@ -6055,7 +6060,7 @@ impl<'a> Lower<'a> {
     // ---- instructions ----
     // ---- instructions ----
 
-    fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+    fn inst(&mut self, b: usize, i: usize, lds_reads_ordered: &mut bool) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
@@ -6091,11 +6096,16 @@ impl<'a> Lower<'a> {
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
-            // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            let read = matches!(&inst.fields, Fields::Ds { gds: false, data, .. }
+                if data.is_empty() && name.starts_with("ds_read"));
+            // All reads in a run see the same writes. The barrier before
+            // a write or atomic still waits for every preceding read.
+            if !read || !*lds_reads_ordered {
+                self.lds_meeting();
+            }
+            *lds_reads_ordered = read && super::group_sync() != 0;
+        } else if name != "s_nop" && !name.starts_with("s_waitcnt") {
+            *lds_reads_ordered = false;
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -6126,6 +6136,7 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                *lds_reads_ordered = self.split_lds && waits;
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -6160,6 +6171,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                *lds_reads_ordered = false;
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }

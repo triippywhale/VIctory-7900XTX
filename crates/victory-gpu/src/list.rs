@@ -203,6 +203,15 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    pub(crate) fn release_tables(&mut self) {
+        self._state.release_dynamic_slots();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_state(host: crate::host::HostList, state: crate::draw::State) -> Self {
+        Self { host, _uploads: Vec::new(), _state: state }
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
