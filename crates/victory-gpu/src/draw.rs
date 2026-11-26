@@ -74,7 +74,7 @@ thread_local! {
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
-/// (`VICTORY_EARLY_TEXTURES_MS`, 12; 0: never, as before), and the
+/// (`VICTORY_EARLY_TEXTURES_MS`, 0: never, the default; 12 as it was), and the
 /// milliseconds it may take just before a draw of the title's decoration
 /// bake (`VICTORY_BAKE_TEXTURES_MS`, 1500; 0: nothing special).
 ///
@@ -91,7 +91,7 @@ fn early_budgets() -> (u64, u64) {
         let ms = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default)
         };
-        (ms("VICTORY_EARLY_TEXTURES_MS", 12), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
+        (ms("VICTORY_EARLY_TEXTURES_MS", 0), ms("VICTORY_BAKE_TEXTURES_MS", 1500))
     })
 }
 
@@ -2410,6 +2410,47 @@ impl State {
                     continue;
                 }
             };
+            // A placed view of a texture the host writes (the title's light
+            // packed as R9G9B9E5 in R32_UINT textures its compute passes
+            // write): its texels are on the card in that texture, not in
+            // title memory. Met here it is a slot no table read took out,
+            // one shaders pick by index: copied on the card now, and from
+            // now on by every list that writes the texture
+            // (`crate::resource::picked_alias`). It was filled from title
+            // memory, which those writes never reach.
+            if placed.is_some()
+                && crate::resource::alias_picked()
+                && let Some(source) = crate::resource::alias_of(resource)
+            {
+                crate::resource::picked_alias(resource, source);
+                let copied = crate::texture::alias(list, resource, source);
+                #[cfg(feature = "diagnostics")]
+                if crate::resource::alias_watching() {
+                    static SEEN: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
+                        std::sync::Mutex::new(std::collections::BTreeMap::new());
+                    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = seen.entry(resource as usize).or_insert(0);
+                    *n += 1;
+                    if *n == 1 || n.is_power_of_two() {
+                        tracing::warn!(
+                            slot = index,
+                            times = *n,
+                            frame,
+                            copied,
+                            view = ?resource,
+                            source = ?source,
+                            "ALIAS WATCH: the pass over textures picked by index met a placed view of a texture the host writes: {}",
+                            describe(view.as_ref())
+                        );
+                    }
+                }
+                if copied {
+                    crate::texture::PICKED_ALIAS_COPIES.fetch_add(1, Ordering::Relaxed);
+                    at_once();
+                    host.texture_slot_done(index, write, None);
+                    continue;
+                }
+            }
             let texture = crate::resource::host_resource(resource);
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
@@ -4127,6 +4168,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     // what shaders write through unordered access goes back to it after.
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::resource::buffer_over_target(address, len, kind == ResourceType::Uav);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
@@ -4150,6 +4193,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            #[cfg(feature = "diagnostics")]
+            if !aliased && placed.is_some() {
+                crate::resource::alias_watch(*resource as This);
+            }
             if !aliased
                 && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.flags() & 0x7 == 0

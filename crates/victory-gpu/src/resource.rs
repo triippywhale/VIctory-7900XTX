@@ -1396,6 +1396,124 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+
+/// Targets the title released, by the address of their memory: bytes,
+/// width, height, format, the frame of the release and whether the host
+/// ever had a texture for them ([`alias_watch`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+static TARGETS_GONE: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, u64, u32, u32, u64, bool)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Whether [`alias_watch`] and [`buffer_over_target`] look
+/// (`VICTORY_ALIAS_WATCH=1`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_watching() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_WATCH").is_some_and(|v| v == "1"))
+}
+
+/// The live target and the released one whose memory overlaps
+/// `[at, at + len)`, each as (address, bytes, width, height, format).
+#[cfg(all(windows, feature = "diagnostics"))]
+#[allow(clippy::type_complexity)]
+fn targets_over(at: u64, len: u64) -> (Option<(u64, u64, u64, u32, u32, u32)>, Option<(u64, (u64, u64, u32, u32, u64, bool))>) {
+    let end = at.saturating_add(len.max(1));
+    let live = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.range(..end).rev().take(8).find_map(|(&o_at, &o)| {
+            let o = resource(o as This);
+            let bytes = footprint(&o.desc).map_or(0, |f| f.size);
+            (o_at + bytes > at).then_some((o_at, bytes, o.desc.width, o.desc.height, o.desc.format, o.desc.flags))
+        })
+    };
+    let gone = {
+        let gone = TARGETS_GONE.lock().unwrap_or_else(|e| e.into_inner());
+        gone.range(..end).rev().take(8).find(|(o_at, o)| **o_at + o.0 > at).map(|(a, o)| (*a, *o))
+    };
+    (live, gone)
+}
+
+/// Diagnostics: `this`, a texture made for a view the title placed in its
+/// memory that is filled from title memory (no [`alias_of`]), is said once
+/// with what else is known of that memory: a live target it overlaps
+/// without being its alias, a released target that lay there, and how much
+/// of its first 64 KiB of title memory is not zero.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn alias_watch(this: This) {
+    if this.is_null() || !alias_watching() {
+        return;
+    }
+    let r = resource(this);
+    if !r.host.placed.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let at = r.data() as u64;
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<(u64, u64, u32, u32)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= 20_000 || !seen.insert((at, r.desc.width, r.desc.height, r.desc.format)) {
+            return;
+        }
+    }
+    let bytes = footprint(&r.desc).map_or(0, |f| f.size);
+    let (live, gone) = targets_over(at, bytes);
+    // Block-compressed art with no target near it is the title's own.
+    let block = matches!(r.desc.format, 70..=84 | 94..=99);
+    if block && live.is_none() && gone.is_none() {
+        return;
+    }
+    let look = (bytes as usize).min(65_536);
+    let nonzero = if look > 0 && crate::texture::committed(at as *const u8, look) {
+        // SAFETY: committed title memory, only read.
+        let b = unsafe { std::slice::from_raw_parts(at as *const u8, look) };
+        b.iter().filter(|&&x| x != 0).count() as i64
+    } else {
+        -1
+    };
+    tracing::warn!(
+        view = ?this,
+        address = format_args!("{at:#x}"),
+        bytes,
+        width = r.desc.width,
+        height = r.desc.height,
+        format = r.desc.format,
+        levels = r.desc.mip_levels,
+        layers = r.desc.depth_or_array_size,
+        nonzero_of_first_64k = nonzero,
+        frame = crate::frame::current(),
+        "ALIAS WATCH: placed texture filled from title memory; live target over it (address, bytes, width, height, format, flags): {}; released target there (address, (bytes, width, height, format, frame, host made)): {}",
+        live.map_or("none".into(), |l| format!("{:#x} {:?}", l.0, (l.1, l.2, l.3, l.4, l.5))),
+        gone.map_or("none".into(), |g| format!("{:#x} {:?}", g.0, g.1)),
+    );
+}
+
+/// Diagnostics: a buffer view over `[at, at + len)` of title memory that a
+/// target lies in (live or released) is said once.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn buffer_over_target(at: u64, len: u64, unordered: bool) {
+    if !alias_watching() {
+        return;
+    }
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let (live, gone) = targets_over(at, len);
+    if live.is_none() && gone.is_none() {
+        return;
+    }
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 4_096 && seen.insert((at, len)) {
+        tracing::warn!(
+            address = format_args!("{at:#x}"),
+            len,
+            unordered,
+            frame = crate::frame::current(),
+            "ALIAS WATCH: buffer view over a target's memory; live {}; released {}",
+            live.map_or("none".into(), |l| format!("{:#x} {:?}", l.0, (l.1, l.2, l.3, l.4, l.5))),
+            gone.map_or("none".into(), |g| format!("{:#x} {:?}", g.0, g.1)),
+        );
+    }
+}
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
 /// same memory, if there is one of the same size, levels and layers with
@@ -1481,6 +1599,112 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+
+/// The placed textures that shaders pick by index and that show a texture
+/// the host writes ([`alias_of`]), by the address of that memory, and the
+/// written textures there now ([`picked_alias`]).
+#[cfg(windows)]
+#[derive(Default)]
+struct PickedAliases {
+    placed: std::collections::BTreeMap<u64, Vec<usize>>,
+    sources: std::collections::BTreeSet<usize>,
+}
+
+#[cfg(windows)]
+static PICKED_ALIASES: std::sync::Mutex<Option<PickedAliases>> = std::sync::Mutex::new(None);
+
+/// How many placed textures [`PICKED_ALIASES`] holds: 0 while there are
+/// none, so that nothing else is asked.
+#[cfg(windows)]
+static PICKED_ALIASES_HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether placed views of host-written textures that shaders pick by index
+/// are kept up to date on the card (`VICTORY_ALIAS_PICKED=0`: filled from
+/// title memory, as before).
+///
+/// A shader that reads such a view through a table has it brought up to
+/// date by its draw ([`crate::texture::alias`]). One that picks the view
+/// from the heap by an index it computes names no view beforehand: the
+/// pass over the heap's textures filled the placed texture from title
+/// memory, which the host's writes never reach, and the shader read that
+/// (or what the last table read of another list had left there).
+#[cfg(windows)]
+pub(crate) fn alias_picked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_PICKED").is_none_or(|v| v != "0"))
+}
+
+/// `placed` shows `source` ([`alias_of`]) and shaders pick it by index: from
+/// now on every list that writes `source` copies it into `placed` when it
+/// closes ([`picked_aliases_of`]).
+#[cfg(windows)]
+pub(crate) fn picked_alias(placed: This, source: This) {
+    let at = resource(placed).data() as u64;
+    let mut held = PICKED_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let held = held.get_or_insert_with(PickedAliases::default);
+    let there = held.placed.entry(at).or_default();
+    if !there.contains(&(placed as usize)) {
+        there.push(placed as usize);
+        PICKED_ALIASES_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    held.sources.insert(source as usize);
+}
+
+/// Whether title texture `this` is one whose placed views shaders pick by
+/// index ([`picked_alias`]).
+#[cfg(windows)]
+pub(crate) fn has_picked_aliases(this: This) -> bool {
+    PICKED_ALIASES_HELD.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && PICKED_ALIASES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|held| held.sources.contains(&(this as usize)))
+}
+
+/// The placed textures picked by index that lie where the written texture
+/// `source` does, each with the texture it shows now (as [`alias_of`]
+/// finds it: `source`, unless the title has put another there since).
+#[cfg(windows)]
+pub(crate) fn picked_aliases_of(source: This) -> Vec<(This, This)> {
+    let placed = {
+        let held = PICKED_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(held) = held.as_ref() else { return Vec::new() };
+        if !held.sources.contains(&(source as usize)) {
+            return Vec::new();
+        }
+        // The source may be gone by now: it is only compared, never read.
+        let Some(at) = TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find_map(|(at, r)| (*r == source as usize).then_some(*at))
+        else {
+            return Vec::new();
+        };
+        held.placed.get(&at).cloned().unwrap_or_default()
+    };
+    placed
+        .into_iter()
+        .filter_map(|p| Some((p as This, alias_of(p as This)?)))
+        .collect()
+}
+
+/// A written texture was made at `at` (or one there released, `made`
+/// false): [`PICKED_ALIASES`] follows.
+#[cfg(windows)]
+fn picked_alias_source(at: u64, this: usize, made: bool) {
+    if PICKED_ALIASES_HELD.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut held = PICKED_ALIASES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(held) = held.as_mut() else { return };
+    if !made {
+        held.sources.remove(&this);
+    } else if held.placed.contains_key(&at) {
+        held.sources.insert(this);
+    }
+}
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.
@@ -2047,6 +2271,15 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    // The copies count against what the PC can commit too: with under a
+    // gibibyte of that left, the idle ones go whatever room the card has
+    // (after DexNom PR #43, 1a82816, which shortens the time from 4 GiB on:
+    // here that is most of a session, and what goes at 2.5 s is made again,
+    // see `crate::host::vram_keep`).
+    let commit_ms = crate::host::commit_idle_ms(crate::host::available_system_memory().map(|m| m.1));
+    // (Never under a second: handles not yet recorded into a list or slot
+    // stay protected, as `crate::host::vram_idle_ms` says.)
+    let (idle_ms, most) = if commit_ms <= 500 { (idle_ms.min(1_000), u64::MAX) } else { (idle_ms, most) };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -2695,10 +2928,15 @@ fn hand_out_resource(
         textures().insert(at);
         crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
+            #[cfg(feature = "diagnostics")]
+            if alias_watching() {
+                TARGETS_GONE.lock().unwrap_or_else(|e| e.into_inner()).remove(&(resource.data() as u64));
+            }
             TARGETS_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(resource.data() as u64, at);
+            picked_alias_source(resource.data() as u64, at, true);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2724,9 +2962,20 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
+                #[cfg(feature = "diagnostics")]
+                if alias_watching() {
+                    let made = self.host.made.lock().map(|m| m.is_some()).unwrap_or(false);
+                    let bytes = footprint(&self.desc).map_or(0, |f| f.size);
+                    TARGETS_GONE.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                        at,
+                        (bytes, self.desc.width, self.desc.height, self.desc.format, crate::frame::current(), made),
+                    );
+                }
                 if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
                     targets.remove(&at);
                 }
+                drop(targets);
+                picked_alias_source(at, std::ptr::from_ref::<Resource>(self) as usize, false);
             }
         }
         let made = self

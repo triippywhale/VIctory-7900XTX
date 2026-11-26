@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prebuild;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -95,15 +96,28 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Warm the run's caches: every container found is translated
+        /// into the run's shader cache; with --pipelines, then every
+        /// pipeline of the title's shader pack is made into the run's host
+        /// pipeline library (the pre-build: the host device is made first,
+        /// and a run with the same environment finds them all). Give the
+        /// game's shaders.rpf and the executables (or the game folder).
+        #[arg(long, conflicts_with = "warm")]
+        cache: bool,
     },
     /// Translate every shader found (as `translate` finds them) into the
-    /// shader cache, so that no run has to: a few minutes, once per change
-    /// of the translator.
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Also write every shader that does not translate to this file,
+        /// one line each: hash, where it was found, why.
+        #[arg(long)]
+        list: Option<PathBuf>,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -199,6 +213,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            cache,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -211,9 +226,12 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
+            if cache {
+                return translate::cache(paths, jobs, pipelines);
+            }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

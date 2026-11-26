@@ -171,8 +171,13 @@ pub(crate) fn cards() -> bool {
 ///
 /// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
 ///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
-/// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
+/// - `> 12 GiB` and `< 17 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 17 GiB` and `< 20 GiB` (20 GB cards such as the RX 7900 XT, whose
+///   budget starts near 19.6 GiB): `(1, 2048)` MiB. Measured on that card
+///   (2026-11-26, the world, two runs of the same scenes): 78 of the 106 MB
+///   a frame compared on the CPU lay in copies of 1 MiB or more; with them
+///   on the card the frame went from 63 to 54 ms.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
 ///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
 ///   still leave headroom for textures and render targets.
@@ -182,11 +187,14 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     };
     let budget_mb = budget_bytes >> 20;
     const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const SEVENTEEN_GIB_MB: u64 = 17 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
         (16, 512)
-    } else if budget_mb < TWENTY_GIB_MB {
+    } else if budget_mb < SEVENTEEN_GIB_MB {
         (4, 2048)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (1, 2048)
     } else {
         (1, (budget_mb / 4).min(8192))
     }
@@ -2975,7 +2983,7 @@ pub(crate) fn let_go_idle() {
         if map.is_empty() {
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        let idle_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
@@ -5231,6 +5239,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5538,7 +5552,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -5700,6 +5714,8 @@ mod window_tests {
         assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
         assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(17 * GIB)), (1, 2048));
+        assert_eq!(default_card_limits_mb(Some(19 * GIB)), (1, 2048));
 
         // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
         assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));

@@ -382,7 +382,7 @@ pub(crate) fn trim() {
     {
         return;
     }
-    let quiet_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let quiet_ms = crate::host::system_ram_idle_ms(crate::host::available_system_memory());
     if crate::host::now_ms() < LOADED_AT.load(Ordering::Relaxed) + quiet_ms
         || TRIMMED.swap(true, Ordering::Relaxed)
     {
@@ -460,6 +460,9 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// The title pipelines a pre-build put in the library, after a first line
+/// naming the library file and translator they hold for ([`tag`]).
+const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
@@ -862,7 +865,9 @@ pub(crate) fn save(now: bool) {
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        let prebuilt_changed = PREBUILT_CHANGED.swap(false, Ordering::Relaxed);
+        if !used_changed && !prebuilt_changed && added == 0 {
             return;
         }
         if added == 0 {
@@ -904,6 +909,21 @@ pub(crate) fn save(now: bool) {
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    // The pre-build's list, beside the library file it holds for (a
+    // library a system did not let replace the mapped one waits as
+    // `NEXT_FILE`, and keeps its size and time when it is renamed).
+    if written.is_ok() && PREBUILDING.load(Ordering::Relaxed) {
+        let file = [NEXT_FILE, LIBRARY_FILE].map(|f| dir.join(f)).into_iter().find(|f| f.exists());
+        let list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|keys| {
+            (keys.len(), keys.iter().map(String::as_str).collect::<Vec<_>>().join("\n"))
+        });
+        if let (Some(tag), Some((n, keys))) = (file.as_deref().and_then(tag), list) {
+            match write_atomically(&dir.join(PREBUILT_FILE), format!("{tag}\n{keys}").as_bytes()) {
+                Ok(()) => tracing::info!(pipelines = n, "pre-built pipelines listed"),
+                Err(e) => tracing::warn!(error = %e, "pre-built pipelines not listed"),
+            }
+        }
+    }
     match written {
         Ok(()) => tracing::info!(
             bytes,
@@ -1007,6 +1027,75 @@ pub(crate) fn note_time(key: &str, ms: u64) {
         *known = ms;
         // With the next save of the early list.
         USED_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether this process is a pre-build (`start_prebuild`): only a
+/// pre-build reads and writes [`PREBUILT_FILE`]; a run leaves it alone, and
+/// once the run saves the library the list no longer holds for it.
+static PREBUILDING: AtomicBool = AtomicBool::new(false);
+/// The title pipelines a pre-build has in the library (`note_prebuilt`).
+static PREBUILT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static PREBUILT_CHANGED: AtomicBool = AtomicBool::new(false);
+
+/// What the pre-build's list holds for: the library file as saved (its
+/// size and time: every save writes a new file) and what names its
+/// pipelines (the translator's fingerprint with the host facts and
+/// switches it reads, the shader cache's and the host description's code).
+fn tag(file: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(file).ok()?;
+    let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let mut h = blake3::Hasher::new();
+    for part in [
+        &meta.len().to_le_bytes()[..],
+        &time.to_le_bytes(),
+        &victory_shader::emit::translation_fingerprint(),
+        include_bytes!("../shader_cache.rs"),
+        include_bytes!("host.rs"),
+        include_bytes!("library.rs"),
+    ] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
+/// The keys of a saved list, if it holds for `tag` (else none).
+fn listed(list: &str, tag: &str) -> HashSet<String> {
+    let mut lines = list.lines();
+    match lines.next() == Some(tag) {
+        true => lines.filter(|l| !l.is_empty()).map(str::to_owned).collect(),
+        false => HashSet::new(),
+    }
+}
+
+/// Readies a pre-build: the library opened, the early list read (a
+/// pre-build draws nothing, and a save must keep the list), and the
+/// pre-build's list read if it holds for the library as it is.
+pub(crate) fn start_prebuild() {
+    PREBUILDING.store(true, Ordering::Relaxed);
+    drop(used());
+    let _ = library();
+    let keys = DIR
+        .get()
+        .and_then(|d| {
+            let tag = tag(&d.join(LIBRARY_FILE))?;
+            Some(listed(&std::fs::read_to_string(d.join(PREBUILT_FILE)).ok()?, &tag))
+        })
+        .unwrap_or_default();
+    tracing::info!(pipelines = keys.len(), "pre-built pipelines already in the library");
+    *PREBUILT.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys);
+}
+
+/// Whether the pre-build has the title pipeline `key` in the library.
+pub(crate) fn prebuilt(key: &str) -> bool {
+    PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|k| k.contains(key))
+}
+
+/// The pre-build has the title pipeline `key` in the library now.
+pub(crate) fn note_prebuilt(key: String) {
+    if PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(key) {
+        PREBUILT_CHANGED.store(true, Ordering::Relaxed);
     }
 }
 
