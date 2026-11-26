@@ -1057,7 +1057,7 @@ mod tests {
         // s[8:9]; s_endpgm`.
         let code = hex("0403881b800389be040308f4000000fa000081bf");
         let mut bindings = Vec::new();
-        for v in [0x403u32, 0x48, 0x60, 0, 0, 0x0001_0440] {
+        for v in [0x403u32, 0x44, 0x60, 0, 0, 0x0001_0440] {
             bindings.extend_from_slice(&v.to_le_bytes());
         }
         // A texture at dword 0 of the table in user-data dword 4.
