@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Taken by a worker from the resolves' own line ([`Queue::resolves`]).
+    as_resolve: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -52,6 +54,39 @@ pub(crate) struct Pending {
     /// the player moves). `VICTORY_PIPELINE_WAIT_EVERY_FRAME=1` waits in
     /// every frame as before.
     waited_frame: AtomicU64,
+    /// A per-material ray-tracing resolve ([`is_resolve`]): while it is being
+    /// made its dispatches are dropped at once, never waited for, and it
+    /// queues in a line of its own ([`Queue::resolves`]). There are about a
+    /// thousand of these programs and the card's driver takes seconds for
+    /// one. fxceless's run 403 (ray tracing on, 52dfd12): for the 3 minutes
+    /// some were being made, the threads that translate the title's lists
+    /// slept the frame's wait budget on them and dropped the dispatch
+    /// anyway: 279 ms a frame against 54 ms once none was being made, at the
+    /// same 3,000-4,000 draws. `VICTORY_PIPELINE_RESOLVE_WAIT=1`: waited for
+    /// and queued as any other pipeline, as before.
+    no_wait: bool,
+}
+
+/// Dispatches dropped because their resolve was still being made
+/// ([`Pending::no_wait`]), since the start.
+static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a pipeline is one of the title's per-material ray-tracing
+/// resolves: a compute program with that name in its container (as
+/// [`crate::ambient::role`] tells its programs).
+fn is_resolve(shaders: &[Arc<Shader>]) -> bool {
+    const NAME: &[u8] = b"CS_RaytracingResolve";
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(NAME.len()).any(|w| w == NAME))
+}
+
+/// Whether the ray-tracing resolves are waited for and queued as any other
+/// pipeline (`VICTORY_PIPELINE_RESOLVE_WAIT=1`; off: see
+/// [`Pending::no_wait`]).
+fn resolves_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_RESOLVE_WAIT").is_some_and(|v| v == "1"))
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -65,10 +100,12 @@ impl Pending {
         let key = key(&shaders, graphics.as_deref());
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            no_wait: is_resolve(&shaders) && !resolves_wait(),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            as_resolve: AtomicBool::new(false),
             made: OnceLock::new(),
             key,
             used: AtomicBool::new(false),
@@ -121,12 +158,37 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
 /// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
-/// leaves the file unread.
+/// (`warm-bad.txt` beside the pipeline library; a line is the translator
+/// and driver it crashed under ([`bad_under`]), the key, then anything; `#`
+/// begins a comment), loaded on first use. A line of another translator or
+/// driver, or of before the lines said which, is not honoured: a pipeline
+/// the compiler crashed on once was left out for good, though a fix to the
+/// translation or a new driver may make it. `VICTORY_WARM_BAD=0` leaves the
+/// file unread.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
+/// The translator with its settings and the driver that this run's crashes
+/// are noted under, as `victory warm` notes its own.
+fn bad_under() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(super::known::fingerprint)
+}
+
+/// The keys `listed` names as bad under `fingerprint`.
+fn bad_listed(listed: &str, fingerprint: &str) -> std::collections::HashSet<String> {
+    listed
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next()? == fingerprint).then(|| words.next().map(str::to_owned))?
+        })
+        .collect()
+}
+
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    // (Before the lock: the fingerprint asks the host.)
+    let fingerprint = bad_under();
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let keys = keys.get_or_insert_with(|| {
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
@@ -135,12 +197,7 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+        bad_listed(&listed, fingerprint)
     });
     f(keys)
 }
@@ -315,13 +372,18 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let _ = writeln!(f, "{} {} ended the compiler in a run: {:?}", bad_under(), p.key, p.shaders);
         }
     }
     let _ = p.made.set(None);
     if p.was_slow.swap(false, Ordering::Relaxed) {
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.slow_now = queue.slow_now.saturating_sub(1);
+        AVAILABLE.notify_all();
+    }
+    if p.as_resolve.swap(false, Ordering::Relaxed) {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.resolves_now = queue.resolves_now.saturating_sub(1);
         AVAILABLE.notify_all();
     }
     {
@@ -415,9 +477,71 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.no_wait {
+            let n = NOT_WAITED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    being_made = WAITING.load(Ordering::Relaxed),
+                    "ray-tracing resolves dropped while their pipeline is being made, not waited for (VICTORY_PIPELINE_RESOLVE_WAIT=1: waited for)"
+                );
+            }
+        } else if p.graphics.is_none() && compute_waits() {
+            wait_until_made(p);
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT=1`; fxceless/victory-fork #1312).
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: a title can run some compute passes once, when a scene changes,
+/// and what they leave is read for as long as the scene lasts. A compute
+/// program met for the first time that takes seconds to make lost its one
+/// dispatch after the budget, and the picture stayed wrong until the scene
+/// ended (4.4 s to make at the source, against half a second of budget). A
+/// wait of seconds once against a picture wrong until the scene ends.
+/// Off unless asked: the stall is not measured here, and the pre-build has
+/// most pipelines made before a run. Unset, a dispatch waits within the
+/// budget, as before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Waits for `p` until a worker has made it or it is given up (refused, on
+/// the list of bad ones, or the compiler crashed under its worker: `lost`
+/// says so here too). Not made on this thread, as at the source: a compile
+/// of ours is not kept to one thread by a `OnceLock`, and a compiler crash
+/// is caught on a worker alone.
+fn wait_until_made(p: &Pending) {
+    let waiting = crate::timeline::span("pipeline: a dispatch waits for its compute pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        // (timed: a notification may come between the test and the wait)
+        held = done.wait_timeout(held, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    waiting.end();
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some_and(Option::is_some),
+            shaders = ?p.shaders,
+            "a dispatch waited for its compute pipeline past the frame's budget (VICTORY_PIPELINE_COMPUTE_WAIT=1)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
@@ -515,6 +639,25 @@ fn wait(p: &Pending, frame: u64) {
     drop(held);
     let waited = started.elapsed().min(left);
     waiting.end();
+    if waited >= Duration::from_millis(50) {
+        // Which pipeline a frame's wait went on, in every build.
+        static LONG: AtomicU64 = AtomicU64::new(0);
+        static LONG_MS: AtomicU64 = AtomicU64::new(0);
+        let ms = waited.as_millis() as u64;
+        let all_ms = LONG_MS.fetch_add(ms, Ordering::Relaxed) + ms;
+        let n = LONG.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(64) {
+            tracing::info!(
+                n,
+                all_ms,
+                ms,
+                made = p.made.get().is_some(),
+                being_made = WAITING.load(Ordering::Relaxed),
+                shaders = ?p.shaders,
+                "a host pipeline was waited for 50 ms or more"
+            );
+        }
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -594,6 +737,19 @@ fn low_memory() -> bool {
     })
 }
 
+/// How many workers may make ray-tracing resolves at once
+/// ([`resolve_limit_of`] of the workers there are).
+fn resolve_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| resolve_limit_of(configured_workers()))
+}
+
+/// All but a quarter of `workers`, which stay free for the pipelines draws
+/// ask for; at least one.
+fn resolve_limit_of(workers: usize) -> usize {
+    (workers - workers / 4).max(1)
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -609,6 +765,14 @@ struct Queue {
     /// in `slow_now`, and before the early ones known to take long.
     slow_screen: VecDeque<Arc<Pending>>,
     slow_requested: VecDeque<Arc<Pending>>,
+    /// Requested per-material ray-tracing resolves ([`Pending::no_wait`]), and
+    /// how many are being made ([`resolve_limit`]). They are hundreds at once
+    /// and take seconds each: in the one line of requested pipelines every
+    /// other pipeline a draw asked for stood behind them, and the frame's wait
+    /// budget went on that one each frame (fxceless's run 405: 300 ms frames
+    /// with the resolves not waited for, 90 to 530 draws a frame dropped).
+    resolves: VecDeque<Arc<Pending>>,
+    resolves_now: usize,
 }
 
 impl Queue {
@@ -621,6 +785,8 @@ impl Queue {
             requested: VecDeque::new(),
             slow_screen: VecDeque::new(),
             slow_requested: VecDeque::new(),
+            resolves: VecDeque::new(),
+            resolves_now: 0,
         }
     }
 
@@ -646,6 +812,12 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         let limited = slow && (priority != REQUESTED || low_memory);
+        // (One known to take long with `low_memory` waits for a slot as the
+        // others of that kind do.)
+        if priority == REQUESTED && p.no_wait && !limited {
+            self.resolves.push_back(p.clone());
+            return Some(prev == NOT_QUEUED);
+        }
         let list = match (priority == REQUESTED, p.screen && screens_first(), limited) {
             (true, true, false) => &mut self.screen,
             (true, true, true) => &mut self.slow_screen,
@@ -658,11 +830,18 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    /// The next pipeline to make: passes over the screen, then requested
-    /// ones, then early ones; of each, one known to take long only while
-    /// fewer than `slow_limit` such are being made. Workers that make passes
-    /// over the screen alone (`screens_only`) take nothing else.
+    /// [`Queue::pop_in`] with this machine's [`resolve_limit`].
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        self.pop_in(screens_only, slow_limit, resolve_limit())
+    }
+
+    /// The next pipeline to make: passes over the screen, then requested
+    /// ones, then requested ray-tracing resolves (while fewer than
+    /// `resolve_limit` of them are being made), then early ones; of each,
+    /// one known to take long only while fewer than `slow_limit` such are
+    /// being made. Workers that make passes over the screen alone
+    /// (`screens_only`) take nothing else.
+    fn pop_in(&mut self, screens_only: bool, slow_limit: usize, resolve_limit: usize) -> Option<Arc<Pending>> {
         // An entry can have been promoted and claimed already: an early one
         // is then in a requested list too.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state: u8| {
@@ -680,6 +859,13 @@ impl Queue {
             if p.is_none() && free {
                 p = unclaimed(&mut self.slow_requested, REQUESTED);
                 slow = p.is_some();
+            }
+            if p.is_none() && self.resolves_now < resolve_limit {
+                p = self.resolves.pop_front();
+                if let Some(p) = &p {
+                    p.as_resolve.store(true, Ordering::Relaxed);
+                    self.resolves_now += 1;
+                }
             }
             if p.is_none() {
                 p = unclaimed(&mut self.early, EARLY);
@@ -805,6 +991,11 @@ fn spawn_worker(screens_only: bool) -> bool {
                 if p.was_slow.load(Ordering::Relaxed) {
                     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                     queue.slow_now -= 1;
+                    AVAILABLE.notify_all();
+                }
+                if p.as_resolve.load(Ordering::Relaxed) {
+                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.resolves_now -= 1;
                     AVAILABLE.notify_all();
                 }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
@@ -1041,6 +1232,24 @@ mod low_memory_tests {
 mod tests {
     use super::*;
 
+    /// A pipeline the compiler crashed on is left out only under the
+    /// translator and driver it crashed under; lines of another, and lines
+    /// of before they said which (a key first), are tried again.
+    #[test]
+    fn a_bad_pipeline_is_tried_again_by_another_translator_or_driver() {
+        let listed = "1111 aaaa ended the compiler in a run: [compute x]\n\
+                      2222 bbbb exit code: 101\n\
+                      cccc ended the compiler in a run: [compute z]\n\
+                      \n\
+                      # 1111 eeee\n\
+                      1111 dddd\n\
+                      1111\n";
+        let keys = |of| bad_listed(listed, of);
+        assert_eq!(keys("1111"), std::collections::HashSet::from(["aaaa".to_owned(), "dddd".to_owned()]));
+        assert_eq!(keys("2222"), std::collections::HashSet::from(["bbbb".to_owned()]));
+        assert!(keys("3333").is_empty());
+    }
+
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
@@ -1166,6 +1375,66 @@ mod tests {
         let started = Instant::now();
         assert!(ready(&p).is_none());
         assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
+    }
+
+    /// A ray-tracing resolve still being made is not waited for at all, and
+    /// is asked for all the same.
+    #[test]
+    fn a_resolve_being_made_is_not_waited_for() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.no_wait = true;
+        // Claimed by a worker that has not finished.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let before = NOT_WAITED.load(Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
+        assert!(NOT_WAITED.load(Ordering::Relaxed) > before);
+        // No frame's wait is claimed for it.
+        assert_eq!(p.waited_frame.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    /// Resolves stand in a line of their own: behind what draws ask for,
+    /// ahead of the early ones, and only so many of them at once.
+    #[test]
+    fn resolves_queue_behind_requested_pipelines_and_leave_workers_free() {
+        let of = |no_wait| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.no_wait = no_wait;
+            Arc::new(p)
+        };
+        let (first, second, third) = (of(true), of(true), of(true));
+        let (early, asked) = (of(false), of(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&early, EARLY, false), Some(true));
+        for p in [&first, &second, &third] {
+            assert_eq!(queue.push_as(p, REQUESTED, false), Some(true));
+        }
+        assert_eq!(queue.push_as(&asked, REQUESTED, false), Some(true));
+        assert!(queue.requested.len() == 1 && queue.resolves.len() == 3);
+
+        assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &asked));
+        assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &first));
+        assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &second));
+        assert!(first.as_resolve.load(Ordering::Relaxed) && !asked.as_resolve.load(Ordering::Relaxed));
+        assert_eq!(queue.resolves_now, 2);
+        // At the limit the next worker takes an early one, not the third.
+        assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &early));
+        assert!(queue.pop_in(false, 1, 2).is_none());
+        // Workers for passes over the screen alone take none.
+        queue.resolves_now -= 1;
+        assert!(queue.pop_in(true, 1, 2).is_none());
+        assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &third));
+        assert_eq!(queue.resolves_now, 2);
+    }
+
+    #[test]
+    fn a_quarter_of_the_workers_stays_free_of_resolves() {
+        assert_eq!(resolve_limit_of(16), 12);
+        assert_eq!(resolve_limit_of(4), 3);
+        assert_eq!(resolve_limit_of(2), 2);
+        assert_eq!(resolve_limit_of(1), 1);
     }
 
     /// The claim: the first frame keeps it, the same frame may wait again

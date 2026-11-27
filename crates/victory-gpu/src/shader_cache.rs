@@ -148,6 +148,19 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        // `VICTORY_PORTABLE_FLOAT_FAST=1` (the translator's cheaper float
+        // clamps on hosts that are not RDNA) was missing here: a run with it
+        // was served the translations cached without it, and the other way
+        // round. Read as the translator reads it; only when on, so the
+        // translations cached without it keep their key.
+        // (Every other switch the translator's code reads is above, in
+        // `shader_opt` (`VICTORY_HOIST_LOADS`) or in `host_settings`
+        // (`VICTORY_RDNA_FLOAT`), or only prints: `VICTORY_WAVE_WHY`,
+        // `VICTORY_WAVE_DUMP`, `VICTORY_DESC_WHY`. A new one that changes
+        // what is written must be added here by hand.)
+        if std::env::var_os("VICTORY_PORTABLE_FLOAT_FAST").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_PORTABLE_FLOAT_FAST=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

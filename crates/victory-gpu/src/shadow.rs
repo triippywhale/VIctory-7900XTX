@@ -1060,7 +1060,7 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
+struct Flights(std::collections::HashMap<(usize, usize), (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
@@ -2835,9 +2835,120 @@ fn piece_at(start: usize, len: usize, piece: usize) -> (usize, usize) {
     (lo, hi)
 }
 
+/// Where [`Shadow::differing`] cuts offsets `[from, to)` of a copy of
+/// memory from `start` on between `threads` threads: `threads + 1` offsets
+/// in order, the first `from` and the last `to`, each one in between on a
+/// piece boundary (a multiple of 64 KiB of title memory) or `from`, so that
+/// every thread sees whole pieces. Thread `i` compares `[cuts[i],
+/// cuts[i + 1])`.
+///
+/// The first cut used to be rounded down like the others: when `start +
+/// from` sat further into its piece than `from` is long, the subtraction
+/// went below zero (a panic with overflow checks, else a huge offset that
+/// left the first thread an empty range and its changes unfound, so never
+/// copied back to title memory).
+fn piece_cuts(start: usize, from: usize, to: usize, threads: usize) -> Vec<usize> {
+    let threads = threads.max(1);
+    (0..=threads)
+        .map(|i| {
+            if i == 0 {
+                return from;
+            }
+            if i == threads {
+                return to;
+            }
+            let at = from + (to - from) / threads * i;
+            at.saturating_sub((start + at) % PIECE).max(from)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod piece_tests {
-    use super::{PIECE, piece_at, pieces_of};
+    use super::{PIECE, Shadow, piece_at, piece_cuts, pieces_of};
+
+    /// The cuts of the threaded compare cover `[from, to)` exactly, in
+    /// order, with the inner ones on piece boundaries, also when `start +
+    /// from` lies further into its piece than `from` is long (where the
+    /// first cut went below zero).
+    #[test]
+    fn piece_cuts_cover_the_range_on_piece_boundaries() {
+        let mut misaligned = 0;
+        for start in
+            [0usize, 1, 4096, PIECE / 2, PIECE - 16, PIECE, 3 * PIECE + 0x1f09, 0xd_b790_df00]
+        {
+            for (from, to) in [
+                (0usize, 32 << 20),
+                (16, 32 << 20),
+                (4096, (40 << 20) + 77),
+                (PIECE - 4, 130 << 20),
+                (3 * PIECE + 5, (200 << 20) + 3),
+                (100, 100 + 5 * PIECE),
+                (7, 8),
+            ] {
+                if (start + from) % PIECE > from {
+                    misaligned += 1;
+                }
+                for threads in [1usize, 2, 3, 8] {
+                    let cuts = piece_cuts(start, from, to, threads);
+                    let at = format!("start {start:#x} [{from:#x}, {to:#x}) on {threads}");
+                    assert_eq!(cuts.len(), threads + 1, "{at}");
+                    assert_eq!(cuts[0], from, "{at}");
+                    assert_eq!(cuts[threads], to, "{at}");
+                    // In order and inside: the slices join without gaps or
+                    // overlaps, so their union is `[from, to)` exactly.
+                    let mut covered = 0;
+                    for w in cuts.windows(2) {
+                        assert!(from <= w[0] && w[0] <= w[1] && w[1] <= to, "{at}: {cuts:?}");
+                        covered += w[1] - w[0];
+                    }
+                    assert_eq!(covered, to - from, "{at}");
+                    for &cut in &cuts[1..threads] {
+                        assert!(cut == from || (start + cut) % PIECE == 0, "{at}: {cuts:?}");
+                    }
+                    // Big enough slices (as the compare threads them): every
+                    // thread gets a part.
+                    if (to - from) / threads >= 16 << 20 {
+                        assert!(cuts.windows(2).all(|w| w[0] < w[1]), "{at}: {cuts:?}");
+                    }
+                }
+            }
+        }
+        assert!(misaligned > 0);
+    }
+
+    /// `Shadow::differing` on a range big enough for several threads, with
+    /// `start + from` further into its piece than `from` is long (where the
+    /// first thread's cut went below zero): changes in the first slice, at
+    /// the cut between the slices and in the last one are all found, each
+    /// as the piece that holds it.
+    #[test]
+    fn differing_finds_changes_in_every_slice_of_a_misaligned_range() {
+        const LEN: usize = 40 << 20;
+        let start = 7 * PIECE + PIECE / 2;
+        let (from, to) = (4096usize, LEN - 4096);
+        assert!((start + from) % PIECE > from);
+        let mut data: Vec<u8> = (0..LEN).map(|i| (i * 7 + i / 251) as u8).collect();
+        let before = data[from..to].to_vec();
+        let cuts = piece_cuts(start, from, to, 2);
+        let changed = [from, from + 10, cuts[1] - 1, cuts[1], to - 1];
+        for &at in &changed {
+            data[at] ^= 0x5a;
+        }
+        // (A copy with no buffer behind it: only its mapping is compared.)
+        let shadow = Shadow::unbacked(start as u64, data.as_mut_ptr(), LEN as u64, false);
+        let found = shadow.differing(from, to, &before);
+        let mut want: Vec<(usize, usize)> = changed
+            .iter()
+            .map(|&at| {
+                let lo = at.saturating_sub((start + at) % PIECE).max(from);
+                let hi = (at + PIECE - (start + at) % PIECE).min(to);
+                (lo, hi - lo)
+            })
+            .collect();
+        want.dedup();
+        assert_eq!(found, want);
+    }
 
     /// The pieces cover a copy without gaps, each cut where the compare
     /// cuts (at multiples of 64 KiB of title memory).
@@ -3672,18 +3783,13 @@ impl Shadow {
             return scan(from, to);
         }
         // Cut on piece boundaries, so that every thread sees whole pieces.
-        let cut = |i: usize| {
-            if i == threads {
-                return to;
-            }
-            let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
-        };
+        let cuts = piece_cuts(start, from, to, threads);
         let scan = &scan;
         std::thread::scope(|s| {
-            let parts: Vec<_> = (0..threads)
-                .map(|i| {
-                    let (a, b) = (cut(i), cut(i + 1));
+            let parts: Vec<_> = cuts
+                .windows(2)
+                .map(|w| {
+                    let (a, b) = (w[0], w[1]);
                     s.spawn(move || scan(a, b))
                 })
                 .collect();

@@ -680,45 +680,57 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    // Pagefile-backed sections, their pages committed when first mapped or
+    // written (`commit`): the title asks for 6.1 GiB at once, which a busy
+    // host often cannot commit (error 1450). One section for the whole
+    // allocation, or pieces of at most `VICTORY_XMEM_SECTION_MB`
+    // ([`section_pages`], [`pieces`]).
+    let mut made: Vec<Arc<Section>> = Vec::new();
+    for piece in pieces(n, section_pages(), port_on()) {
+        let bytes = piece * PAGE;
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (bytes as u64 >> 32) as u32,
+                bytes as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, sections = made.len(), %error, "XMemAllocatePhysicalPages failed");
+            // The pieces made so far go with their last `Arc`.
+            drop(made);
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // For the GPU side's in-place census: only a committed section can
+        // be opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, bytes as u64, on_wine());
+        made.push(Arc::new(Section {
+            handle,
+            pages: piece,
+            window: std::sync::OnceLock::new(),
+            committed: (0..piece.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }));
     }
     tracing::debug!(
         n,
+        sections = made.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
     let mut table = page_table_mut();
     let Some(numbers) = table.take_page_numbers(n) else {
         drop(table);
@@ -727,7 +739,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { count.write(0) };
         return 0;
     };
-    for (index, &number) in numbers.iter().enumerate() {
+    // The page numbers in order take the pieces in order, each piece's
+    // slices in order: consecutive numbers are consecutive slices of one
+    // section up to a piece's end.
+    let slices = made.iter().flat_map(|section| (0..section.pages).map(move |index| (section, index)));
+    for (&number, (section, index)) in numbers.iter().zip(slices) {
         let slice = Slice {
             section: section.clone(),
             index,
@@ -737,14 +753,61 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     for (index, number) in numbers.into_iter().enumerate() {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
     1
+}
+
+/// With renderer port 1 on, an allocation of at most this many bytes stays
+/// one section whatever [`section_pages`] says: the port opens at most
+/// 512 MB as one region (`victory_gpu`'s `port`, `MOST`), and the title's
+/// 32-bit graphics heap (185 MB, all its pages from one call) must be one
+/// stretch of one section for it ([`arrange`]).
+const PORT_WHOLE: usize = 512 << 20;
+
+/// The most 64 KiB pages one section of an allocation holds
+/// (`VICTORY_XMEM_SECTION_MB=<MB>`, read once here; 2 when unset, as the
+/// source measured); `None` (0 or not a number): one section for the
+/// whole allocation, as before. With renderer port 1 on, allocations of up
+/// to [`PORT_WHOLE`] stay whole ([`pieces`]).
+///
+/// Windows' background rebuild of large pages (`MiRebuildLargePages`, a
+/// system worker thread) moves pages out of sections to free contiguous
+/// runs, and for each page of a shared section looks at every view of that
+/// section (`MiTrimSharedPage` -> `MiTrimSection` -> `MiViewMayContainPage`).
+/// The title maps its page pool (one allocation of 6.1 GiB) one view per
+/// run of consecutive pages, so one section gathers thousands of views: the
+/// source saw that thread at 0.8 to 1.0 of a processor all the time, and
+/// each of the title's remaps (under the address-space lock the
+/// DirectStorage workers need too) wait about 10 ms on the scan, so that
+/// streaming crawled. In pieces, a page's section has only the views of its
+/// own piece. A run of pages that crosses pieces is mapped one view per
+/// piece, as runs of different sections always were, and is not one run of
+/// a section to the GPU side (`victory_gpu`'s `inplace`: `cover`,
+/// `stretch`, `beside`), which then does what it does for scattered pages.
+/// (After PalmVI e56966d4a and 3170c57c6, after fxceless/victory-fork #1089.)
+fn section_pages() -> Option<usize> {
+    static PAGES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        // 2 MB unless given; `=0` keeps each allocation one section.
+        let mb: usize = match std::env::var("VICTORY_XMEM_SECTION_MB") {
+            Ok(v) => v.trim().parse().ok()?,
+            Err(_) => 2,
+        };
+        (mb > 0).then(|| mb.saturating_mul(1 << 20).div_ceil(PAGE).max(1))
+    })
+}
+
+/// The sections of an allocation of `n` pages, as pages each, in order:
+/// one of `n`, or pieces of at most `most` pages ([`section_pages`]) unless
+/// renderer port 1 is on (`port`) and could open the allocation whole
+/// ([`PORT_WHOLE`]).
+fn pieces(n: usize, most: Option<usize>, port: bool) -> impl Iterator<Item = usize> {
+    let whole = port && n.saturating_mul(PAGE) <= PORT_WHOLE;
+    let piece = if whole { n } else { most.unwrap_or(n) }.max(1);
+    (0..n).step_by(piece).map(move |at| piece.min(n - at))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -2185,6 +2248,35 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    /// `VICTORY_XMEM_SECTION_MB`: every page is in one piece, in order, and
+    /// what renderer port 1 could open stays one section.
+    #[test]
+    fn an_allocation_is_cut_into_sections_unless_the_port_could_open_it() {
+        let cut = |n, most, port| pieces(n, most, port).collect::<Vec<usize>>();
+        // `=0`: one section, as before, whatever the port.
+        assert_eq!(cut(100_000, None, false), [100_000]);
+        assert_eq!(cut(100_000, None, true), [100_000]);
+        // 2 MB pieces of 64 KiB pages: 32 pages each, the rest in the last.
+        let two = Some((2 << 20) / PAGE);
+        assert_eq!(cut(70, two, false), [32, 32, 6]);
+        assert_eq!(cut(64, two, false), [32, 32]);
+        assert_eq!(cut(1, two, false), [1]);
+        // The title's page pool (6.1 GiB) is cut with the port on too.
+        let pool = (6247 << 20) / PAGE;
+        let parts = cut(pool, two, true);
+        assert_eq!(parts.iter().sum::<usize>(), pool);
+        assert!(parts.iter().all(|&p| (1..=32).contains(&p)));
+        // Its 32-bit graphics heap (185 MB) stays whole with the port on,
+        // as does anything up to the port's largest region; not without it.
+        let heap = (185 << 20) / PAGE;
+        assert_eq!(cut(heap, two, true), [heap]);
+        assert_eq!(cut(PORT_WHOLE / PAGE, two, true), [PORT_WHOLE / PAGE]);
+        assert_eq!(cut(PORT_WHOLE / PAGE + 1, two, true).len(), PORT_WHOLE / PAGE / 32 + 1);
+        assert_eq!(cut(heap, two, false).len(), heap.div_ceil(32));
+        // A piece larger than the allocation is the allocation.
+        assert_eq!(cut(5, Some(1 << 20), false), [5]);
     }
 
     #[test]

@@ -244,6 +244,12 @@ fn submit_split(this: This, lists: &[This]) {
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
         host.execute(&now);
+        // They have run: their descriptor tables' slots are free again, as
+        // in [`submit_cut`] (which does this after the same call, for the
+        // same reason: the lists are not detached here, so nothing else
+        // gives their fresh tables' dynamic slots back before the title
+        // resets them, and the ring runs out).
+        crate::list::tables_done(&lists[..cut]);
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -1314,6 +1320,46 @@ mod tests {
             0x80
         } else {
             0x70
+        }
+    }
+
+    /// The lists a split submission runs at once give the dynamic
+    /// descriptor slots they hold back when they have run, not only when
+    /// the title resets them.
+    #[cfg(windows)]
+    #[test]
+    fn split_submission_returns_the_immediate_lists_descriptor_slots() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let null = std::ptr::null();
+        let iid = &PAGEABLE_IIDS[2];
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let (mut q, mut allocator, mut list) = (null, null, null);
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        assert_eq!(crate::list::create_allocator(null, 0, iid, &mut allocator), S_OK);
+        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list), S_OK);
+        crate::descriptor::with_test_view_heap(|title_heap| {
+            let host_heap = title_heap.host().expect("a host view heap");
+            let free = host_heap.dynamic_free();
+            let mut took = false;
+            crate::list::with_state(list, |_, state| {
+                took = state.reserve_dynamic(title_heap, host_heap, 1).is_some();
+            });
+            assert!(took, "a dynamic slot");
+            assert_eq!(host_heap.dynamic_free(), free - 1);
+            // Closed, then submitted with no wait in it: it runs at once.
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            submit_split(q, &[list]);
+            assert_eq!(host_heap.dynamic_free(), free);
+        });
+        for object in [list, allocator, q] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
         }
     }
 

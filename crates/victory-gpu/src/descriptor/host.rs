@@ -163,7 +163,7 @@ pub(crate) struct HostHeap {
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
-    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    away: Mutex<std::collections::HashMap<u32, (u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -629,10 +629,10 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: std::collections::HashMap<u32, u64, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The level each slot's view starts at, and where what it is read from
     /// ends ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, (u32, u64)>,
+    first: std::collections::HashMap<u32, (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
@@ -1009,6 +1009,15 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::in_order`]);
+/// `VICTORY_FAIR_DUE=0` serves every slot looked at before first, as
+/// before.
+fn fair_due() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAIR_DUE").is_none_or(|v| v != "0"))
+}
+
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
@@ -1026,10 +1035,8 @@ struct Waiting {
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
     /// For a slot uploaded whole and looked at again
-    /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
-    /// the fingerprint it had at the upload, how many looks found it
-    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
-    checked: (u64, u64, u64, u8, u64),
+    /// ([`TextureQueue::recheck`]). A fingerprint of 0: none.
+    checked: TextureRecheck,
     /// When the slot first waited for this (`crate::host::now_ms`), for
     /// `crate::texlate`: kept over writes until it is brought up to date;
     /// and whether it waited for its memory meanwhile.
@@ -1037,6 +1044,24 @@ struct Waiting {
     waited: bool,
     /// When a look last found its memory away (or no more of it): 0 none.
     away: u64,
+}
+
+/// The last whole upload of a texture picked by index, for the looks at
+/// its memory afterwards ([`TextureQueue::recheck`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TextureRecheck {
+    /// Where its memory is.
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    /// The fingerprint the memory had at the upload. 0: no look is due.
+    pub(crate) fingerprint: u64,
+    /// How many looks found it unchanged.
+    pub(crate) unchanged_looks: u8,
+    /// The frame of the upload.
+    pub(crate) uploaded: u64,
+    /// A look found this view's memory changed with nothing to tell of
+    /// it: such a texture is looked at for as long as the view stays.
+    pub(crate) changed_in_place: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1117,7 +1142,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default(), since, waited, away });
     }
 
     /// What a slot written again keeps of its wait.
@@ -1140,14 +1165,19 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it), newest write first: the look is a query, and memory
+    ///   that has arrived since is what the title streamed in last;
+    /// - the others, the newest write first and the oldest next, in turns:
+    ///   slot order served the low slots of a backlog of 25,000-40,000
+    ///   while the textures of the shot on screen waited (run 52: 98% of
+    ///   the drawn pixels had no colour texture in the first 3D frames);
+    /// - the two kinds one after the other, a slot looked at before first
+    ///   ([`fair_due`]). With all those looked at before first, a backlog
+    ///   of thousands of slots streaming in a part at a time filled every
+    ///   pass, which the pass's time then cut, and slots never looked at
+    ///   waited 300 to 1,500 frames: faces whose textures are picked by
+    ///   index read an empty slot (black) or an older view (red, noise).
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
         Self::in_order(self.all_due(frame), max)
@@ -1164,20 +1194,43 @@ impl TextureQueue {
 
     /// What [`TextureQueue::due`] says of `due` (with nothing held: some
     /// ten thousand slots are sorted).
-    fn in_order([mut again, mut fresh]: Due, max: usize) -> Vec<(u32, u64)> {
+    fn in_order(due: Due, max: usize) -> Vec<(u32, u64)> {
+        Self::in_order_as(due, max, fair_due())
+    }
+
+    /// [`TextureQueue::in_order`], the two kinds served in turns (`fair`)
+    /// or every slot looked at before first.
+    fn in_order_as([mut again, mut fresh]: Due, max: usize, fair: bool) -> Vec<(u32, u64)> {
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut fresh_order: Vec<(u32, u64)> = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        let mut again_order = again.iter().map(|&(_, index, write)| (index, write));
+        if !fair {
+            let mut order: Vec<(u32, u64)> = again_order.collect();
+            order.extend(fresh_order);
+            order.truncate(max);
+            return order;
+        }
+        let mut fresh_order = fresh_order.into_iter();
+        let mut order = Vec::with_capacity(max.min(fresh.len() + again.len()));
+        while order.len() < max {
+            let (a, b) = (again_order.next(), fresh_order.next());
+            if a.is_none() && b.is_none() {
+                break;
+            }
+            order.extend(a);
+            order.extend(b);
         }
         order.truncate(max);
         order
@@ -1244,22 +1297,21 @@ impl TextureQueue {
         }
     }
 
-    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
-    /// with fingerprint `print`: looked at again from frame `due`, for a
-    /// title that fills a texture's memory after it wrote the view (the
-    /// `looks`-th such look; `uploaded` is the upload's frame).
-    #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    /// Slot `index` was uploaded whole (`checked` says from where, and
+    /// with which fingerprint): looked at again from frame `due`, for a
+    /// title that fills a texture's memory after it wrote the view. Not
+    /// if the slot was written again meanwhile.
+    fn recheck(&mut self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
-            w.checked = (at.0, at.1, print, looks, uploaded);
+            w.checked = checked;
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
-    /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    /// still that write and waiting for such a look.
+    fn checked(&self, index: u32, write: u64) -> Option<TextureRecheck> {
+        self.slots.get(&index).filter(|w| w.write == write && w.checked.fingerprint != 0).map(|w| w.checked)
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1271,7 +1323,7 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         let (since, waited, away) = self.kept(index);
-        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), since, waited, away });
+        self.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: TextureRecheck::default(), since, waited, away });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1934,6 +1986,12 @@ impl HostHeap {
         self.dynamic
     }
 
+    /// How many dynamic slots are free (tests).
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> u32 {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).available()
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -1981,7 +2039,7 @@ impl HostHeap {
             .slots
             .iter()
             .filter(|(_, w)| w.due <= frame)
-            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.2 != 0))
+            .map(|(&index, w)| (index, w.mapped > 0 || w.checked.fingerprint != 0))
             .collect()
     }
 
@@ -2004,24 +2062,14 @@ impl HostHeap {
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn texture_slot_recheck(
-        &self,
-        index: u32,
-        write: u64,
-        due: u64,
-        at: (u64, u64),
-        print: u64,
-        looks: u8,
-        uploaded: u64,
-    ) {
+    pub(crate) fn texture_slot_recheck(&self, index: u32, write: u64, due: u64, checked: TextureRecheck) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, checked);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
+    pub(crate) fn texture_slot_checked(&self, index: u32, write: u64) -> Option<TextureRecheck> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index, write)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
@@ -2141,7 +2189,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
-        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.fingerprint != 0));
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
         if !due {
@@ -3043,15 +3091,25 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: a description that
+        // runs past it is not a valid call, and what a refused creation
+        // leaves in the slot is undefined, so a shader may read another
+        // resource through it. The range is clamped to what the buffer
+        // holds, which is also where reads past a view return zeros.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
+            self.null_raw_at(index);
+            return;
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3083,14 +3141,23 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all. What
+        // a refused description leaves in the slot is undefined, and a
+        // compute shader writing through such a slot can remove the device
+        // rather than do nothing.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
+            self.null_raw_uav_at(index);
+            return;
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -3570,7 +3637,7 @@ impl HostHeap {
                 w.written,
                 w.looks,
                 w.mapped,
-                w.checked.2 != 0
+                w.checked.fingerprint != 0
             ),
         }
     }
@@ -4579,6 +4646,31 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                // A view of more levels than its texture has removes the
+                // device at once (an invalid call; measured by the source
+                // of this check on the software adapter too). The title
+                // has such views of textures it placed in memory: 15
+                // levels from level 0 over a texture of 5 to 8. `from_base`
+                // cuts them for a copy of the smaller levels only; a whole
+                // copy's view went to the host as the title gave it.
+                if let Some(desc) = &mut desc {
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    if let Some((first, levels)) = within_levels(desc, own_mips) {
+                        static CUT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::warn!(
+                                n,
+                                first,
+                                levels,
+                                mips = own_mips,
+                                "texture view of levels its texture does not have: cut to the texture's (it would remove the device)"
+                            );
+                        }
+                    }
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4866,6 +4958,98 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
     }
     t.MostDetailedMip = 0;
     t.ResourceMinLODClamp = 0.0;
+}
+
+/// Cuts the view `desc` to the levels a texture of `mips` levels has: the
+/// first level it shows is one the texture has, and it shows no more than
+/// the texture has from there on (a count of `u32::MAX`, all from the
+/// first, is left). Says what the title asked for (first level, levels) if
+/// that was cut. Views without levels (buffers, multisampled textures,
+/// acceleration structures) and a texture that reports no levels are left.
+fn within_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) -> Option<(u32, u32)> {
+    if mips == 0
+        || matches!(
+            desc.ViewDimension,
+            D3D12_SRV_DIMENSION_UNKNOWN
+                | D3D12_SRV_DIMENSION_BUFFER
+                | D3D12_SRV_DIMENSION_TEXTURE2DMS
+                | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+                | D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+        )
+    {
+        return None;
+    }
+    // SAFETY: every texture member of the union that has levels starts
+    // with the first level and the count.
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    let asked = (t.MostDetailedMip, t.MipLevels);
+    t.MostDetailedMip = t.MostDetailedMip.min(mips - 1);
+    if t.MipLevels != u32::MAX {
+        t.MipLevels = t.MipLevels.min(mips - t.MostDetailedMip).max(1);
+    }
+    (asked != (t.MostDetailedMip, t.MipLevels)).then_some(asked)
+}
+
+#[cfg(test)]
+mod within_levels_tests {
+    use super::*;
+
+    fn view(dimension: D3D12_SRV_DIMENSION, first: u32, levels: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: dimension,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: first,
+                    MipLevels: levels,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        }
+    }
+
+    /// (First level, levels) of `desc`.
+    fn shown(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u32, u32) {
+        // SAFETY: made by `view`, which fills this member.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        (t.MostDetailedMip, t.MipLevels)
+    }
+
+    /// A view that names more levels than its texture has is cut to the
+    /// texture's, whatever the copy (the title's 15 levels over a texture
+    /// of 5 to 8); one inside the texture, and one of all levels from its
+    /// first, is left as it is; a buffer view is never touched.
+    #[test]
+    fn a_view_shows_no_more_levels_than_its_texture_has() {
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 0, 15);
+        assert_eq!(within_levels(&mut v, 5), Some((0, 15)));
+        assert_eq!(shown(&v), (0, 5));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURECUBE, 2, 15);
+        assert_eq!(within_levels(&mut v, 8), Some((2, 15)));
+        assert_eq!(shown(&v), (2, 6));
+        // A first level the texture does not have: its last one.
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2DARRAY, 9, 3);
+        assert_eq!(within_levels(&mut v, 4), Some((9, 3)));
+        assert_eq!(shown(&v), (3, 1));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 9, u32::MAX);
+        assert_eq!(within_levels(&mut v, 4), Some((9, u32::MAX)));
+        assert_eq!(shown(&v), (3, u32::MAX));
+        // Inside the texture: as the title gave it.
+        for (first, levels) in [(0, 5), (1, 4), (4, 1), (0, u32::MAX), (2, u32::MAX), (0, 1)] {
+            let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, first, levels);
+            assert_eq!(within_levels(&mut v, 5), None);
+            assert_eq!(shown(&v), (first, levels));
+        }
+        // No levels to speak of.
+        let mut v = view(D3D12_SRV_DIMENSION_BUFFER, 64, 4096);
+        assert_eq!(within_levels(&mut v, 1), None);
+        assert_eq!(shown(&v), (64, 4096));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 0, 15);
+        assert_eq!(within_levels(&mut v, 0), None);
+        assert_eq!(shown(&v), (0, 15));
+    }
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
@@ -5324,6 +5508,129 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         _ => {}
     }
     desc
+}
+
+/// Whether a raw buffer view is kept inside its buffer ([`raw_range`]; on by
+/// default, `VICTORY_RAW_VIEW_CLAMP=0`: the range is taken as asked, without
+/// a look at the buffer's size, as before).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// Where a raw buffer view starts and how many dwords it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// The raw view of `len` bytes from `offset` of a buffer of `size` bytes,
+/// kept inside the buffer: `None` when none of the range lies in it.
+///
+/// `FirstElement` is 64-bit and `NumElements` is 32-bit, so only the length
+/// is cut at `u32::MAX`; the start keeps its own value. Callers pass
+/// `offset` on 16 bytes, which a raw view needs; a start clamped to the
+/// buffer's end is put back on that boundary, where nothing is left to view
+/// anyway. A view keeps at least one dword where the buffer has one, as
+/// before the clamp.
+fn raw_range_in(size: u64, offset: u64, len: u64) -> Option<RawRange> {
+    let words = size / 4;
+    let asked = offset / 4;
+    let mut first = asked.min(words);
+    if first != asked {
+        first -= first & 3;
+    }
+    let elements = (len / 4).max(1).min(words - first).min(u64::from(u32::MAX));
+    (elements != 0).then_some(RawRange {
+        first,
+        elements: elements as u32,
+    })
+}
+
+/// [`raw_range_in`] for `buffer`; with [`raw_view_clamp`] off, the range
+/// as asked.
+fn raw_range(buffer: &ID3D12Resource, offset: u64, len: u64) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    if !offset.is_multiple_of(16) {
+        static ODD: std::sync::Once = std::sync::Once::new();
+        ODD.call_once(|| {
+            tracing::warn!(
+                offset,
+                "a raw buffer view asked for at an address that is not on 16 bytes"
+            )
+        });
+    }
+    // SAFETY: a live buffer.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    raw_range_in(size, offset, len)
+}
+
+/// Counts the ranges [`raw_range`] cut or emptied, and says so on the first
+/// and every 4096th: no run could otherwise tell whether the clamp applied
+/// at all. Both the SRV and the UAV path are counted.
+fn raw_range_count(offset: u64, len: u64, range: Option<RawRange>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLAMPED: AtomicU64 = AtomicU64::new(0);
+    static EMPTY: AtomicU64 = AtomicU64::new(0);
+    let Some(range) = range else {
+        let n = EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(4096) {
+            tracing::warn!(
+                offset,
+                len,
+                empty = n,
+                "a raw buffer view of no bytes inside the buffer: reads nothing"
+            );
+        }
+        return;
+    };
+    if range.first != offset / 4 || u64::from(range.elements) != (len / 4).max(1) {
+        let n = CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(4096) {
+            tracing::info!(
+                offset,
+                len,
+                first = range.first,
+                elements = range.elements,
+                clamped = n,
+                empty = EMPTY.load(Ordering::Relaxed),
+                "a raw buffer view cut to the buffer's size"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_range_tests {
+    use super::{RawRange, raw_range_in};
+
+    /// A raw view stays inside its buffer: a range that fits is kept as
+    /// asked, one that runs past the end is cut there, one that starts at
+    /// or past the end is nothing (the null raw view), and a view of fewer
+    /// than four bytes keeps one dword where the buffer has one.
+    #[test]
+    fn a_raw_view_stays_inside_its_buffer() {
+        let range = |first, elements| Some(RawRange { first, elements });
+        assert_eq!(raw_range_in(1024, 0, 1024), range(0, 256));
+        assert_eq!(raw_range_in(1024, 16, 64), range(4, 16));
+        // Runs past the end: cut at the buffer.
+        assert_eq!(raw_range_in(1024, 512, 4096), range(128, 128));
+        // Starts at the end, or past it: nothing to view.
+        assert_eq!(raw_range_in(1024, 1024, 16), None);
+        assert_eq!(raw_range_in(1024, 1 << 40, 16), None);
+        assert_eq!(raw_range_in(0, 0, 16), None);
+        // At least one dword, as before the clamp.
+        assert_eq!(raw_range_in(1024, 32, 0), range(8, 1));
+        assert_eq!(raw_range_in(1024, 32, 3), range(8, 1));
+        // The count is 32-bit; the start is not narrowed.
+        assert_eq!(raw_range_in(u64::MAX, 1 << 36, u64::MAX), range(1 << 34, u32::MAX));
+    }
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
@@ -5959,6 +6266,64 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first: a pass that can take only some
+    /// of a backlog of slots streaming in a part at a time still reaches
+    /// the slots never looked at.
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before (their memory not there yet).
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due(u64::MAX, 100).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1..4 never looked at.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = TextureQueue::in_order_as(q.all_due(10), 6, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
+        // With `VICTORY_FAIR_DUE=0`: every slot looked at before first, as
+        // before, so a full pass reaches no fresh slot.
+        let order: Vec<u32> = TextureQueue::in_order_as(q.all_due(10), 6, false).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order.iter().all(|&i| i >= 100), "the slots looked at before fill the pass: {order:?}");
+    }
+
+    /// A texture found changed in place stays in the queue for its looks;
+    /// a new write of its slot drops what was noted of the old view, and
+    /// what the pass says of the old write changes nothing.
+    #[test]
+    fn a_descriptor_rewrite_clears_periodic_texture_rechecks() {
+        let mut queue = TextureQueue::default();
+        queue.written(1, 1, 1, false);
+        let write = queue.due(1, 1)[0].1;
+        let checked = TextureRecheck {
+            address: 0x10000,
+            bytes: 0x2000,
+            fingerprint: 1,
+            unchanged_looks: 4,
+            uploaded: 1,
+            changed_in_place: true,
+        };
+        queue.recheck(1, write, 401, checked);
+        assert!(queue.due(400, 1).is_empty());
+        assert_eq!(queue.due(401, 1), [(1, write)]);
+        assert_eq!(queue.checked(1, write), Some(checked));
+
+        queue.written(1, 402, 402, false);
+        let new_write = queue.due(402, 1)[0].1;
+        queue.recheck(1, write, 801, checked);
+        assert_eq!(queue.due(402, 1), [(1, new_write)]);
+        assert_eq!(queue.checked(1, new_write), None);
     }
 
     /// Slots held back for lack of room on the card are not handed out
