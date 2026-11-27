@@ -3043,15 +3043,25 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: a description that
+        // runs past it is not a valid call, and what a refused creation
+        // leaves in the slot is undefined, so a shader may read another
+        // resource through it. The range is clamped to what the buffer
+        // holds, which is also where reads past a view return zeros.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
+            self.null_raw_at(index);
+            return;
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3083,14 +3093,23 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all. What
+        // a refused description leaves in the slot is undefined, and a
+        // compute shader writing through such a slot can remove the device
+        // rather than do nothing.
+        let Some(range) = raw_range(buffer, offset, len) else {
+            raw_range_count(offset, len, None);
+            self.null_raw_uav_at(index);
+            return;
+        };
+        raw_range_count(offset, len, Some(range));
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -5324,6 +5343,129 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         _ => {}
     }
     desc
+}
+
+/// Whether a raw buffer view is kept inside its buffer ([`raw_range`]; on by
+/// default, `VICTORY_RAW_VIEW_CLAMP=0`: the range is taken as asked, without
+/// a look at the buffer's size, as before).
+fn raw_view_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+}
+
+/// Where a raw buffer view starts and how many dwords it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawRange {
+    first: u64,
+    elements: u32,
+}
+
+/// The raw view of `len` bytes from `offset` of a buffer of `size` bytes,
+/// kept inside the buffer: `None` when none of the range lies in it.
+///
+/// `FirstElement` is 64-bit and `NumElements` is 32-bit, so only the length
+/// is cut at `u32::MAX`; the start keeps its own value. Callers pass
+/// `offset` on 16 bytes, which a raw view needs; a start clamped to the
+/// buffer's end is put back on that boundary, where nothing is left to view
+/// anyway. A view keeps at least one dword where the buffer has one, as
+/// before the clamp.
+fn raw_range_in(size: u64, offset: u64, len: u64) -> Option<RawRange> {
+    let words = size / 4;
+    let asked = offset / 4;
+    let mut first = asked.min(words);
+    if first != asked {
+        first -= first & 3;
+    }
+    let elements = (len / 4).max(1).min(words - first).min(u64::from(u32::MAX));
+    (elements != 0).then_some(RawRange {
+        first,
+        elements: elements as u32,
+    })
+}
+
+/// [`raw_range_in`] for `buffer`; with [`raw_view_clamp`] off, the range
+/// as asked.
+fn raw_range(buffer: &ID3D12Resource, offset: u64, len: u64) -> Option<RawRange> {
+    if !raw_view_clamp() {
+        return Some(RawRange {
+            first: offset / 4,
+            elements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+        });
+    }
+    if !offset.is_multiple_of(16) {
+        static ODD: std::sync::Once = std::sync::Once::new();
+        ODD.call_once(|| {
+            tracing::warn!(
+                offset,
+                "a raw buffer view asked for at an address that is not on 16 bytes"
+            )
+        });
+    }
+    // SAFETY: a live buffer.
+    let size = unsafe { buffer.GetDesc() }.Width;
+    raw_range_in(size, offset, len)
+}
+
+/// Counts the ranges [`raw_range`] cut or emptied, and says so on the first
+/// and every 4096th: no run could otherwise tell whether the clamp applied
+/// at all. Both the SRV and the UAV path are counted.
+fn raw_range_count(offset: u64, len: u64, range: Option<RawRange>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLAMPED: AtomicU64 = AtomicU64::new(0);
+    static EMPTY: AtomicU64 = AtomicU64::new(0);
+    let Some(range) = range else {
+        let n = EMPTY.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(4096) {
+            tracing::warn!(
+                offset,
+                len,
+                empty = n,
+                "a raw buffer view of no bytes inside the buffer: reads nothing"
+            );
+        }
+        return;
+    };
+    if range.first != offset / 4 || u64::from(range.elements) != (len / 4).max(1) {
+        let n = CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(4096) {
+            tracing::info!(
+                offset,
+                len,
+                first = range.first,
+                elements = range.elements,
+                clamped = n,
+                empty = EMPTY.load(Ordering::Relaxed),
+                "a raw buffer view cut to the buffer's size"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_range_tests {
+    use super::{RawRange, raw_range_in};
+
+    /// A raw view stays inside its buffer: a range that fits is kept as
+    /// asked, one that runs past the end is cut there, one that starts at
+    /// or past the end is nothing (the null raw view), and a view of fewer
+    /// than four bytes keeps one dword where the buffer has one.
+    #[test]
+    fn a_raw_view_stays_inside_its_buffer() {
+        let range = |first, elements| Some(RawRange { first, elements });
+        assert_eq!(raw_range_in(1024, 0, 1024), range(0, 256));
+        assert_eq!(raw_range_in(1024, 16, 64), range(4, 16));
+        // Runs past the end: cut at the buffer.
+        assert_eq!(raw_range_in(1024, 512, 4096), range(128, 128));
+        // Starts at the end, or past it: nothing to view.
+        assert_eq!(raw_range_in(1024, 1024, 16), None);
+        assert_eq!(raw_range_in(1024, 1 << 40, 16), None);
+        assert_eq!(raw_range_in(0, 0, 16), None);
+        // At least one dword, as before the clamp.
+        assert_eq!(raw_range_in(1024, 32, 0), range(8, 1));
+        assert_eq!(raw_range_in(1024, 32, 3), range(8, 1));
+        // The count is 32-bit; the start is not narrowed.
+        assert_eq!(raw_range_in(u64::MAX, 1 << 36, u64::MAX), range(1 << 34, u32::MAX));
+    }
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
