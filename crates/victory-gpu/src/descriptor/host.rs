@@ -4598,6 +4598,31 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                // A view of more levels than its texture has removes the
+                // device at once (an invalid call; measured by the source
+                // of this check on the software adapter too). The title
+                // has such views of textures it placed in memory: 15
+                // levels from level 0 over a texture of 5 to 8. `from_base`
+                // cuts them for a copy of the smaller levels only; a whole
+                // copy's view went to the host as the title gave it.
+                if let Some(desc) = &mut desc {
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    if let Some((first, levels)) = within_levels(desc, own_mips) {
+                        static CUT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::warn!(
+                                n,
+                                first,
+                                levels,
+                                mips = own_mips,
+                                "texture view of levels its texture does not have: cut to the texture's (it would remove the device)"
+                            );
+                        }
+                    }
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4885,6 +4910,98 @@ fn show_prefilled(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, levels: u32) {
     }
     t.MostDetailedMip = 0;
     t.ResourceMinLODClamp = 0.0;
+}
+
+/// Cuts the view `desc` to the levels a texture of `mips` levels has: the
+/// first level it shows is one the texture has, and it shows no more than
+/// the texture has from there on (a count of `u32::MAX`, all from the
+/// first, is left). Says what the title asked for (first level, levels) if
+/// that was cut. Views without levels (buffers, multisampled textures,
+/// acceleration structures) and a texture that reports no levels are left.
+fn within_levels(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) -> Option<(u32, u32)> {
+    if mips == 0
+        || matches!(
+            desc.ViewDimension,
+            D3D12_SRV_DIMENSION_UNKNOWN
+                | D3D12_SRV_DIMENSION_BUFFER
+                | D3D12_SRV_DIMENSION_TEXTURE2DMS
+                | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+                | D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE
+        )
+    {
+        return None;
+    }
+    // SAFETY: every texture member of the union that has levels starts
+    // with the first level and the count.
+    let t = unsafe { &mut desc.Anonymous.Texture2D };
+    let asked = (t.MostDetailedMip, t.MipLevels);
+    t.MostDetailedMip = t.MostDetailedMip.min(mips - 1);
+    if t.MipLevels != u32::MAX {
+        t.MipLevels = t.MipLevels.min(mips - t.MostDetailedMip).max(1);
+    }
+    (asked != (t.MostDetailedMip, t.MipLevels)).then_some(asked)
+}
+
+#[cfg(test)]
+mod within_levels_tests {
+    use super::*;
+
+    fn view(dimension: D3D12_SRV_DIMENSION, first: u32, levels: u32) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+        D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: dimension,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: first,
+                    MipLevels: levels,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        }
+    }
+
+    /// (First level, levels) of `desc`.
+    fn shown(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> (u32, u32) {
+        // SAFETY: made by `view`, which fills this member.
+        let t = unsafe { desc.Anonymous.Texture2D };
+        (t.MostDetailedMip, t.MipLevels)
+    }
+
+    /// A view that names more levels than its texture has is cut to the
+    /// texture's, whatever the copy (the title's 15 levels over a texture
+    /// of 5 to 8); one inside the texture, and one of all levels from its
+    /// first, is left as it is; a buffer view is never touched.
+    #[test]
+    fn a_view_shows_no_more_levels_than_its_texture_has() {
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 0, 15);
+        assert_eq!(within_levels(&mut v, 5), Some((0, 15)));
+        assert_eq!(shown(&v), (0, 5));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURECUBE, 2, 15);
+        assert_eq!(within_levels(&mut v, 8), Some((2, 15)));
+        assert_eq!(shown(&v), (2, 6));
+        // A first level the texture does not have: its last one.
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2DARRAY, 9, 3);
+        assert_eq!(within_levels(&mut v, 4), Some((9, 3)));
+        assert_eq!(shown(&v), (3, 1));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 9, u32::MAX);
+        assert_eq!(within_levels(&mut v, 4), Some((9, u32::MAX)));
+        assert_eq!(shown(&v), (3, u32::MAX));
+        // Inside the texture: as the title gave it.
+        for (first, levels) in [(0, 5), (1, 4), (4, 1), (0, u32::MAX), (2, u32::MAX), (0, 1)] {
+            let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, first, levels);
+            assert_eq!(within_levels(&mut v, 5), None);
+            assert_eq!(shown(&v), (first, levels));
+        }
+        // No levels to speak of.
+        let mut v = view(D3D12_SRV_DIMENSION_BUFFER, 64, 4096);
+        assert_eq!(within_levels(&mut v, 1), None);
+        assert_eq!(shown(&v), (64, 4096));
+        let mut v = view(D3D12_SRV_DIMENSION_TEXTURE2D, 0, 15);
+        assert_eq!(within_levels(&mut v, 0), None);
+        assert_eq!(shown(&v), (0, 15));
+    }
 }
 
 /// The view `desc` of a texture, of a host copy of its levels from `base`
