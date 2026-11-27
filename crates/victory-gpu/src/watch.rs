@@ -2931,9 +2931,9 @@ fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
 /// Whether `[start, end)` is view memory. The title's views lie in
 /// placeholders, mapped and unmapped block by block as it streams, so a
 /// range can begin in a block that is not mapped right now: the first
-/// pages of the range that are there decide. A range with nothing there
-/// counts as a view (its blocks are noted absent, and looked at again when
-/// the runtime maps them).
+/// pages of the range that are there decide. A range of placeholders with
+/// nothing there counts as a view (its blocks are noted absent, and looked
+/// at again when the runtime maps them); free memory is none.
 ///
 /// Looking at the first address only took such a range for "not a view":
 /// its copy was marked not watched for good and copied whole at every
@@ -2942,7 +2942,7 @@ fn protect_run(g: &Guards, from: usize, to: usize, claims: &mut Claims) {
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
@@ -2959,11 +2959,17 @@ fn is_view(start: usize, end: usize) -> bool {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
-        // the answer as it was before.
-        if info.State == MEM_COMMIT || !holes {
+        // the answer as it was before. Free memory is no one's yet: taken
+        // for a view, its blocks were noted absent and guarded once
+        // something was allocated there, the process heap too (its own
+        // code then faulted while holding its lock, the fault waited for
+        // the guard lock, and the guard lock's holder for the heap: PalmVI's
+        // world froze seconds after the structure builder started,
+        // c5b31041; as Marvisak/VIctory#1849 found under Wine).
+        if info.State == MEM_COMMIT || info.State == MEM_FREE || !holes {
             return false;
         }
-        // A hole (a placeholder, or free): on to what follows it.
+        // A hole (a placeholder): on to what follows it.
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if next <= at || next >= end {
             return true;
@@ -3082,7 +3088,50 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
 }
 
 /// [`protect`] for one range, without the other views of its pages.
+///
+/// Only view memory is made read-only. A range can run past the views into
+/// other committed memory (a window that begins in mapped memory, so
+/// [`is_view`] says yes): refused whole, it was made read-only block by
+/// block, every committed private block in it too, the process heap's among
+/// them. The heap's own code then faulted while holding its lock, the
+/// faults waited for the guard lock, and the world froze (PalmVI c5b31041,
+/// from fxceless/victory-fork #1147). Committed private memory and images
+/// are never guarded, and not noted absent either (as Marvisak/VIctory's
+/// 280b150 decides region by region).
 fn protect_here(g: &Guards, from: usize, to: usize) {
+    let mut at = from;
+    while at < to {
+        let (end, view) = view_run(at, to);
+        if view {
+            protect_views(g, at, end);
+        }
+        at = end;
+    }
+}
+
+/// From `block` on (to `to` at most): the end of the run of blocks whose
+/// memory is of one kind, and whether that kind may be guarded (anything
+/// but committed private memory and images: views, and placeholders, which
+/// [`protect_views`] notes absent when a protection fails).
+fn view_run(block: usize, to: usize) -> (usize, bool) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return (block + 1, false);
+    }
+    let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize).div_ceil(BLOCK)).clamp(block + 1, to);
+    let other = info.State == MEM_COMMIT && (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE);
+    (end, !other)
+}
+
+/// [`protect_here`] for a run of blocks that are not committed private
+/// memory or an image: whole, else block by block.
+fn protect_views(g: &Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -3146,13 +3195,14 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
-    if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
+    // (Placeholders only: free memory is not noted absent, see `is_view`.)
+    if n != 0 && info.State == MEM_RESERVE {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
         block
@@ -4135,6 +4185,84 @@ mod tests {
             let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
             VirtualQuery(at as *const _, &mut info, size_of_val(&info));
             info.Protect
+        }
+    }
+
+    /// Free memory is not tracked: tracked, it would be guarded once
+    /// something is allocated there (the process heap: its writes then
+    /// fault into the handler while a thread holds the guard lock).
+    #[test]
+    fn free_memory_is_not_tracked() {
+        use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: a reservation of ours, released at once: free memory.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(r, 0);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+        let view = is_view(r, r + 2 * PAGE);
+        let tracked = track(r, 2 * PAGE, true).is_some();
+        // Other tests allocate meanwhile: only memory still free counts.
+        // SAFETY: plain data filled in by the query, of the right size.
+        let still_free = unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(r as *const _, &mut info, size_of_val(&info)) != 0
+                && info.State == MEM_FREE
+                && info.BaseAddress as usize + info.RegionSize >= r + 2 * PAGE
+        };
+        assert!(!((view || tracked) && still_free), "free memory");
+    }
+
+    /// A range that begins in a view and runs into committed private
+    /// memory guards the view only: the private block (the process heap's,
+    /// say) stays writable.
+    #[test]
+    fn committed_private_memory_beside_a_view_is_not_guarded() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_READONLY, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // A placeholder of two blocks, split; a pagefile section's block
+        // mapped over the first, private memory committed over the second.
+        let p = placeholder(2);
+        // SAFETY: a section of our own, mapped in place of our placeholder.
+        let (section, view) = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(view.Value as usize, p);
+            (section, view)
+        };
+        private_at(p + BLOCK, PAGE_READWRITE);
+        title_memory_remapped(p, BLOCK);
+        assert!(is_view(p, p + 2 * BLOCK), "it begins in a view");
+        assert!(guard(p, p + 2 * BLOCK).is_some());
+        assert_eq!(protection(p), PAGE_READONLY, "the view is guarded");
+        assert_eq!(protection(p + BLOCK), PAGE_READWRITE, "the private block is not");
+        {
+            let g = guards();
+            assert!(g.protected.contains(p / BLOCK));
+            assert!(!g.protected.contains(p / BLOCK + 1) && !g.absent.contains(p / BLOCK + 1));
+        }
+        // SAFETY: committed private memory of ours, writable.
+        unsafe { ((p + BLOCK + 8) as *mut u8).write_volatile(1) };
+        // Before the view goes, as the runtime does.
+        title_memory_unmapping(p, 2 * BLOCK);
+        // SAFETY: our view, section and private block.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, 0);
+            VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 
