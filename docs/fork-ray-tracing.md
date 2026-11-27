@@ -91,7 +91,7 @@ after it was given them as an unordered access view.
 
 | variable | does |
 |---|---|
-| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_BUILDER=1` | the builder's stages run. If title memory by address runs out of copy numbers (4,095) and a stage names a page that so gets no copy, the builder turns off for the rest of the run instead of running stages that read zeros (the log says so, with the copies numbered so far; after PalmVI 080fb856) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |

@@ -303,6 +303,9 @@ struct Memory {
     /// window's place in `copies`: where a copy of those results reads them
     /// ([`results`]).
     results: HashMap<u64, usize>,
+    /// A page the current [`ready`] named found no number left for the copy
+    /// that would hold it ([`Memory::number`]).
+    short: bool,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -361,6 +364,10 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// No page the dispatch names was left without a copy for want of a
+    /// number. False once the numbers have run out ([`COPIES`]): what it
+    /// names then reads zeros, a dropped stage for the structure builder.
+    pub(crate) whole: bool,
 }
 
 impl Memory {
@@ -412,6 +419,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             results: HashMap::new(),
+            short: false,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -462,8 +470,18 @@ impl Memory {
             return Some(n);
         }
         if self.copies.len() >= COPIES as usize {
+            self.short = true;
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
+            ONCE.call_once(|| {
+                let (arenas, windows) = (self.arenas.len(), self.windows);
+                tracing::warn!(
+                    COPIES,
+                    arenas,
+                    windows,
+                    title_buffers = self.copies.len().saturating_sub(arenas + windows),
+                    "title memory by address: no number left for another copy; its pages read zeros, and a stage of the structure builder that names one turns the builder off (numbered so far, by what they are)"
+                )
+            });
             return None;
         }
         // SAFETY: a live buffer.
@@ -1594,6 +1612,9 @@ pub(crate) fn ready(
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    // From here on: what this dispatch names. (The faults' pages and the
+    // spare arena are not its own.)
+    m.short = false;
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1744,6 +1765,7 @@ pub(crate) fn ready(
         // (The shader's places are the same in either half.)
         faults: m.faults.2 + if builds { u64::from(MEMORY_FAULTS) * 4 } else { 0 },
         base,
+        whole: !m.short,
     })
 }
 

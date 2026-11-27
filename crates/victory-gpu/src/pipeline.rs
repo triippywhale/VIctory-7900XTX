@@ -297,7 +297,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// is off; it is looked at again when the title creates another. A stage
 /// that could not be bound stops the stages after it for the rest of that
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
-/// rest of the run at first.
+/// rest of the run at first. A stage whose pages would read zeros because
+/// title memory by address has no number left for another copy still does
+/// ([`builder_off`]): the numbers do not come back.
 ///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
@@ -314,6 +316,8 @@ struct Builder {
     rests: u64,
     /// It waited for pipelines being made since it last ran.
     waited: bool,
+    /// Off for the rest of the run ([`builder_off`]).
+    stopped: bool,
 }
 
 #[cfg(windows)]
@@ -323,6 +327,7 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: 0,
     rests: 0,
     waited: false,
+    stopped: false,
 });
 
 /// Whether `shaders` are a pipeline of the structure builder.
@@ -373,6 +378,17 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// A stage of the builder was dropped for a reason that does not pass (title
+/// memory by address has no number left for another copy): none runs from
+/// here on.
+#[cfg(windows)]
+pub(crate) fn builder_off(why: &'static str) {
+    let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if !std::mem::replace(&mut b.stopped, true) {
+        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+    }
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
@@ -382,7 +398,7 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
+    if b.stopped || b.off == b.pipelines.len() || crate::frame::current() < b.rests {
         return false;
     }
     if b.whole {
