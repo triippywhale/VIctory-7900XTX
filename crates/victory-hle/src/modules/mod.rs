@@ -9,6 +9,8 @@
 //! `xaudio2`, `xstore` stubs.
 
 #[cfg(windows)]
+pub mod affinity;
+#[cfg(windows)]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
@@ -57,6 +59,8 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
+    #[cfg(windows)]
+    all.push(affinity::module());
     #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
