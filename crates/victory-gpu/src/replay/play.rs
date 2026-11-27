@@ -286,7 +286,7 @@ fn chosen(r: &wire::Resource, only: &[String]) -> bool {
     only.iter().all(|f| {
         // `opened`: the heaps opened on title memory (renderer port 1),
         // moved whole in `make_resources`; no committed buffer is in one.
-        if f == "opened" {
+        if f == "opened" || f.starts_with("opened-") {
             return false;
         }
         let (no, f) = match f.strip_prefix('!') {
@@ -852,16 +852,36 @@ impl Player {
             );
             tracing::info!("replay: {line}");
             self.notes.push(line);
+            let mut sizes: Vec<u64> = self.frame.heaps.iter().filter(|h| opened.contains(&h.id)).map(|h| h.size).collect();
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            if !sizes.is_empty() {
+                let top: Vec<String> = sizes.iter().take(8).map(|&b| format!("{:.2}", mb(b))).collect();
+                let small = sizes.iter().filter(|&&b| b < 1 << 20).count();
+                let line = format!(
+                    "heaps opened on title memory, the largest (MB): {}; {small} of them under 1 MB ({:.0} MB together)",
+                    top.join(", "),
+                    mb(sizes.iter().filter(|&&b| b < 1 << 20).sum())
+                );
+                tracing::info!("replay: {line}");
+                self.notes.push(line);
+            }
         }
         // `--only-buffers opened`: of the heaps, only those opened on title
         // memory move (renderer port 1's memory, as if the port were off).
-        let only_opened = only.iter().any(|f| f == "opened");
+        // `opened-min=<bytes>`, `opened-max=<bytes>`: only those of that size.
+        let only_opened = only.iter().any(|f| f == "opened" || f.starts_with("opened-"));
+        let bound = |key: &str| {
+            only.iter()
+                .find_map(|f| f.strip_prefix(key))
+                .and_then(|v| v.parse::<u64>().ok())
+        };
+        let (least, most) = (bound("opened-min=").unwrap_or(0), bound("opened-max=").unwrap_or(u64::MAX));
         for h in &self.frame.heaps {
             if leave_opened && opened.contains(&h.id) {
                 continue;
             }
             let moved = if only_opened {
-                opened.contains(&h.id)
+                opened.contains(&h.id) && (least..=most).contains(&h.size)
             } else {
                 only.is_empty() && used_by_buffers_only.contains(&h.id)
             };
