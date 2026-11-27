@@ -10278,14 +10278,15 @@ impl Meter {
                     du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                     du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                     refused = format!(
-                        "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass, {} of those given the pass before the use after all (VICTORY_PLANE_NOW)",
+                        "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass, {} of those given the pass before the use after all (VICTORY_PLANE_NOW); shader views in the sRGB twin of their texture's format, read without the conversion: {}",
                         crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                         crate::shadow::OWN_MADE.load(Ordering::Relaxed),
                         crate::resource::TWINS[0].load(Ordering::Relaxed),
                         crate::resource::TWINS[1].load(Ordering::Relaxed),
                         crate::resource::PLANES[1].load(Ordering::Relaxed),
                         crate::resource::PLANES[2].load(Ordering::Relaxed),
-                        crate::resource::PLANES[3].load(Ordering::Relaxed)
+                        crate::resource::PLANES[3].load(Ordering::Relaxed),
+                        crate::descriptor::host::SRGB_LOST_VIEWS.load(Ordering::Relaxed)
                     ),
                     making = crate::pipeline::making(),
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),

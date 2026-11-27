@@ -4390,12 +4390,37 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
+    // Counted (the shortcut above; PastiiJay/klbf-lab's silent-defects audit,
+    // A7, had no number for it either): a shader view that asks for the sRGB
+    // conversion of a texture made without it, or the other way round, is
+    // about to take the texture's format and read without (or with) it.
+    if !unordered && !typeless && srgb_differs(view, own) {
+        let lost = SRGB_LOST_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if lost.is_power_of_two() {
+            tracing::warn!(lost, view, texture = own, "a shader view in the sRGB twin of its texture's format reads without (or with) the sRGB conversion");
+        }
+    }
     if let Some(format) = format
         && !typeless
     {
         *format = d.Format;
     }
     true
+}
+
+/// Shader views made in the sRGB twin of their typed texture's format (or
+/// the linear twin of an sRGB texture's) since the start: they read in the
+/// texture's format ([`fits`]).
+pub(crate) static SRGB_LOST_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// DXGI formats with an sRGB twin: (linear, sRGB). R8G8B8A8, BC1, BC2,
+/// BC3, B8G8R8A8, B8G8R8X8, BC7.
+const SRGB_TWINS: [(u32, u32); 7] = [(28, 29), (71, 72), (74, 75), (77, 78), (87, 91), (88, 93), (98, 99)];
+
+/// Whether formats `a` and `b` are the two twins of one pair: the same
+/// bits, read with the sRGB conversion by one and without by the other.
+fn srgb_differs(a: u32, b: u32) -> bool {
+    SRGB_TWINS.iter().any(|&(linear, srgb)| (a, b) == (linear, srgb) || (a, b) == (srgb, linear))
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
