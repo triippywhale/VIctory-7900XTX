@@ -118,12 +118,20 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let g = match job {
             Job::Graphics(i) => &graphics[i],
             Job::Compute(i) => {
-                let (cs, _) = container(compute[i].stage.program).ok_or("shader not found")?;
+                let (cs, _) = container(compute[i].stage.program).ok_or("compute shader not found")?;
                 return Ok(Prebuild::compute(&cs));
             }
         };
-        let [ps, vs, gs, es, ..] = g.stages;
-        if g.stages[4..].iter().any(Option::is_some) {
+        // The last slot, a vertex-fetch program, is ignored: the console
+        // driver builds it from the input layout, which the stream carries,
+        // and a run's vertex shader gets its attributes as inputs (the
+        // container's call to it is the translator's fetch call). Two
+        // records of the title have one, a debug-draw vertex shader with
+        // POSITION and COLOR; every other vertex record has it folded in.
+        // That vertex shader is in none of the title's files, so those two
+        // are still skipped, now as "vertex or mesh shader not found".
+        let [ps, vs, gs, es, hs, ls, _fetch] = g.stages;
+        if hs.is_some() || ls.is_some() {
             return Err("stages other than vertex, geometry, mesh and pixel".into());
         }
         // A geometry pipeline: the vertex shader runs as the ES, the GS slot
@@ -132,19 +140,19 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let mut geometry = None;
         let (first, stage) = match es {
             Some(es) => {
-                let (vs, stage) = container(es.program).ok_or("shader not found")?;
+                let (vs, stage) = container(es.program).ok_or("vertex shader (ES) not found")?;
                 let (g, gstage) =
-                    gs.and_then(|s| container(s.program)).ok_or("shader not found")?;
+                    gs.and_then(|s| container(s.program)).ok_or("geometry shader not found")?;
                 if (stage, gstage) != (HwStage::Es, HwStage::Gs) {
                     return Err("an ES without a geometry program".into());
                 }
                 geometry = Some(g);
                 (vs, HwStage::Vs)
             }
-            None => vs.or(gs).and_then(|s| container(s.program)).ok_or("shader not found")?,
+            None => vs.or(gs).and_then(|s| container(s.program)).ok_or("vertex or mesh shader not found")?,
         };
         let pixel = match ps {
-            Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
+            Some(ps) => Some(container(ps.program).ok_or("pixel shader not found")?.0),
             None => None,
         };
         let mesh = match stage {
