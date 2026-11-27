@@ -328,6 +328,39 @@ impl HostList {
         true
     }
 
+    /// (`crate::memory`, `VICTORY_BVH_MIRROR`) At this place of the list the
+    /// card copies `len` bytes of the host copy `from` (title address `src`)
+    /// into the host copy `to` at its address `dst`: what shaders wrote into
+    /// a title buffer's own copy, for the by-address copy of a page the
+    /// buffer shares. `false` if nothing was recorded.
+    pub(crate) fn mirror_copy(&self, from: &std::sync::Arc<Shadow>, src: u64, to: &std::sync::Arc<Shadow>, dst: u64, len: u64) -> bool {
+        let Some(host) = host() else {
+            return false;
+        };
+        if len == 0
+            || from.buffer.as_raw() == to.buffer.as_raw()
+            || from.offset_in(src).is_none()
+            || to.offset_in(dst).is_none()
+            || from.left(src) < len
+            || to.left(dst) < len
+        {
+            return false;
+        }
+        // What the title's CPU wrote there so far goes first.
+        from.refresh(self, src, len);
+        self.keep(&from.buffer);
+        self.keep(&to.buffer);
+        // SAFETY: an open list; live buffers the list keeps, ranges inside
+        // them (checked above).
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&to.buffer, to.offset(dst), &from.buffer, from.offset(src), len);
+            wait_for_all(host, &self.list);
+        }
+        self.changed_something();
+        true
+    }
+
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
     /// copies) that holds what shaders wrote there, at this place of the list.
     /// `None` where shaders do not write it.
