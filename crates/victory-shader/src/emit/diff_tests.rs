@@ -981,6 +981,161 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A mesh shader of 128 vertices with 72 scalars each: 36,864 bytes of
+/// outputs, past the 32 KiB the DXIL validator allows. `OVER` is that
+/// shader, one group; without it the same vertices and triangles come from
+/// two groups of 64 vertices, within the limit. Each half draws 22
+/// triangles over 21 cells of its own, and `wps` sums every attribute
+/// with a weight of its own.
+const WIDE_MS: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0)"
+cbuffer K : register(b0) { float4 k; };
+struct W { float4 pos : SV_Position; float4 a[17] : TEXCOORD0; };
+[RootSignature(RS)] float4 wps(W i) : SV_Target {
+    float4 s = 0;
+    for (uint n = 0; n < 17; n++) s += i.a[n] * (n + 1);
+    return s;
+}
+W vert(uint h, uint j) {
+    uint t = min(j / 3, 20);
+    uint c = j == 63 ? 3 : j % 3;
+    uint cell = h * 21 + t;
+    float2 size = float2(0.25, 1.0 / 3);
+    W v;
+    v.pos = float4((float2(cell % 8, cell / 8) + float2(c & 1, c >> 1)) * size - 1, 0.5, 1);
+    uint g = h * 64 + j;
+    for (uint n = 0; n < 17; n++)
+        v.a[n] = float4(g * k.x + n, g + n * k.y, n * 4 + (g & 3), k.z + g * n + 1);
+    return v;
+}
+uint3 tri(uint base, uint t) {
+    if (t < 21) return base + uint3(3 * t, 3 * t + 1, 3 * t + 2);
+    if (t == 21) return base + uint3(62, 61, 63);
+    return uint3(0, 0, 0);
+}
+#ifdef OVER
+[RootSignature(RS)] [outputtopology("triangle")] [numthreads(128, 1, 1)]
+void wms(uint i : SV_GroupIndex, out vertices W verts[128], out indices uint3 tris[128]) {
+    SetMeshOutputCounts(128, 128);
+    verts[i] = vert(i / 64, i % 64);
+    tris[i] = tri(i / 64 * 64, i % 64);
+}
+#else
+[RootSignature(RS)] [outputtopology("triangle")] [numthreads(64, 1, 1)]
+void wms(uint i : SV_GroupIndex, uint3 g : SV_GroupID, out vertices W verts[64],
+         out indices uint3 tris[64]) {
+    SetMeshOutputCounts(64, 64);
+    verts[i] = vert(g.x, i);
+    tris[i] = tri(0, i);
+}
+#endif
+"#;
+
+/// 71 of the title's mesh programs (ped and transform variants) declare 128
+/// vertices of 65 to 71 scalars: 33 to 36 KiB of outputs, where D3D12
+/// documents 32 KiB and the DXIL validator refuses the shader. They are
+/// emitted as they are (`mesh_prologue`), under the hash we compute. Here
+/// the host draws such a shader, compiled for PC without validation, and
+/// every vertex's every attribute arrives as it does from a shader within
+/// the limit. Needs only the PC compiler.
+#[test]
+fn a_mesh_shader_past_the_output_limit_draws_whole() {
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => Some(PathBuf::from(p)),
+        None => super::validator::Validator::default_path().map(|p| p.with_file_name("dxc.exe")),
+    };
+    let Some(pc) = pc.filter(|p| p.exists()) else {
+        eprintln!("no PC compiler; skipped");
+        return;
+    };
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
+    };
+    let dir = std::env::temp_dir().join(format!("victory-wide-ms-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("wide.hlsl");
+    std::fs::write(&input, WIDE_MS).unwrap();
+    let compile = |entry: &str, profile: &str, extra: &[&str]| {
+        let output = dir.join(format!("{entry}{}.bin", extra.len()));
+        let out = std::process::Command::new(&pc)
+            .args(["-T", profile, "-E", entry, "-Fo"])
+            .arg(&output)
+            .arg(&input)
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read(output).unwrap()
+    };
+    let ps = compile("wps", "ps_6_5", &[]);
+    let within = compile("wms", "ms_6_5", &[]);
+    // Past the limit: not validated, so not signed; the hash is ours.
+    let mut over = compile("wms", "ms_6_5", &["-DOVER", "-Vd"]);
+    let digest = super::container::hash(&over[20..]);
+    over[4..20].copy_from_slice(&digest);
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        let refused = v.validate(&mut over.clone()).unwrap_err();
+        assert!(
+            refused.contains("output size is greater than 32768"),
+            "{refused}"
+        );
+    }
+    let k = [0.75f32, -1.5, 2.0, 0.125].map(f32::to_bits);
+    let image = |ms: &[u8], mesh_groups| {
+        // SAFETY: the container carries its root signature.
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, ms) }.unwrap();
+        let pso = host.mesh_pipeline_with(&root, ms, &ps).unwrap();
+        host.draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![(0, Root::Constants(k.to_vec()))],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (48, 48),
+                mesh_groups,
+            },
+        )
+        .unwrap()
+    };
+    let (ours, theirs) = (image(&over, 1), image(&within, 2));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Both drew the same texels, about half of each of the 42 cells (a
+    // drawn texel's alpha is never 0: every term of its sum is positive).
+    let drawn = |texels: &[[f32; 4]]| texels.iter().filter(|t| t[3] != 0.0).count();
+    assert_eq!(drawn(&ours), drawn(&theirs));
+    assert!(drawn(&theirs) >= 42 * 12, "{} texels drawn", drawn(&theirs));
+    let worst = ours
+        .iter()
+        .flatten()
+        .zip(theirs.iter().flatten())
+        .enumerate()
+        .map(|(i, (a, b))| (((a - b).abs() / b.abs().max(1.0)), i, *a, *b))
+        .max_by(|x, y| x.0.total_cmp(&y.0))
+        .unwrap();
+    eprintln!(
+        "{} texels drawn; worst relative difference {:.2e} (at {}: {} vs {})",
+        drawn(&theirs),
+        worst.0,
+        worst.1,
+        worst.2,
+        worst.3
+    );
+    assert!(worst.0 <= 1e-4, "{worst:?}");
+}
+
 /// Where PC code and the console differ by design, the translation must
 /// give the console's results: float-to-int conversions saturate and give
 /// 0 for NaN (`v_cvt_i32/u32_f32`), the legacy multiply the compiler

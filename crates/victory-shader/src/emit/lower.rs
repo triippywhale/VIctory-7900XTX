@@ -5489,7 +5489,11 @@ impl<'a> Lower<'a> {
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
             // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
+            // refuse them here if one hangs. The title has 71 such
+            // programs (128 vertices of 65 to 71 scalars, 33 to 36 KiB);
+            // the validator refuses them, and the RX 7900 XT draws a
+            // shader of 36 KiB whole
+            // (`a_mesh_shader_past_the_output_limit_draws_whole`).
             // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
             if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
                 return Err("a mesh shader whose outputs pass the host's 32 KiB");
