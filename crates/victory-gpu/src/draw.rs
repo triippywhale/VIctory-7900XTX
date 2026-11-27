@@ -1180,6 +1180,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
+    // Renderer port 1, constants in place (`VICTORY_PORT_CONSTANTS=3`): a
+    // root constant buffer in the title's 32-bit heap on 256 bytes, all of
+    // its 64 KiB in the heap, is read where the title has it: no refresh.
+    // (With renderer port 5 root constant buffers are root SRVs, bound as
+    // any other root SRV.)
+    if !srv && let Some((_, gpu)) = crate::port::constant_gpu(address, 1 << 16, crate::port::Bound::Root) {
+        return Some(gpu);
+    }
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -4336,6 +4344,31 @@ impl State {
                             host.constant_at(index, &buffer, gpu, size);
                             continue;
                         }
+                        // Renderer port 1, constants in place
+                        // (`VICTORY_PORT_CONSTANTS=3`): in the title's 32-bit
+                        // heap, a view of the title's bytes there (the
+                        // region's buffer outlives the view): with renderer
+                        // port 5 a raw view on 16 bytes, else a constant
+                        // buffer view on 256. No refresh, no fill.
+                        if crate::port::constants_only() {
+                            let made = if crate::port_cbv::in_place_on() {
+                                let raw = crate::port::constant_raw_view(address, u64::from(size), crate::port::Bound::Table)
+                                    .is_some_and(|(whole, gpu)| host.constant_raw_at(index, whole, gpu, size));
+                                if raw {
+                                    crate::port_cbv::in_place(size);
+                                }
+                                raw
+                            } else {
+                                let len = u64::from(size.min(65536).next_multiple_of(256).max(256));
+                                crate::port::constant_gpu(address, len, crate::port::Bound::Table)
+                                    .map(|(whole, gpu)| host.constant_at(index, whole, gpu, size))
+                                    .is_some()
+                            };
+                            if made {
+                                crate::port::table_constant(true);
+                                continue;
+                            }
+                        }
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {
@@ -4343,6 +4376,7 @@ impl State {
                                 Some(shadow) => {
                                     if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
                                         crate::port_cbv::in_place(size);
+                                        crate::port::table_constant(true);
                                         continue;
                                     }
                                     crate::port_cbv::copied(false);
@@ -4356,6 +4390,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
+                        crate::port::table_constant(false);
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {

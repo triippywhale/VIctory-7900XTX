@@ -2625,6 +2625,290 @@ mod tests {
         }
     }
 
+    /// Renderer port 5 as the title's ring of constants has it (and as
+    /// renderer port 1's constants in place, `VICTORY_PORT_CONSTANTS=3`,
+    /// binds it): a table's constant buffer on 16 bytes, not 256, inside a
+    /// bigger buffer, the raw twin of its slot a raw view from its own byte
+    /// offset. Read by scalar loads at a constant offset (four and eight
+    /// dwords), at an offset in a register, and per lane by a vector load,
+    /// the raw reads give what the constant buffer path gives for the same
+    /// bytes. (After PalmVI 9a79e80f4.)
+    #[test]
+    #[cfg(windows)]
+    fn ring_constants_on_16_bytes_read_raw_as_the_constant_buffer_path() {
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the constant buffer)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+            0xF420_0504,
+            0x0000_0000, // s_buffer_load_dword s20, s[8:11], s0
+            0xF42C_0604,
+            0xFA00_0040, // s_buffer_load_dwordx8 s[24:31], s[8:11], 0x40
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xE030_1020,
+            0x8002_0207, // buffer_load_dword v2, v7, s[8:11], 0 offen offset:0x20 (per lane)
+            0xE070_1060,
+            0x8003_0207, // buffer_store_dword v2, v7, s[12:15], 0 offen offset:0x60
+        ];
+        let scalars: Vec<u32> = (16..21u32).chain(24..32).collect();
+        for (out, &s) in scalars.iter().enumerate() {
+            // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [4, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
+        const TWINS: u32 = 2;
+        let lowered = |raw: bool| {
+            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let l = super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                geometry: None,
+            });
+            super::shader::CONSTANTS_RAW_HERE.set(None);
+            super::shader::RAW_VIEWS_HERE.set(None);
+            l.unwrap()
+        };
+        let (before, after) = (lowered(false), lowered(true));
+        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        // The buffer: the constant buffer from byte 0x110 on (on 16 bytes,
+        // not 256), 64 dwords of it, other bytes before it.
+        const FIRST: u32 = 0x110 / 4;
+        let all: Vec<u32> = (0..FIRST + 64).map(|i| 0x0101_0101u32.wrapping_mul(i + 7) ^ 0x2000_0000 ^ i << 20).collect();
+        let cb = &all[FIRST as usize..];
+        let other: Vec<u32> = vec![0xdead_beef; 64];
+        let s0 = 8u32;
+        let mut want: Vec<u32> = cb[4..8].to_vec();
+        want.push(cb[(s0 / 4) as usize]);
+        want.extend_from_slice(&cb[16..24]);
+        let lanes: Vec<u32> = (0..4).map(|lane| cb[8 + lane]).collect();
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, l) in [(false, before), (true, after)] {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = super::host::Host::new(true) else {
+                eprintln!("no software adapter; the dispatch is skipped");
+                return;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            // Without the switch the constant buffer path needs 256 bytes: a
+            // buffer of its own with the same bytes. With it the slot holds
+            // a constant buffer view of other bytes, which is not read.
+            let views: Vec<super::host::View> = if raw {
+                vec![
+                    super::host::View::Cbv(&other),
+                    super::host::View::RawUav(32),
+                    super::host::View::RawAt { data: &all, first: FIRST },
+                    super::host::View::RawUav(32),
+                ]
+            } else {
+                vec![super::host::View::Cbv(cb), super::host::View::RawUav(32)]
+            };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            // The UAV is written where the program reads it: its twin with the switch.
+            let got = out
+                .iter()
+                .find(|o| o[..32].iter().any(|&w| w != 0))
+                .unwrap_or_else(|| panic!("nothing written, switch {raw}: {out:x?}"));
+            assert_eq!(got[..13], want[..], "scalar loads, switch {raw}: {:x?}", &got[..32]);
+            assert_eq!(got[24..28], lanes[..], "per lane, switch {raw}: {:x?}", &got[..32]);
+        }
+    }
+
+    /// Renderer port 5: a constant buffer whose table entry lies after a
+    /// declared range of another kind (here a UAV range starting at dword
+    /// 0; the used-resource entry a load falls in is the last one starting
+    /// at or before it) is read raw all the same, through the raw twin of
+    /// its slot: the host makes that twin a raw view because the slot holds
+    /// a constant buffer view, whatever the shader's entries say. The slot
+    /// itself holds a constant buffer view of other bytes; read as a
+    /// constant buffer it would give those. (After PalmVI 9a79e80f4, whose
+    /// tree read such a load as a constant buffer from a raw view: zeros, a
+    /// removed device on WARP.)
+    #[test]
+    #[cfg(windows)]
+    fn constants_behind_another_kind_of_entry_are_read_raw_with_the_port() {
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 0x20 (the constant buffer, slot 1)
+            0xF408_0302,
+            0xFA00_0040, // s_load_dwordx4 s[12:15], s[4:5], 0x40 (the UAV, slot 2)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+        ];
+        for (out, s) in (16..20u32).enumerate() {
+            // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            // The constant buffer at dword 8 is in no entry of its own.
+            used: vec![table(crate::ResourceType::Uav, 0), table(crate::ResourceType::Uav, 16)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // The twins start at slot 4 (a power of two past the table's three
+        // slots): slot i's is 4 + i.
+        const TWINS: u32 = 4;
+        super::shader::CONSTANTS_RAW_HERE.set(Some(true));
+        super::shader::RAW_VIEWS_HERE.set(Some(TWINS));
+        let lowered = {
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                geometry: None,
+            })
+        };
+        super::shader::CONSTANTS_RAW_HERE.set(None);
+        super::shader::RAW_VIEWS_HERE.set(None);
+        let l = lowered.unwrap();
+        const FIRST: u32 = 0x110 / 4;
+        let all: Vec<u32> = (0..FIRST + 16).map(|i| 0x0303_0303u32.wrapping_mul(i + 5) ^ 0x1000_0000).collect();
+        let cb = &all[FIRST as usize..];
+        let other: Vec<u32> = vec![0xdead_beef; 64];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dxil = l.dxil;
+        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let Ok(host) = super::host::Host::new(true) else {
+            eprintln!("no software adapter; the dispatch is skipped");
+            return;
+        };
+        let cs = super::HostShader {
+            stage: super::HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let views = [
+            super::host::View::RawUav(4),
+            super::host::View::Cbv(&other),
+            super::host::View::RawUav(8),
+            // Not a slot of the table's: below the twins.
+            super::host::View::RawUav(4),
+            super::host::View::RawUav(4),
+            super::host::View::RawAt { data: &all, first: FIRST },
+            super::host::View::RawUav(8),
+        ];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &super::host::Dispatch {
+                    roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        // The UAV is written where the program reads it: its twin.
+        let got = out.iter().find(|o| o[..4].iter().any(|&w| w != 0)).map(|o| o[..4].to_vec());
+        assert_eq!(got.as_deref(), Some(&cb[4..8]), "{out:x?}");
+    }
+
     #[test]
     fn valu_div_f32_sequence_executes_on_gpu() {
         let words: &[u32] = &[

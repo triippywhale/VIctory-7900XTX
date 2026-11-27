@@ -65,7 +65,10 @@ pub(crate) struct Replay {
     buffers: Buffers,
     /// With --buffers, only the buffers all of these match: `name=<text>`,
     /// `min=<bytes>`, `max=<bytes>`, `seen=<No, Cached, Combined>`,
-    /// `id=<a>..<b>`, or `!` and one of those (may be given several times).
+    /// `id=<a>..<b>`, or `!` and one of those (may be given several times);
+    /// `opened`: only the heaps opened on title memory (renderer port 1),
+    /// with `opened-min=<bytes>` / `opened-max=<bytes>`: of those, the ones
+    /// of that size.
     #[arg(long)]
     only_buffers: Vec<String>,
     /// One ExecuteCommandLists for the whole frame.

@@ -64,6 +64,8 @@ mod port_journal;
 mod port_rt;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod left;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -135,6 +137,8 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use left::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

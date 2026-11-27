@@ -800,6 +800,7 @@ impl Memory {
     fn there(&self, address: u64) -> bool {
         let mut header = [0u8; 8];
         crate::texture::committed(address as *const u8, 8) && {
+            crate::left::before_take(address as usize, address as usize + 8, 0);
             crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
             self.packed.get(&address).is_some_and(|p| p.header == u64::from_le_bytes(header))
         }
@@ -920,6 +921,9 @@ impl Memory {
             let base = held.at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
             let mut changed = 0;
+            // Pieces of buffer copies left on the card there first
+            // (`crate::left`).
+            crate::left::before_take((page * PAGE) as usize, ((page + 1) * PAGE) as usize, 0);
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
@@ -949,6 +953,7 @@ impl Memory {
             return None;
         }
         let mut header = [0u8; 8];
+        crate::left::before_take(address as usize, address as usize + 8, 0);
         crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
         let header = u64::from_le_bytes(header);
         Some((packed_len(header)?, header))
@@ -1039,6 +1044,8 @@ impl Memory {
         let mut title = [0u8; PIECE];
         let mut at = from;
         let mut changed = false;
+        // Pieces of buffer copies left on the card there first (`crate::left`).
+        crate::left::before_take(page as usize * PAGE as usize + from, page as usize * PAGE as usize + to, 0);
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
@@ -1421,6 +1428,13 @@ pub(crate) fn results(src: u64, len: u64) -> Option<Arc<Shadow>> {
     let &k = m.results.get(&page)?;
     let shadow = m.copies.get(k)?;
     shadow.written().then(|| shadow.clone())
+}
+
+/// Whether an arena holds a 64 KiB page of title memory `[at, end)`
+/// (`crate::left`: it takes such a page again only where the title wrote).
+pub(crate) fn holds(at: u64, end: u64) -> bool {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|m| (at / PAGE..end.div_ceil(PAGE)).any(|page| m.pages.contains_key(&page)))
 }
 
 /// `VICTORY_BVH_TRACE=1`: a buffer copy out of the builder's results.

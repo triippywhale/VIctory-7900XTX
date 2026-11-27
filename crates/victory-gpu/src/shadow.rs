@@ -3959,6 +3959,11 @@ impl Shadow {
         if from >= to {
             return false;
         }
+        // Pieces other copies left on the card here are fetched first
+        // (`crate::left`); this copy's own stay (what is put in here is
+        // only what differs from its CPU side).
+        crate::left::before_take(from, to, self.id);
+        let _taking = crate::left::Taking::new(self.id);
         let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4032,6 +4037,7 @@ impl Shadow {
             let done: Vec<Mutex<Done>> = stale.iter().map(|_| Mutex::new(None)).collect();
             let page_of = |i: usize| -> (usize, usize) { ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e)) };
             let one = |i: usize| {
+                let _taking = crate::left::Taking::new(self.id);
                 let (lo, hi) = page_of(i);
                 if lo < hi && !over.load(Ordering::Relaxed) {
                     // SAFETY: the reference holds the copy's bytes at the
@@ -4226,6 +4232,9 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Pieces other copies left on the card here are fetched first
+        // (`crate::left`; `VICTORY_SKIP_WC_BACK`).
+        let _left = crate::left::before_refresh(self.id, from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4473,6 +4482,7 @@ impl Shadow {
             // SAFETY: `wide_each` returns when every part is done, before
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
+            let _taking = crate::left::Taking::new(this.id);
             let (from, to, known) = parts[i];
             this.take(from, to, known);
         });
@@ -4563,13 +4573,16 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+        // What shaders wrote and left on the card here (`crate::left`) is
+        // not in title memory: only what the title changed goes up.
+        let left = self.card.is_some() && crate::left::own_left_in(self.id, from, to);
+        let Some(card) = self.card.as_ref().filter(|_| left || self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
             }
             return self.copy(from, to);
         };
-        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let whole = !left && !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4610,6 +4623,11 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // As in `take`: around what was left on the card, only what the
+        // title changed goes up.
+        if self.card.is_some() && from < to && crate::left::own_left_in(self.id, from, to) {
+            return self.take(from, to, true);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -4956,6 +4974,35 @@ impl Shadow {
             return 0;
         }
         put_changed(start + at, &was, title)
+    }
+
+    /// A piece left on the card (`crate::left`) was fetched for a reader:
+    /// `gpu` is what the card's side held at offset `at` on, and it is
+    /// merged into title memory as [`Shadow::card_merge_relay`] merges,
+    /// with this copy's landings and title bytes put in under shader
+    /// writes kept out meanwhile (they write the CPU side too). The caller
+    /// keeps out this copy's refreshes there (`crate::left`'s gate).
+    pub(crate) fn fetched_left(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+        self.card_merge_relay(at, gpu, fetched_after, title)
+    }
+
+    /// Whether title bytes went up to the card's side in offsets `[lo, hi)`
+    /// with a send that a merge must still leave out (`crate::left`).
+    pub(crate) fn sends_noted(&self, lo: usize, hi: usize) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut near = Vec::new();
+        card.sent.lock().unwrap_or_else(|e| e.into_inner()).near(0, lo, hi, &mut near);
+        !near.is_empty()
+    }
+
+    /// Whether shaders store in it only in their declared ranges (not
+    /// [`Shadow::keep_stores`]'s copies, nor those by address).
+    pub(crate) fn plain_copy(&self) -> bool {
+        !self.changes_only.load(Ordering::Relaxed) && self.place.is_none()
     }
 }
 
@@ -5478,6 +5525,39 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// The copies other than copy `not` that hold any of title memory `[at,
+/// end)`: title buffers' (in place too), windows', single views'
+/// (`crate::left`).
+pub(crate) fn holders(at: u64, end: u64, not: u64) -> Vec<Arc<Shadow>> {
+    let held = |s: &Arc<Shadow>| s.id != not && s.start < end && s.start + s.len > at;
+    let mut out: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let map = buffers_read();
+        // Those under [`BIG_BUFFER`] begin less than that below; the others
+        // are all in [`BIG_BUFFERS`].
+        out.extend(
+            map.range((at.saturating_sub(BIG_BUFFER), 0)..(end, 0))
+                .filter(|(_, e)| e.end > at)
+                .filter_map(|(_, e)| e.shadow.as_ref().filter(|s| held(s)).cloned()),
+        );
+        let big = BIG_BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        for (key, _) in big.range(..(end, 0)).filter(|(_, e)| **e > at) {
+            if let Some(shadow) = map.get(key).and_then(|e| e.shadow.as_ref()).filter(|s| held(s))
+                && !out.iter().any(|o| Arc::ptr_eq(o, shadow))
+            {
+                out.push(shadow.clone());
+            }
+        }
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let longest = LOOSE_LONGEST.load(Ordering::Relaxed).max(WINDOW);
+    out.extend(loose.range((at.saturating_sub(longest), 0)..(end, 0)).filter(|(_, s)| held(s)).map(|(_, s)| s.clone()));
+    drop(loose);
+    let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    out.extend(exact.1.range((at.saturating_sub(64 << 20), 0)..(end, 0)).filter(|(_, (s, _))| held(s)).map(|(_, (s, _))| s.clone()));
+    out
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -5523,11 +5603,107 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    let outer = nested(address, end);
     let map = buffers_read();
+    if let Some((start, stop)) = outer
+        && let Some(shadow) = holding(&map, start, stop).and_then(|key| map.get(&key)).and_then(|e| e.shadow.clone())
+        && shadow.place.is_none()
+        && shadow.start <= address
+        && shadow.start + shadow.len >= end
+    {
+        return Some(shadow);
+    }
     map.get(&holding(&map, address, end)?).and_then(|e| e.shadow.clone())
 }
 
+/// `VICTORY_NEST=1` (off by default; after PalmVI 06edf544f): an ask that
+/// lies inside a title buffer of [`BIG_BUFFER`] or more is given that
+/// buffer's copy, not the copy of the innermost buffer holding it, as a
+/// native port binds a range of the buffer the data lives in. Title buffers
+/// nest: the title makes big buffers over its pools and small ones inside
+/// them, and a shader that writes through the big one (whose copy is often
+/// in the card's memory) and one that reads through a small one each had a
+/// copy of their own. What the card wrote came back into title memory and
+/// was sent up again into the small one's copy: in PalmVI's measurement
+/// 26-44 MB a frame of the copy refreshes took bytes the card had written
+/// at that very address. With the switch both read and write the one copy.
+///
+/// What it assumes: callers place views by the copy's own start
+/// ([`Shadow::offset`]), not the buffer's they asked about, as they do for
+/// windows. Asks for a view's own bytes ([`exact`]), title memory in place
+/// (`VICTORY_INPLACE`) and renderer port 1's 32-bit graphics memory, where
+/// buffers are placed in title memory itself, keep the copies they had.
+pub(crate) fn nest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NEST").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_NEST=1: asks inside a title buffer of 1 MiB or more are given that buffer's copy");
+        }
+        on
+    })
+}
+
+/// With [`nest`], since the last frame line: asks given an outer buffer's
+/// copy.
+pub(crate) static NESTED: AtomicU64 = AtomicU64::new(0);
+
+/// With [`nest`]: the outermost title buffer of [`BIG_BUFFER`] or more
+/// holding `[address, end)`, among the 16 such that start at or below it,
+/// as (start, end), if it is not the ask itself.
+fn nested(address: u64, end: u64) -> Option<(u64, u64)> {
+    if !nest() || crate::inplace::level() != 0 {
+        return None;
+    }
+    let (start, stop) = {
+        let big = BIG_BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        big.range(..=(address, usize::MAX))
+            .rev()
+            .take(16)
+            .filter(|(_, e)| **e >= end)
+            .map(|(key, &e)| (key.0, e))
+            .min_by_key(|&(s, e)| (s, std::cmp::Reverse(e)))?
+    };
+    ((start, stop) != (address, end) && !crate::port::wanted(start, stop - start)).then_some((start, stop))
+}
+
+/// For the frame line, with [`nest`].
+pub(crate) fn nest_line(frames: f64) {
+    if nest() {
+        tracing::info!(
+            "asks given the copy of an outer title buffer per frame (VICTORY_NEST): {:.0}",
+            NESTED.swap(0, Ordering::Relaxed) as f64 / frames
+        );
+    }
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let quick = quick_find();
+    if quick && let Some(shadow) = found(address, len) {
+        return Some(shadow);
+    }
+    // With `VICTORY_NEST`: the outer buffer's copy ([`nest`]).
+    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    if let Some(end) = address.checked_add(len.max(1))
+        && let Some((start, stop)) = nested(address, end)
+        && let Some(shadow) = lookup_innermost(start, stop - start, any)
+        && shadow.place.is_none()
+        && shadow.start <= address
+        && shadow.start + shadow.len >= end
+    {
+        NESTED.fetch_add(1, Ordering::Relaxed);
+        if quick {
+            // With the count of before the look: an answer out of a map
+            // changed meanwhile is not used.
+            remember(address, len, changed, &shadow);
+        }
+        return Some(shadow);
+    }
+    lookup_innermost(address, len, any)
+}
+
+/// [`lookup`] of the innermost title buffer holding the ask.
+fn lookup_innermost(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5856,6 +6032,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The longest window [`LOOSE`] was given (an ask longer than a cell makes
+/// one as long), for looks at the windows that hold an address.
+static LOOSE_LONGEST: AtomicU64 = AtomicU64::new(0);
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
@@ -5909,6 +6089,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
+        LOOSE_LONGEST.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
@@ -5922,6 +6103,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         shadow.mapped = true;
         let shadow = Arc::new(shadow);
         note(&shadow);
+        LOOSE_LONGEST.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
@@ -5958,7 +6140,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let shadow = Arc::new(shadow);
     carded(&shadow);
     note(&shadow);
-    map.insert((start, len), shadow.clone());
+    LOOSE_LONGEST.fetch_max(len, Ordering::Relaxed);
+        map.insert((start, len), shadow.clone());
     Some(shadow)
 }
 

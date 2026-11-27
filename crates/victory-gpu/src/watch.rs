@@ -3805,6 +3805,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    crate::left::forget(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }
 
@@ -3815,6 +3816,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
     crate::texback::remapped(at, len);
+    crate::left::forget(at, len);
     forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -3839,6 +3841,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    crate::left::forget(at, len);
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {

@@ -711,6 +711,8 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    // Pieces left on the card by copies nothing else holds any more.
+    crate::left::sweep();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -3398,6 +3400,42 @@ fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Before `runs` are prepared, with pieces left on the card (`crate::left`):
+/// what their steps read or write of title memory there is fetched first.
+/// A refresh fetches for itself (`Shadow::update`); our work that may read
+/// or write anywhere has every piece fetched.
+fn left_before_steps(runs: &[&HostList]) {
+    use crate::left::before_take;
+    if !crate::left::on() {
+        return;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    before_take(src, src + len, 0);
+                    before_take(dst, dst + len, 0);
+                }
+                &Step::Fill(_, src, len, _) => before_take(src, src + len, 0),
+                Step::Texture(upload) => {
+                    let (at, len) = upload.memory();
+                    before_take(at, at + len, 0);
+                }
+                Step::Placed(p) => {
+                    before_take(p.src, p.src + p.len, 0);
+                    before_take(p.dst, p.dst + p.len, 0);
+                }
+                Step::Host(_, (from, to)) => before_take(*from, *to, 0),
+                Step::Run(_) => {
+                    crate::left::before_anything();
+                    return;
+                }
+                Step::Refresh(..) | Step::GpuWrite(..) => {}
+            }
+        }
+    }
+}
+
 /// With flights in the air ([`late`]): why `runs` cannot be prepared
 /// before they are settled, if so. Preparing reads title memory on the
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
@@ -4363,6 +4401,7 @@ pub(crate) mod awake;
 mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
+pub(crate) mod leftq;
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -5404,6 +5443,11 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        // Write-combining memory may stay on the card
+                        // (`crate::left`, `VICTORY_SKIP_WC_BACK`).
+                        if lo < hi && !seen.contains(&(copy, lo, hi)) && crate::left::skip_back(&r.shadow, lo, hi) {
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -5783,7 +5827,9 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                // Write-combining memory may stay on the card
+                // (`crate::left`, `VICTORY_SKIP_WC_BACK`).
+                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) && !crate::left::skip_back(&r.shadow, lo, hi) {
                     pieces.push((i, lo, hi, total));
                     total += (hi - lo) as u64;
                 }
@@ -6295,6 +6341,9 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
+        // What the steps read of pieces left on the card is fetched first
+        // (`crate::left`).
+        left_before_steps(runs);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         // Renderer port #7 (from renderer patch #4): the round asked for when
@@ -9689,6 +9738,7 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    crate::left::read(src as usize, len);
     if crate::safecopy::on() {
         // SAFETY: the destination is mapped writable memory of `len` bytes;
         // a source page that is not there fails the copy.
@@ -10259,6 +10309,8 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                crate::left::log(frames);
+                crate::shadow::nest_line(frames);
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
