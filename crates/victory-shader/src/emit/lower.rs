@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, Ty, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -91,27 +91,6 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
-}
-
-thread_local! {
-    /// Typed SRVs of the program being lowered that hold integers: (root
-    /// slot, dword in its table, DXIL resource kind). See [`with_uint_srvs`].
-    static UINT_SRVS: std::cell::Cell<&'static [(u8, u32, u32)]> = const { std::cell::Cell::new(&[]) };
-}
-
-/// Runs `work` (a lowering) with the typed SRVs given as integer views: their
-/// loads return `ResRet.i32` from an SRV of component type uint, not float.
-/// For stripped programs whose views carry no component type (after
-/// DexNom/VIctory b8ff22e4).
-pub(super) fn with_uint_srvs<T>(srvs: &'static [(u8, u32, u32)], work: impl FnOnce() -> T) -> T {
-    struct Reset(&'static [(u8, u32, u32)]);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            UINT_SRVS.set(self.0);
-        }
-    }
-    let _restore = Reset(UINT_SRVS.replace(srvs));
-    work()
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
@@ -291,8 +270,6 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
-    /// [`with_uint_srvs`].
-    uint_srvs: &'static [(u8, u32, u32)],
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
@@ -2275,7 +2252,6 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            uint_srvs: UINT_SRVS.get(),
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
@@ -12060,37 +12036,6 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
-    /// Whether the typed SRV `src` (DXIL resource kind `kind`) is one of
-    /// [`with_uint_srvs`]: loaded straight from a root table at a fixed place.
-    fn scalar_uint_srv(&self, src: &Source, kind: u32) -> bool {
-        if self.uint_srvs.is_empty() {
-            return false;
-        }
-        let Source::Loaded { load, first } = src else {
-            return false;
-        };
-        let Some(address) = self.scalar.get(load) else {
-            return false;
-        };
-        let Some(root) = self.x.native.layout.get(address.param) else {
-            return false;
-        };
-        if root.root != RootType::Table || address.dynamic.is_some() || !address.offset.is_multiple_of(4) {
-            return false;
-        }
-        self.uint_srvs
-            .contains(&(root.slot, address.offset / 4 + u32::from(*first), kind))
-    }
-
-    /// The result type of a typed load: `ResRet.i32` from a uint view.
-    fn resource_return_type(&mut self, uint: bool) -> Ty {
-        if uint {
-            self.s.m.named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5])
-        } else {
-            self.s.t.res_ret
-        }
-    }
-
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -12173,9 +12118,7 @@ impl<'a> Lower<'a> {
             self.s.flags |= flags::ROVS;
         }
         let rov = if ordered { 0x2000 } else { 0 };
-        // An integer view of the list above: one channel, read as is.
-        let uint = !uav && !*d16 && *dmask == 1 && name == "image_load" && self.scalar_uint_srv(src, kind);
-        let props = (kind | if uav { 0x1000 } else { 0 } | rov, if uint { 0x105 } else { 0x409 });
+        let props = (kind | if uav { 0x1000 } else { 0 } | rov, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -12864,12 +12807,11 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                if uint { "textureLoad.i32" } else { "textureLoad.f32" },
+                "textureLoad.f32",
                 Attr::ReadOnly,
-                ret,
+                self.s.t.res_ret,
                 66,
                 &args,
             )
@@ -12888,9 +12830,7 @@ impl<'a> Lower<'a> {
                 Some(g) => g[ch as usize],
                 None => self.s.m.extract(c, r, ch),
             };
-            xs.push(if uint {
-                x
-            } else if *d16 {
+            xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
                 let i32t = self.s.t.i32;
@@ -13488,8 +13428,6 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // An integer view of [`with_uint_srvs`]: its one channel read as is.
-        let uint = typed && !uav && name == "buffer_load_format_x" && self.scalar_uint_srv(src, 10);
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
@@ -13497,14 +13435,13 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, if uint { 0x105 } else { 0x409 }))?;
+            let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            let ret = self.resource_return_type(uint);
             self.s.op(
                 c,
-                if uint { "bufferLoad.i32" } else { "bufferLoad.f32" },
+                "bufferLoad.f32",
                 Attr::ReadOnly,
-                ret,
+                self.s.t.res_ret,
                 68,
                 &[h, index, iu],
             )
@@ -13589,7 +13526,7 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = if uint { x } else { self.as_int(x) };
+            let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -15050,43 +14987,6 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
-    }
-
-    #[test]
-    fn a_listed_uint_view_loads_as_uint_and_only_at_its_field_and_dimension() {
-        // The tiled-lighting vertex program's: root 1, dwords 48 and 56, Texture2D.
-        let vs = 0x8386ec5b_47a3b2de_49309239_7987b35du128.to_be_bytes();
-        let views = super::super::tiled_lighting_uint_srvs(vs);
-        assert!(!views.is_empty());
-        let compile = |slot: u8, offset: u32, dim: u32, views: &'static [(u8, u32, u32)]| {
-            let words = [
-                0xBE84_0300, 0xBE85_0380,          // s[4:5] = the first root table
-                0xF40C_0302, 0xFA00_0000 | offset, // s_load_dwordx8 s[12:19], s[4:5], offset
-                0xF000_1100 | dim, 0x0003_0C00,    // image_load v12, v[0:1], s[12:19]
-                0xD834_0000, 0x0000_0C00,          // ds_write_b32 v0, v12
-                S_ENDPGM,
-            ];
-            let (mut layout, mut used) = texture_tables();
-            layout.truncate(1);
-            used.truncate(1);
-            layout[0].slot = slot;
-            used[0].slot = slot;
-            used[0].table_offset_dwords = offset / 4;
-            super::with_uint_srvs(views, || lower_with(&words, layout, used)).unwrap().dxil
-        };
-        // Root 1, 48 dwords in (the immediate is in bytes), Texture2D.
-        let matched = compile(1, 192, 8, views);
-        assert_ne!(matched, compile(1, 192, 8, &[]));
-        // Another root, another dword, another dimension: as before.
-        for (slot, offset, dim) in [(2, 192, 8), (1, 196, 8), (1, 192, 16)] {
-            assert_eq!(compile(slot, offset, dim, views), compile(slot, offset, dim, &[]));
-        }
-        #[cfg(windows)]
-        if let Ok(mut v) = crate::emit::validator::Validator::load(
-            crate::emit::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut matched.clone()).unwrap();
-        }
     }
 
     #[test]
