@@ -154,6 +154,15 @@ impl GraphicsState {
     /// Whether the draws are a pass over the screen: no vertex input, no
     /// depth or stencil, a target. Such passes fill tables once; their shaders
     /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
+    /// A pass that writes depth and no color: a shadow map or a depth
+    /// prepass, which later draws of the frame depend on.
+    pub(crate) fn writes_depth_only(&self) -> bool {
+        self.targets.NumRenderTargets == 0
+            && self.depth_format != DXGI_FORMAT_UNKNOWN
+            && self.depth.DepthEnable.as_bool()
+            && self.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+    }
+
     pub(crate) fn screen_pass(&self) -> bool {
         self.inputs.is_empty()
             && (self.depth_format == DXGI_FORMAT_UNKNOWN

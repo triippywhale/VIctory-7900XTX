@@ -724,6 +724,26 @@ fn widen(
     }
 }
 
+/// The tiled-lighting vertex program and six eye-lighting pixel programs
+/// read UINT masks and indices through typed SRVs. These stripped programs
+/// carry no component types, so their views are named here by the input's
+/// digest and the exact root-table field (root slot, dword in the table,
+/// DXIL resource kind: 2 Texture2D, 4 Texture3D, 10 TypedBuffer). Other
+/// fields of the same programs hold float textures (DexNom/VIctory b8ff22e4).
+fn tiled_lighting_uint_srvs(digest: [u8; 16]) -> &'static [(u8, u32, u32)] {
+    const DIRECTIONAL_EYE: &[(u8, u32, u32)] = &[(0, 32, 10), (0, 968, 2), (0, 1160, 2), (1, 72, 2), (1, 80, 4)];
+    match u128::from_be_bytes(digest) {
+        0x8386ec5b_47a3b2de_49309239_7987b35d => &[(1, 48, 2), (1, 56, 2)],
+        0x46545633_f601b707_19765403_267442c5
+        | 0xa3c6e3b5_a1226f1b_3b08afe2_ac7b6c3d
+        | 0x58795ccc_1d3237cf_683a8a7a_a88391fd => DIRECTIONAL_EYE,
+        0x56d5f614_619f530c_f1cf2b90_43b580e8
+        | 0xbd4ac3d8_98dc88e0_c0d0f252_2fbe6341
+        | 0x50d20881_47c267aa_c6ec8d21_9970b21b => &DIRECTIONAL_EYE[1..],
+        _ => &[],
+    }
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -801,7 +821,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -811,7 +831,8 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = lower::with_uint_srvs(tiled_lighting_uint_srvs(c.digest), || lower::lower(&parts))?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

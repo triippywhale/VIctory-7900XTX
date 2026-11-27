@@ -1436,6 +1436,93 @@ pub(crate) struct HostList {
 /// A list's prelude: an allocator and a closed list.
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
+/// A list's prelude to record ([`HostList::prelude_plan`]).
+struct PreludePlan {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    aliasing: Vec<D3D12_RESOURCE_BARRIER>,
+    to_copy: Vec<D3D12_RESOURCE_BARRIER>,
+    /// The copies: depth texture, twin, whether into the twin.
+    syncs: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>, bool)>,
+    barriers: Vec<D3D12_RESOURCE_BARRIER>,
+}
+
+// SAFETY: the barriers borrow textures that the list's states and twins hold
+// until the submission is done with; a plan is recorded once, by one thread,
+// while its allocator is not executing (every submission is waited for).
+unsafe impl Send for PreludePlan {}
+
+impl PreludePlan {
+    /// Records it; `uploads` records the texture uploads, after the copies
+    /// and before the last transitions.
+    fn record(self, uploads: impl FnOnce(&ID3D12GraphicsCommandList)) {
+        let (allocator, list) = (&self.allocator, &self.list);
+        // SAFETY: see the type's; the textures are live.
+        let recorded = unsafe {
+            allocator.Reset().and_then(|()| {
+                list.Reset(allocator, None)?;
+                if !self.aliasing.is_empty() {
+                    list.ResourceBarrier(&self.aliasing);
+                }
+                if !self.to_copy.is_empty() {
+                    list.ResourceBarrier(&self.to_copy);
+                }
+                for (depth, twin, colour) in &self.syncs {
+                    record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                uploads(list);
+                if !self.barriers.is_empty() {
+                    list.ResourceBarrier(&self.barriers);
+                }
+                list.Close()
+            })
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("a host state prelude did not record ({e})"));
+        }
+    }
+
+    /// Transitions and copies it records.
+    fn work(&self) -> usize {
+        self.aliasing.len() + self.to_copy.len() + self.barriers.len() + 8 * self.syncs.len()
+    }
+}
+
+/// Whether a submission's preludes are recorded together on several threads
+/// once its lists' steps are done (`VICTORY_PARALLEL_PRELUDES=1`; off by
+/// default, after DexNom/VIctory 5f4c3df4): with four lists or more, each
+/// list once. They are planned in the submission's order either way.
+fn parallel_preludes(runs: &[&HostList]) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if runs.len() < 4 || !*ON.get_or_init(|| std::env::var_os("VICTORY_PARALLEL_PRELUDES").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let mut unique = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter().all(|list| unique.insert(std::ptr::from_ref(*list)))
+}
+
+/// Records `plans`: on several threads where there are four or more and
+/// enough to record (a job costs more than a few barriers), else here.
+fn record_preludes(plans: Vec<PreludePlan>) {
+    let work: usize = plans.iter().map(PreludePlan::work).sum();
+    if plans.len() < 4 || work < 256 {
+        for plan in plans {
+            plan.record(|_| {});
+        }
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!(lists = plans.len(), "preludes recorded on several threads"));
+    }
+    let jobs = plans
+        .into_iter()
+        .map(|plan| Box::new(move || plan.record(|_| {})) as Box<dyn FnOnce() + Send>)
+        .collect();
+    crate::shadow::wide_run(jobs);
+}
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -6088,14 +6175,26 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
+        let parallel = parallel_preludes(runs);
+        let mut plans = Vec::new();
         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
         for (_run, list) in runs.iter().enumerate() {
             let uploads = list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(plan) = list.prelude_plan(&uploads) {
                 #[cfg(feature = "diagnostics")]
                 marks.push((lists.len(), crate::copystat::Timed::Prelude));
-                lists.push(Some(prelude));
+                lists.push(plan.list.cast().ok());
+                // Texture uploads record with the list itself: here, in order.
+                if parallel && uploads.is_empty() {
+                    plans.push(plan);
+                } else {
+                    plan.record(|prelude| {
+                        for (upload, _) in &uploads {
+                            upload.record(list, prelude);
+                        }
+                    });
+                }
             }
             #[cfg(feature = "diagnostics")]
             marks.push((
@@ -6106,6 +6205,10 @@ impl Host {
                 },
             ));
             lists.push(list.list.cast().ok());
+        }
+        if !plans.is_empty() {
+            stage.next("submit: the preludes");
+            record_preludes(plans);
         }
         batch.fill();
         stage.next("submit: the last refreshes");
@@ -7146,7 +7249,12 @@ impl HostList {
     /// from the other, if a list submitted earlier left it behind. For
     /// title-written textures refreshed on this submission (`uploads`), it
     /// records `CopyTextureRegion` right before the list runs.
-    fn prelude(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<ID3D12CommandList> {
+    ///
+    /// This plans that list: the transitions, copies and states, with the
+    /// textures' states and the twins moved on to how the list leaves them
+    /// (so plans are made in the order of the submission; the recording
+    /// can be done later, elsewhere: [`PreludePlan::record`]).
+    fn prelude_plan(&self, uploads: &[(crate::texture::PreludeUpload, bool)]) -> Option<PreludePlan> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -7255,33 +7363,14 @@ impl HostList {
         else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                if !aliasing.is_empty() {
-                    list.ResourceBarrier(&aliasing);
-                }
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
-                }
-                for (upload, _) in uploads {
-                    upload.record(self, list);
-                }
-                if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
-                }
-                list.Close()
-            })
-        };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
-        }
-        list.cast().ok()
+        Some(PreludePlan {
+            allocator: allocator.clone(),
+            list: list.clone(),
+            aliasing,
+            to_copy,
+            syncs,
+            barriers,
+        })
     }
 
     /// Notes what the command about to be recorded does, as a marker
