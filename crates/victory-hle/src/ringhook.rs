@@ -39,9 +39,23 @@ const CTOR_RETURN: usize = 0x1d4107d;
 const TO_CTOR_RETURN: usize = 0x80;
 const TO_WRAPPER_RETURN: usize = 0xb0;
 /// Where the wrapper returns to, for the rings named so far (the others
-/// are in the log by address).
-const NAMED: [(usize, &str); 3] =
-    [(0xcc9067, "imposter"), (0x1dfee58, "visibility_buffer"), (0x3286358, "terrain_virtual_texture")];
+/// are in the log by address). The names are from klbf-lab's notes
+/// (`tools/docs/ghidra-perf-findings.md`, `dof-blur-analysis.md`); the wind
+/// grid's and the voxelization's are by the function the place is in.
+const NAMED: [(usize, &str); 12] = [
+    (0xcc9067, "imposter"),
+    (0x1dfee58, "visibility_buffer"),
+    (0x3286358, "terrain_virtual_texture"),
+    (0x57461f2, "autofocus_lens"),
+    (0x5783c6c, "vfx_lightningStrike"),
+    (0x5783d07, "vfx_lightningStrike"),
+    (0x15ee338, "weatherparticle"),
+    (0x57011a8, "puddledetect"),
+    (0x5a8c7b0, "cascadeshadows_classify"),
+    (0x36b933, "deferred_lighting"),
+    (0x236eb5c, "wind_grid"),
+    (0xcbda79, "entity_coarse_voxelization"),
+];
 /// The ring reader: `push r15; push r14; push rsi; push rdi; push rbp;
 /// push rbx`.
 const READ: usize = 0x524dab0;
