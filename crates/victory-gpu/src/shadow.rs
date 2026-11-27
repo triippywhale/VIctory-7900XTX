@@ -1589,9 +1589,17 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: a quarter of the processors,
+/// 2 to 6, unless `VICTORY_WIDE_THREADS=<n>` (1 to 16) says. The 7800X3D
+/// (16 processors) gets 4, and a submission's refreshes, 16-25 ms of its
+/// 41-43 ms of preparing (run costs-2), are spread over them and the
+/// submitting thread.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        asked.map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6), |n| n.clamp(1, 16))
+    })
 }
 
 fn workers() -> &'static Workers {
