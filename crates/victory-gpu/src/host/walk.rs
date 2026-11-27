@@ -7,9 +7,13 @@
 //! read-back buffer of its own and clears it from a buffer of zeros; the copy is
 //! read at the list's reset (every submission of it has run). Per program and
 //! frame line: threads that tested a node, node tests per such thread (mean,
-//! median, p99, max) and the share at or above 1,000 and 10,000 tests.
+//! median, p99, max) and the share at or above 1,000 and 10,000 tests; the
+//! children a box test lets the ray into on average (a tight structure keeps
+//! it near 1-2; loose or overlapping boxes push it to 3-4); and the threads
+//! that read a node off a page the host has no copy of (it reads zeros: a
+//! broken walk), overall and among those ended by the loop limit.
 //!
-//! What it costs: one atomic per node test, two 16 MiB copies per metered
+//! What it costs: one atomic per node test, two 32 MiB copies per metered
 //! dispatch, the barriers around them. What it changes: nothing the title's
 //! programs read or write. Not exact: threads whose x + 4096 y fall on the same
 //! slot (more than 4M threads, or rows wider than 4096) add up; dispatches of
@@ -23,7 +27,9 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 
 use victory_shader::emit::WALK_SLOTS;
 
-const BYTES: u64 = WALK_SLOTS as u64 * 4;
+/// Two dwords a thread: node tests, then children entered and tests of
+/// nodes on pages with no copy.
+const BYTES: u64 = WALK_SLOTS as u64 * 8;
 
 /// `VICTORY_BVH_WALK=1` (the translator reads the same switch).
 pub(crate) fn on() -> bool {
@@ -133,6 +139,49 @@ struct Sums {
     most: u64,
     /// Threads with [`CUT`] tests or more.
     cut: u64,
+    /// Children entered, summed over the box tests.
+    entered: u64,
+    /// Tests of nodes on a page with no copy (they read zeros), and the
+    /// threads that made one.
+    lost: u64,
+    lost_threads: u64,
+    /// Of the threads at [`CUT`]: those that made such a test.
+    cut_lost: u64,
+    /// Children entered and box tests of the threads at [`CUT`].
+    cut_entered: u64,
+    cut_boxes: u64,
+}
+
+impl Sums {
+    /// One dispatch's read-back: [`WALK_SLOTS`] dwords of node tests (box
+    /// tests low, triangle tests high), then as many of children entered
+    /// (low) and tests of nodes with no copy (high).
+    fn add(&mut self, counts: &[u32]) {
+        let (tests, detail) = counts.split_at(WALK_SLOTS as usize);
+        self.dispatches += 1;
+        for (&c, &d) in tests.iter().zip(detail) {
+            if c == 0 {
+                continue;
+            }
+            let (boxes, triangles) = (u64::from(c & 0xFFFF), u64::from(c >> 16));
+            let (entered, lost) = (u64::from(d & 0xFFFF), u64::from(d >> 16));
+            let n = boxes + triangles;
+            self.threads += 1;
+            self.boxes += boxes;
+            self.triangles += triangles;
+            self.entered += entered;
+            self.lost += lost;
+            self.lost_threads += u64::from(lost > 0);
+            self.buckets[(64 - n.leading_zeros() as usize).min(23)] += 1;
+            self.most = self.most.max(n);
+            if n >= CUT {
+                self.cut += 1;
+                self.cut_lost += u64::from(lost > 0);
+                self.cut_entered += entered;
+                self.cut_boxes += boxes;
+            }
+        }
+    }
 }
 
 /// Tests from which a thread counts as ended by the translation's loop limit
@@ -149,24 +198,11 @@ pub(crate) fn reset(taken: &Taken) {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer the finished list copied into.
         if unsafe { back.Map(0, None, Some(&mut data)) }.is_ok() {
-            // SAFETY: the mapping holds WALK_SLOTS dwords.
-            let counts = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), WALK_SLOTS as usize) };
+            // SAFETY: the mapping holds 2 * WALK_SLOTS dwords.
+            let counts = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 2 * WALK_SLOTS as usize) };
             let mut sums = SUMS.lock().unwrap_or_else(|e| e.into_inner());
             let s = sums.get_or_insert_with(HashMap::new).entry(name).or_default();
-            s.dispatches += 1;
-            for &c in counts {
-                if c == 0 {
-                    continue;
-                }
-                let (boxes, triangles) = (u64::from(c & 0xFFFF), u64::from(c >> 16));
-                let n = boxes + triangles;
-                s.threads += 1;
-                s.boxes += boxes;
-                s.triangles += triangles;
-                s.buckets[(64 - n.leading_zeros() as usize).min(23)] += 1;
-                s.most = s.most.max(n);
-                s.cut += u64::from(n >= CUT);
-            }
+            s.add(counts);
             // SAFETY: mapped above.
             unsafe { back.Unmap(0, None) };
         }
@@ -205,7 +241,8 @@ pub(crate) fn line(frames: f64) {
             "node tests per ray (VICTORY_BVH_WALK): {:.1} dispatches a frame, {:.0} threads testing a node per dispatch; \
              tests per such thread: mean {:.1} ({:.1} boxes, {:.1} triangles), median <= {}, p90 <= {}, p99 <= {}, max {}; \
              threads at 1024+ tests {:.2} %, at 2048+ {:.2} %, at 4000+ (ended by the loop limit, their results lost) {:.2} %, \
-             at 8192+ {:.3} %: {}",
+             at 8192+ {:.3} %; children entered per box test {:.2} (those at 4000+: {:.2}); \
+             threads that read a node off a page with no copy {:.3} % ({:.2} such tests a thread; of those at 4000+: {:.1} %): {}",
             s.dispatches as f64 / frames,
             s.threads as f64 / s.dispatches.max(1) as f64,
             all as f64 / s.threads.max(1) as f64,
@@ -219,7 +256,36 @@ pub(crate) fn line(frames: f64) {
             over(2048),
             100.0 * s.cut as f64 / s.threads.max(1) as f64,
             over(8192),
+            s.entered as f64 / s.boxes.max(1) as f64,
+            s.cut_entered as f64 / s.cut_boxes.max(1) as f64,
+            100.0 * s.lost_threads as f64 / s.threads.max(1) as f64,
+            s.lost as f64 / s.lost_threads.max(1) as f64,
+            100.0 * s.cut_lost as f64 / s.cut.max(1) as f64,
             name.chars().take(200).collect::<String>()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_back_sums_tests_children_entered_and_pages_with_no_copy() {
+        let mut counts = vec![0u32; 2 * WALK_SLOTS as usize];
+        let detail = WALK_SLOTS as usize;
+        // A thread with 10 box tests and 2 triangle tests, 15 children entered.
+        counts[0] = 10 | 2 << 16;
+        counts[detail] = 15;
+        // One ended by the loop limit, 4 of its tests on a page with no copy.
+        counts[7] = 4090;
+        counts[detail + 7] = 8000 | 4 << 16;
+        // A slot with a detail but no test (cannot happen): not a thread.
+        counts[detail + 9] = 3;
+        let mut s = Sums::default();
+        s.add(&counts);
+        assert_eq!((s.dispatches, s.threads, s.boxes, s.triangles), (1, 2, 4100, 2));
+        assert_eq!((s.entered, s.lost, s.lost_threads), (8015, 4, 1));
+        assert_eq!((s.cut, s.cut_lost, s.cut_entered, s.cut_boxes), (1, 1, 8000, 4090));
     }
 }

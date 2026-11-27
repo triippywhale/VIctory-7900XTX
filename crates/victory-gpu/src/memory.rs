@@ -202,8 +202,12 @@ struct Memory {
     /// Their numbers in the order they came, and where the sweep is.
     order: Vec<u64>,
     sweep: usize,
-    /// Windows of title memory itself ([`Memory::map`]).
+    /// Windows of title memory itself ([`Memory::map`]), and their pages.
     windows: usize,
+    windowed: Vec<u64>,
+    /// Pages shown as title memory has them that share title buffers shaders
+    /// write, with those buffers ([`Memory::shares`]).
+    over: HashMap<u64, Vec<(u64, u64)>>,
     /// Packed structures the builder came to: the frame it last did.
     packed: HashMap<u64, Packed>,
     /// Their addresses in the order they came, and where the sweep is.
@@ -258,6 +262,8 @@ struct Stats {
     /// pages taken from faults, and the different pages faulted.
     left: u64,
     distinct: std::collections::HashSet<u64>,
+    /// Ranges copied from shader-written buffers into pages they share.
+    mirrored: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -300,6 +306,8 @@ impl Memory {
             order: Vec::new(),
             sweep: 0,
             windows: 0,
+            windowed: Vec::new(),
+            over: HashMap::new(),
             packed: HashMap::new(),
             packed_order: Vec::new(),
             packed_sweep: 0,
@@ -414,6 +422,8 @@ impl Memory {
             }
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        held_over_written(start);
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
@@ -422,6 +432,8 @@ impl Memory {
             {
                 self.windows += 1;
                 fill(self.entry(page), n, 0);
+                self.windowed.push(page);
+                self.shares(page);
                 return true;
             }
             return false;
@@ -464,6 +476,53 @@ impl Memory {
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        self.shares(page);
+    }
+
+    /// (`VICTORY_BVH_MIRROR=1`) Notes whether `page`, which by-address
+    /// readers see as title memory has it (an arena's page, a window), lies
+    /// partly in title buffers whose own copies shaders write: those bytes
+    /// are on the card in the buffer's copy alone until they land in title
+    /// memory, flights later. Run bvhcheck-2 found 12 such pages, among them
+    /// the first page of 2 and 6 MiB buffers shaders write; moving objects'
+    /// structures were built from vertices that were not there, and their
+    /// boxes reached 3.4e38 (bvhcheck-1 to -3).
+    fn shares(&mut self, page: u64) {
+        if !mirror() {
+            return;
+        }
+        let found = crate::shadow::written_across(page * PAGE, PAGE);
+        if found.is_empty() {
+            self.over.remove(&page);
+        } else if self.over.insert(page, found).is_none() && self.over.len() <= 200 {
+            tracing::info!(
+                page = format_args!("{:#x}", page * PAGE),
+                pages = self.over.len(),
+                "title memory by address: a page shares title buffers shaders write; their bytes are copied into it on the card before the builder reads (VICTORY_BVH_MIRROR)"
+            );
+        }
+    }
+
+    /// (`VICTORY_BVH_MIRROR=1`) In `list`, before its first builder dispatch:
+    /// the bytes of [`Memory::shares`]' buffers go from their own copies into
+    /// the by-address copies of the pages they share.
+    fn mirror(&mut self, list: &HostList) {
+        let mut copies = 0;
+        for (&page, buffers) in &self.over {
+            let Some(k) = self.copy_of(page) else { continue };
+            let to = &self.copies[k];
+            // An arena's page lies at its place in the arena's memory; a
+            // window is title memory itself.
+            let base = self.pages.get(&page).map_or(page * PAGE, |held| held.at as u64);
+            for &(start, len) in buffers {
+                let Some(from) = crate::shadow::peek(start, 1).filter(|s| s.written() && !s.in_place()) else { continue };
+                let (lo, hi) = (start.max(page * PAGE), (start + len).min((page + 1) * PAGE));
+                if lo < hi && list.mirror_copy(&from, lo, to, base + (lo - page * PAGE), hi - lo) {
+                    copies += 1;
+                }
+            }
+        }
+        self.stats.mirrored += copies;
     }
 
     /// With [`arenas_told`]: the page at `at` of the arena that is `copy` was
@@ -523,10 +582,17 @@ impl Memory {
 
     /// Looks at some of the pages and packed structures again.
     fn look_again(&mut self) {
+        // (Buffers come, and are first written by shaders, after a page did.)
+        if mirror() && self.frame.is_multiple_of(16) {
+            for page in self.windowed.clone() {
+                self.shares(page);
+            }
+        }
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let page = self.order[self.sweep];
             if self.pages.contains_key(&page) {
+                self.shares(page);
                 self.bring(page, page + 1);
             } else {
                 self.order.swap_remove(self.sweep);
@@ -913,7 +979,7 @@ impl Memory {
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; {:.1} runs of arena pages brought up \
-             (VICTORY_ARENAS_TOLD=0: arenas whole); since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all)",
+             (VICTORY_ARENAS_TOLD=0: arenas whole); since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all); {:.1} ranges a frame mirrored from buffers shaders write (VICTORY_BVH_MIRROR=1)",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -939,7 +1005,8 @@ impl Memory {
             s.told_runs as f64 / frames,
             s.distinct.len(),
             s.left as f64 / frames,
-            faults_all()
+            faults_all(),
+            s.mirrored as f64 / frames
         );
         // Where the copies shaders walk lie: a read of the PC's memory
         // crosses the bus.
@@ -966,6 +1033,15 @@ impl Memory {
         );
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// `VICTORY_BVH_MIRROR=1`: before a list's first builder dispatch, pages that
+/// by-address readers see as title memory has them take, on the card, the
+/// bytes of the title buffers in them that shaders write
+/// ([`Memory::shares`]). Off unless set.
+fn mirror() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MIRROR").is_some_and(|v| v == "1"))
 }
 
 /// Whether the builder stored results in a window at all ([`results`]).
@@ -1260,6 +1336,13 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    #[cfg(feature = "diagnostics")]
+    if builds {
+        m.inputs(addresses, written);
+    }
+    if builds && !m.over.is_empty() && list.first_use(usize::MAX - (7 << 33)) {
+        m.mirror(list);
+    }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -1296,6 +1379,8 @@ pub(crate) fn ready(
     #[cfg(feature = "diagnostics")]
     if use_ == Use::Reads {
         m.dump.walked(addresses);
+    } else {
+        m.dump.read_by_builder(addresses, written);
     }
     let directory = &m.directory.1;
     Some(Ready {
@@ -1303,6 +1388,123 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// `VICTORY_BVH_INPUTS=1`: where the structure builder's reads through a root
+/// view into a title buffer are served from. A page a title buffer does not
+/// hold whole is an arena's page or a window of title memory: what the CPU's
+/// side of title memory holds, not the buffer's own copy on the card, where
+/// the title's programs write (characters' skinned vertices). Run bvhcheck-1:
+/// moving objects' structures were built from vertices that are not there
+/// (z of 1e27 to 3.4e38, bytes of other records), and their boxes stretched
+/// the top level's to infinity. Per frame line: such reads by what serves
+/// them; the first buffers of each kind once.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct Inputs {
+    /// Reads served by the buffer's own copy; by an arena page; by a window;
+    /// by nothing. And of those not by its own copy, the buffers whose copy
+    /// shaders write.
+    own: u64,
+    arena: u64,
+    window: u64,
+    none: u64,
+    written: u64,
+    /// Pages given a place of title memory over buffers shaders write.
+    pages: u64,
+    said: std::collections::HashSet<(u64, u8)>,
+    from: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "diagnostics")]
+fn inputs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_INPUTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static INPUTS: Mutex<Option<Inputs>> = Mutex::new(None);
+
+/// (`VICTORY_BVH_INPUTS`) The page at `start` is given a place of title
+/// memory (an arena page or a window): the title buffers in it whose own
+/// copy shaders write are not what by-address readers see there. Each such
+/// page said once (the first 400), and counted.
+#[cfg(feature = "diagnostics")]
+fn held_over_written(start: u64) {
+    if !inputs_on() {
+        return;
+    }
+    let found = crate::shadow::written_across(start, PAGE);
+    if found.is_empty() {
+        return;
+    }
+    let mut guard = INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = guard.get_or_insert_with(Inputs::default);
+    n.pages += 1;
+    if n.pages <= 400 {
+        let list: Vec<String> = found.iter().take(8).map(|(s, l)| format!("{s:#x}+{l}")).collect();
+        tracing::info!(
+            "bvh inputs: page {start:#x} is read by address from title memory, but {} title buffers in it are written by shaders in their own copies: {}",
+            found.len(),
+            list.join(", ")
+        );
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Memory {
+    /// A builder dispatch's root views (`written`: those it stores through).
+    fn inputs(&mut self, addresses: &[u64], written: &[u64]) {
+        if !inputs_on() {
+            return;
+        }
+        let mut guard = INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = guard.get_or_insert_with(Inputs::default);
+        for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
+            let Some((start, len)) = crate::shadow::in_buffer(at, 1) else { continue };
+            let page = at / PAGE;
+            let own_copy = crate::shadow::peek(at, 1);
+            let kind = match self.copy_of(page) {
+                None => 3u8,
+                Some(k) if own_copy.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.copies[k])) => 0,
+                Some(_) if self.pages.contains_key(&page) => 1,
+                Some(_) => 2,
+            };
+            let shaders_write = own_copy.as_ref().is_some_and(|s| s.written());
+            match kind {
+                0 => n.own += 1,
+                1 => n.arena += 1,
+                2 => n.window += 1,
+                _ => n.none += 1,
+            }
+            if kind != 0 && shaders_write {
+                n.written += 1;
+            }
+            if n.said.len() < 400 && n.said.insert((start, kind)) {
+                let what = ["its own copy", "an arena page (title memory)", "a window of title memory", "nothing"][kind as usize];
+                tracing::info!(
+                    "bvh inputs: the builder reads {at:#x} in title buffer {start:#x} ({len} bytes, page {:#x} {}): from {what}; shaders write its copy: {shaders_write}",
+                    page * PAGE,
+                    if start <= page * PAGE && start + len >= (page + 1) * PAGE { "whole in it" } else { "shared" },
+                );
+            }
+        }
+        let now = std::time::Instant::now();
+        let since = *n.from.get_or_insert(now);
+        if now.duration_since(since).as_secs_f64() >= 5.0 {
+            tracing::info!(
+                "bvh inputs (VICTORY_BVH_INPUTS): reads of title buffers by the builder in 5 s: {} from their own copy, {} from arena pages, {} from windows, {} from nothing; of those not from their own copy, {} of buffers shaders write; pages read by address over such buffers so far {}",
+                n.own,
+                n.arena,
+                n.window,
+                n.none,
+                n.written,
+                n.pages
+            );
+            (n.own, n.arena, n.window, n.none, n.written) = (0, 0, 0, 0, 0);
+            n.from = Some(now);
+        }
+    }
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
@@ -1411,6 +1613,8 @@ mod dump {
     #[derive(Default)]
     pub(super) struct Dump {
         walked: std::collections::BTreeSet<u64>,
+        /// Title buffers the builder read through root views (start, bytes).
+        buffers: std::collections::BTreeSet<(u64, u64)>,
         /// Views the builder was given to write outside buffers: the first
         /// and the last frame, how often.
         pub(super) built: std::collections::BTreeMap<u64, (u64, u64, u64)>,
@@ -1423,6 +1627,18 @@ mod dump {
         pub(super) fn walked(&mut self, addresses: &[u64]) {
             if !self.done && self.walked.len() < 64 {
                 self.walked.extend(addresses);
+            }
+        }
+
+        /// A builder dispatch's root views: the title buffers it reads.
+        pub(super) fn read_by_builder(&mut self, addresses: &[u64], written: &[u64]) {
+            if self.done || folder().is_none() {
+                return;
+            }
+            for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
+                if let Some(span) = crate::shadow::in_buffer(at, 1) {
+                    self.buffers.insert(span);
+                }
             }
         }
     }
@@ -1504,6 +1720,62 @@ mod dump {
                 copies.push((to, data as usize));
             }
             self.dump.due = Some((self.frame + 12, copies));
+            self.title_side(folder);
+        }
+
+        /// The CPU's side of every held page, as title memory has it while the
+        /// arenas' copies are recorded (`title.bin`, pages in the order of
+        /// `title-pages.txt`: page, index, the frame it came in and was last
+        /// looked at, the write-watch asking it was last taken after): to
+        /// tell what the card's copy of a page lacks from what title memory
+        /// itself holds (run bvhcheck-2: moving objects built from vertex
+        /// bytes that are not positions, in memory the builder reaches by
+        /// pointer).
+        fn title_side(&self, folder: &std::path::Path) {
+            use std::io::Write;
+            let Ok(file) = std::fs::File::create(folder.join("title.bin")) else { return };
+            let mut out = std::io::BufWriter::with_capacity(1 << 22, file);
+            let mut text = format!("frame {}\n", self.frame);
+            let mut buf = vec![0u8; PAGE as usize];
+            let mut pages: Vec<(&u64, &Held)> = self.pages.iter().collect();
+            pages.sort_unstable_by_key(|p| *p.0);
+            let mut n = 0;
+            let mut done = std::collections::HashSet::new();
+            for (page, held) in pages {
+                crate::host::copy_mapped(buf.as_mut_ptr(), (page * PAGE) as *const u8, PAGE as usize, false);
+                if out.write_all(&buf).is_err() {
+                    return;
+                }
+                done.insert(*page);
+                text += &format!("{:#x} {n} {} {} {}\n", page * PAGE, held.born, held.looked, held.taken);
+                n += 1;
+            }
+            // And the title buffers the builder read through root views, as
+            // title memory has them (what shaders wrote to them comes back
+            // there when its copy lands): up to 1.5 GB more. Their line has
+            // `buffer` for the frames and the asking.
+            let mut more = 0;
+            for &(start, len) in &self.dump.buffers {
+                for page in start / PAGE..(start + len).div_ceil(PAGE) {
+                    if more >= 24_000 || !done.insert(page) {
+                        continue;
+                    }
+                    let at = page * PAGE;
+                    if !crate::texture::committed(at as *const u8, PAGE as usize) {
+                        continue;
+                    }
+                    crate::host::copy_mapped(buf.as_mut_ptr(), at as *const u8, PAGE as usize, false);
+                    if out.write_all(&buf).is_err() {
+                        return;
+                    }
+                    text += &format!("{at:#x} {n} buffer {start:#x} {len}\n");
+                    n += 1;
+                    more += 1;
+                }
+            }
+            let _ = out.flush();
+            let _ = std::fs::write(folder.join("title-pages.txt"), text);
+            tracing::info!("title memory by address: the CPU's side of the held pages is written out");
         }
     }
 }

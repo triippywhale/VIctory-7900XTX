@@ -213,9 +213,7 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
-        if crate::emit::bvh_walk() && self.s.threads.is_some() {
-            self.bvh_walk_count(is_box, is_triangle);
-        }
+        let walk = (crate::emit::bvh_walk() && self.s.threads.is_some()).then(|| self.bvh_walk_count(is_box, is_triangle));
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -226,6 +224,19 @@ impl<'a> Lower<'a> {
             .terminate(leaf_block, Term::CondBr(is_triangle, triangle_block, join));
         self.cur = box_block;
         let boxes = self.bvh_boxes(at, kind, &ray, sort);
+        // (`VICTORY_BVH_WALK`) How many of the node's children the ray
+        // enters.
+        let entered = walk.map(|_| {
+            let c = self.cur;
+            let (none, one, k0) = (self.s.m.i32(bvh::NONE), self.s.m.i32(1), self.s.m.i32(0));
+            let mut sum = k0;
+            for &id in &boxes {
+                let there = self.s.m.cmp(c, pred::NE, id, none);
+                let n = self.s.m.select(c, there, one, k0);
+                sum = self.s.m.bin(c, Bin::Add, sum, n);
+            }
+            sum
+        });
         let box_end = self.cur;
         self.s.m.terminate(box_end, Term::Br(join));
         self.cur = triangle_block;
@@ -249,6 +260,14 @@ impl<'a> Lower<'a> {
                 ],
             );
             results.push((phi, skipped[k]));
+        }
+        // (After the results' phis: a block's phis come first.)
+        if let (Some(byte), Some(entered)) = (walk, entered) {
+            let mapped = match at {
+                NodeAt::Memory { mapped, .. } => Some(mapped),
+                NodeAt::Buffer { .. } => None,
+            };
+            self.bvh_walk_detail(byte, entered, [box_end, triangle_end, leaf_block], mapped);
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -293,7 +312,9 @@ impl<'a> Lower<'a> {
     /// (`VICTORY_BVH_WALK=1`) This thread's node test counted in its dword of
     /// the [`crate::emit::SLOT_WALK`] buffer: 1 for a box node, 0x10000 for a
     /// triangle.
-    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) {
+    ///
+    /// Returns the byte of the thread's dword, for [`Lower::bvh_walk_detail`].
+    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) -> V {
         let c = self.cur;
         let (entry, i32t) = (self.s.entry, self.s.t.i32);
         let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
@@ -311,6 +332,34 @@ impl<'a> Lower<'a> {
         let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
         let iu = self.s.m.undef(i32t);
         self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
+        byte
+    }
+
+    /// (`VICTORY_BVH_WALK=1`) At the join of the node test: the thread's
+    /// second dword, [`crate::emit::WALK_SLOTS`] dwords past its first, adds
+    /// the children the ray entered (`entered`, from the box path; none
+    /// for a node that is not a box node) and 0x10000 when the node's page
+    /// has no copy (`mapped` false: it read zeros).
+    /// `from` is the join's predecessors, the box path's end first.
+    fn bvh_walk_detail(&mut self, byte: V, entered: V, from: [usize; 3], mapped: Option<V>) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k0 = self.s.m.i32(0);
+        let phi = self.s.m.phi(c, i32t);
+        self.s.m.set_phi(phi, vec![(entered, from[0]), (k0, from[1]), (k0, from[2])]);
+        let add = match mapped {
+            Some(m) => {
+                let high = self.s.m.i32(0x10000);
+                let lost = self.s.m.select(c, m, k0, high);
+                self.s.m.bin(c, Bin::Add, phi, lost)
+            }
+            None => phi,
+        };
+        let second = self.s.m.i32(crate::emit::WALK_SLOTS * 4);
+        let at = self.s.m.bin(c, Bin::Add, byte, second);
+        let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, at, iu, iu, add]);
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
