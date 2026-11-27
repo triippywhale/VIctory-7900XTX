@@ -76,7 +76,7 @@ fn gs_words() -> Vec<u32> {
         w.extend(write2(d, regs, regs + 1));
         w.extend(write2(d + 2, regs + 2, regs + 3));
         w.extend(write2(d + 4, 16, 14));
-        w.extend([0xD834_0000 | (d + 6) * 4, 15 << 8 | 13]); // ds_write_b32 v13, v15
+        w.extend([0xD834_0000 | ((d + 6) * 4), 15 << 8 | 13]); // ds_write_b32 v13, v15
         w.push(0xBF90_0022); // s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)
     }
     w.extend([
