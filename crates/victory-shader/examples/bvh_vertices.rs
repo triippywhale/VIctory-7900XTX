@@ -2,7 +2,7 @@
 //! (`VICTORY_MEMORY_DUMP`):
 //!
 //! ```text
-//! cargo run --release -p victory-shader --example bvh_vertices -- <folder> <bottom level address>
+//! cargo run --release -p victory-shader --example bvh_vertices -- <folder> <bottom level address> [--title]
 //! ```
 //!
 //! Collects the corners of the structure's triangles, then looks through
@@ -105,22 +105,59 @@ fn half(x: f32) -> u16 {
     sign | (e as u16) << 10 | ((b >> 13) & 0x3ff) as u16
 }
 
+/// The CPU's side of the held pages (`title.bin`, `title-pages.txt`).
+fn load_title(folder: &Path) -> std::io::Result<Dump> {
+    let text = std::fs::read_to_string(folder.join("title-pages.txt"))?;
+    let mut pages = HashMap::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if let [page, n, ..] = f.as_slice()
+            && let (Some(page), Some(n)) = (number(page), number(n))
+        {
+            pages.insert(page / PAGE, (0, n as usize * PAGE as usize));
+        }
+    }
+    Ok(Dump {
+        arenas: vec![std::fs::read(folder.join("title.bin"))?],
+        pages,
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (Some(folder), Some(address)) = (args.first(), args.get(1).and_then(|a| number(a))) else {
-        eprintln!("usage: bvh_vertices <dump folder> <bottom level address>");
+        eprintln!("usage: bvh_vertices <dump folder> <bottom level address> [--title]");
         std::process::exit(2);
     };
-    let d = match load(Path::new(folder)) {
+    let card = match load(Path::new(folder)) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{folder}: {e}");
             std::process::exit(1);
         }
     };
-    let all = corners(&d, address);
+    // `--title`: look in the CPU's side of title memory (`title.bin`) instead
+    // of the card's copy; the structure itself is read from the card's.
+    let title = args.iter().any(|a| a == "--title");
+    let d = if title {
+        match load_title(Path::new(folder)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("{folder}: title.bin: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Dump {
+            arenas: Vec::new(),
+            pages: HashMap::new(),
+        }
+    };
+    let d = if title { &d } else { &card };
+
+    let all = corners(&card, address);
     // The structure's own triangle nodes hold the corners too: not looked in.
-    let own = Header::read(&d, address).map_or(0..0, |h| address..address + h.bytes);
+    let own = Header::read(&card, address).map_or(0..0, |h| address..address + h.bytes);
     let box_of = |v: &[f32; 3]| [v[0], v[1], v[2], v[0], v[1], v[2]];
     let (bad, good): (Vec<[f32; 3]>, Vec<[f32; 3]>) = all.iter().partition(|v| huge(&box_of(v)));
     println!(
@@ -140,7 +177,12 @@ fn main() {
     // The sane corners by their x y z dwords, and by their halves.
     let mut want32: HashMap<[u32; 3], [f32; 3]> = HashMap::new();
     let mut want16: HashMap<[u16; 3], [f32; 3]> = HashMap::new();
-    for v in good.iter().take(4096) {
+    // (A corner at the origin is in every run of zeros.)
+    for v in good
+        .iter()
+        .filter(|v| v.iter().filter(|x| **x == 0.0).count() < 2)
+        .take(4096)
+    {
         want32.insert(v.map(f32::to_bits), *v);
         want16.insert(v.map(half), *v);
     }

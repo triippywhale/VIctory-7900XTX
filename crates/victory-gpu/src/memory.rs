@@ -1302,6 +1302,8 @@ pub(crate) fn ready(
     #[cfg(feature = "diagnostics")]
     if use_ == Use::Reads {
         m.dump.walked(addresses);
+    } else {
+        m.dump.read_by_builder(addresses, written);
     }
     let directory = &m.directory.1;
     Some(Ready {
@@ -1534,6 +1536,8 @@ mod dump {
     #[derive(Default)]
     pub(super) struct Dump {
         walked: std::collections::BTreeSet<u64>,
+        /// Title buffers the builder read through root views (start, bytes).
+        buffers: std::collections::BTreeSet<(u64, u64)>,
         /// Views the builder was given to write outside buffers: the first
         /// and the last frame, how often.
         pub(super) built: std::collections::BTreeMap<u64, (u64, u64, u64)>,
@@ -1546,6 +1550,18 @@ mod dump {
         pub(super) fn walked(&mut self, addresses: &[u64]) {
             if !self.done && self.walked.len() < 64 {
                 self.walked.extend(addresses);
+            }
+        }
+
+        /// A builder dispatch's root views: the title buffers it reads.
+        pub(super) fn read_by_builder(&mut self, addresses: &[u64], written: &[u64]) {
+            if self.done || folder().is_none() {
+                return;
+            }
+            for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
+                if let Some(span) = crate::shadow::in_buffer(at, 1) {
+                    self.buffers.insert(span);
+                }
             }
         }
     }
@@ -1646,12 +1662,39 @@ mod dump {
             let mut buf = vec![0u8; PAGE as usize];
             let mut pages: Vec<(&u64, &Held)> = self.pages.iter().collect();
             pages.sort_unstable_by_key(|p| *p.0);
-            for (n, (page, held)) in pages.into_iter().enumerate() {
+            let mut n = 0;
+            let mut done = std::collections::HashSet::new();
+            for (page, held) in pages {
                 crate::host::copy_mapped(buf.as_mut_ptr(), (page * PAGE) as *const u8, PAGE as usize, false);
                 if out.write_all(&buf).is_err() {
                     return;
                 }
+                done.insert(*page);
                 text += &format!("{:#x} {n} {} {} {}\n", page * PAGE, held.born, held.looked, held.taken);
+                n += 1;
+            }
+            // And the title buffers the builder read through root views, as
+            // title memory has them (what shaders wrote to them comes back
+            // there when its copy lands): up to 1.5 GB more. Their line has
+            // `buffer` for the frames and the asking.
+            let mut more = 0;
+            for &(start, len) in &self.dump.buffers {
+                for page in start / PAGE..(start + len).div_ceil(PAGE) {
+                    if more >= 24_000 || !done.insert(page) {
+                        continue;
+                    }
+                    let at = page * PAGE;
+                    if !crate::texture::committed(at as *const u8, PAGE as usize) {
+                        continue;
+                    }
+                    crate::host::copy_mapped(buf.as_mut_ptr(), at as *const u8, PAGE as usize, false);
+                    if out.write_all(&buf).is_err() {
+                        return;
+                    }
+                    text += &format!("{at:#x} {n} buffer {start:#x} {len}\n");
+                    n += 1;
+                    more += 1;
+                }
             }
             let _ = out.flush();
             let _ = std::fs::write(folder.join("title-pages.txt"), text);
