@@ -5556,6 +5556,23 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     map.get(&key).map(|e| (key.0, e.end - key.0))
 }
 
+/// Diagnostics (`VICTORY_BVH_INPUTS`): the title buffers that overlap
+/// `[address, address + len)` without holding all of it and whose copy
+/// shaders were declared to write, as (start, length); among the 256 that
+/// start closest below its end.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn written_across(address: u64, len: u64) -> Vec<(u64, u64)> {
+    let end = address.saturating_add(len);
+    let map = buffers_read();
+    map.range(..(end, 0))
+        .rev()
+        .take(256)
+        .filter(|(key, e)| e.end > address && !(key.0 <= address && e.end >= end))
+        .filter(|(_, e)| e.shadow.as_ref().is_some_and(|s| s.written()))
+        .map(|(key, e)| (key.0, e.end - key.0))
+        .collect()
+}
+
 /// Whether a title buffer of at most `most` bytes lies in `[address, address
 /// + len)`, all of it or in part.
 pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {

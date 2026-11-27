@@ -414,6 +414,8 @@ impl Memory {
             }
             return true;
         }
+        #[cfg(feature = "diagnostics")]
+        held_over_written(start);
         // Small title buffers in it: what the builder stores in them comes
         // back, so title memory itself.
         if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
@@ -1260,6 +1262,10 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    #[cfg(feature = "diagnostics")]
+    if builds {
+        m.inputs(addresses, written);
+    }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -1303,6 +1309,123 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// `VICTORY_BVH_INPUTS=1`: where the structure builder's reads through a root
+/// view into a title buffer are served from. A page a title buffer does not
+/// hold whole is an arena's page or a window of title memory: what the CPU's
+/// side of title memory holds, not the buffer's own copy on the card, where
+/// the title's programs write (characters' skinned vertices). Run bvhcheck-1:
+/// moving objects' structures were built from vertices that are not there
+/// (z of 1e27 to 3.4e38, bytes of other records), and their boxes stretched
+/// the top level's to infinity. Per frame line: such reads by what serves
+/// them; the first buffers of each kind once.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+pub(crate) struct Inputs {
+    /// Reads served by the buffer's own copy; by an arena page; by a window;
+    /// by nothing. And of those not by its own copy, the buffers whose copy
+    /// shaders write.
+    own: u64,
+    arena: u64,
+    window: u64,
+    none: u64,
+    written: u64,
+    /// Pages given a place of title memory over buffers shaders write.
+    pages: u64,
+    said: std::collections::HashSet<(u64, u8)>,
+    from: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "diagnostics")]
+fn inputs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_INPUTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static INPUTS: Mutex<Option<Inputs>> = Mutex::new(None);
+
+/// (`VICTORY_BVH_INPUTS`) The page at `start` is given a place of title
+/// memory (an arena page or a window): the title buffers in it whose own
+/// copy shaders write are not what by-address readers see there. Each such
+/// page said once (the first 400), and counted.
+#[cfg(feature = "diagnostics")]
+fn held_over_written(start: u64) {
+    if !inputs_on() {
+        return;
+    }
+    let found = crate::shadow::written_across(start, PAGE);
+    if found.is_empty() {
+        return;
+    }
+    let mut guard = INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = guard.get_or_insert_with(Inputs::default);
+    n.pages += 1;
+    if n.pages <= 400 {
+        let list: Vec<String> = found.iter().take(8).map(|(s, l)| format!("{s:#x}+{l}")).collect();
+        tracing::info!(
+            "bvh inputs: page {start:#x} is read by address from title memory, but {} title buffers in it are written by shaders in their own copies: {}",
+            found.len(),
+            list.join(", ")
+        );
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Memory {
+    /// A builder dispatch's root views (`written`: those it stores through).
+    fn inputs(&mut self, addresses: &[u64], written: &[u64]) {
+        if !inputs_on() {
+            return;
+        }
+        let mut guard = INPUTS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = guard.get_or_insert_with(Inputs::default);
+        for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
+            let Some((start, len)) = crate::shadow::in_buffer(at, 1) else { continue };
+            let page = at / PAGE;
+            let own_copy = crate::shadow::peek(at, 1);
+            let kind = match self.copy_of(page) {
+                None => 3u8,
+                Some(k) if own_copy.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.copies[k])) => 0,
+                Some(_) if self.pages.contains_key(&page) => 1,
+                Some(_) => 2,
+            };
+            let shaders_write = own_copy.as_ref().is_some_and(|s| s.written());
+            match kind {
+                0 => n.own += 1,
+                1 => n.arena += 1,
+                2 => n.window += 1,
+                _ => n.none += 1,
+            }
+            if kind != 0 && shaders_write {
+                n.written += 1;
+            }
+            if n.said.len() < 400 && n.said.insert((start, kind)) {
+                let what = ["its own copy", "an arena page (title memory)", "a window of title memory", "nothing"][kind as usize];
+                tracing::info!(
+                    "bvh inputs: the builder reads {at:#x} in title buffer {start:#x} ({len} bytes, page {:#x} {}): from {what}; shaders write its copy: {shaders_write}",
+                    page * PAGE,
+                    if start <= page * PAGE && start + len >= (page + 1) * PAGE { "whole in it" } else { "shared" },
+                );
+            }
+        }
+        let now = std::time::Instant::now();
+        let since = *n.from.get_or_insert(now);
+        if now.duration_since(since).as_secs_f64() >= 5.0 {
+            tracing::info!(
+                "bvh inputs (VICTORY_BVH_INPUTS): reads of title buffers by the builder in 5 s: {} from their own copy, {} from arena pages, {} from windows, {} from nothing; of those not from their own copy, {} of buffers shaders write; pages read by address over such buffers so far {}",
+                n.own,
+                n.arena,
+                n.window,
+                n.none,
+                n.written,
+                n.pages
+            );
+            (n.own, n.arena, n.window, n.none, n.written) = (0, 0, 0, 0, 0);
+            n.from = Some(now);
+        }
+    }
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
