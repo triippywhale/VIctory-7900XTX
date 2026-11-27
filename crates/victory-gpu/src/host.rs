@@ -6873,6 +6873,12 @@ impl HostList {
         self.epoch.store(next_epoch(), Ordering::Relaxed);
     }
 
+    /// (`VICTORY_TABLE_MEMO=verify`) How many deferred steps the list has
+    /// queued.
+    pub(crate) fn deferred_steps(&self) -> usize {
+        self.deferred().copies.len()
+    }
+
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)

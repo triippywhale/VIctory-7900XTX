@@ -10,6 +10,11 @@
 #               6 = VICTORY_PORT_GUARD, 7 = VICTORY_PORT_JOURNAL. The listed ones are set to 1 and
 #               the others to 0: -Ports 1,5, -Ports all, or -Ports none (all five off). Without it
 #               each keeps the build's default (1 and 5 on, the rest off). -More still wins over it.
+# -CpuPorts     two recording-thread trims from Op-lite/victory-scarlett, both off without it:
+#               VICTORY_AFFINITY=free (the title's five recording threads not pinned to logical
+#               processors 8-12) and VICTORY_TABLE_MEMO=1 (a table entry made ready earlier in a list,
+#               with nothing changed since, not made ready again). -More @{VICTORY_TABLE_MEMO='verify'}
+#               checks the memo instead: its frame line must count 0 changes.
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new
@@ -25,6 +30,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$Safe,
     [switch]$RayTracing,
+    [switch]$CpuPorts,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
@@ -44,6 +50,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192' }
+if ($CpuPorts) { $settings.VICTORY_AFFINITY = 'free'; $settings.VICTORY_TABLE_MEMO = '1' }
 $portSwitches = [ordered]@{
     '1' = 'VICTORY_PORT_CONSTANTS'; '2' = 'VICTORY_PORT_DESCRIPTORS'; '5' = 'VICTORY_PORT_CBV'
     '6' = 'VICTORY_PORT_GUARD'; '7' = 'VICTORY_PORT_JOURNAL'
