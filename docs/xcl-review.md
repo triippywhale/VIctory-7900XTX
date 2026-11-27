@@ -18,7 +18,7 @@ its RX 9070 / 6800 / 6700 XT contributors.
 |---|---|
 | ea088a58: `image_get_resinfo` at a level past the last gives 0 sizes; AMD's driver answers with the sizes of the level it clamped to | The size query compares the level with the view's level count; past it, every size reads 0 as on the console. Translations change |
 | 5b3f0a4b: `amdxc64` folds `Bfrev(Countbits(K))` of a constant K wrong (0x80000001 for K = 2) | The optimiser's FOLD pass computes `Countbits` and `Bfrev` of 32-bit constants itself, so the driver never sees the pair. Test `bit_counts_and_reversals_of_constants_fold` |
-| 0574950e: an AMD driver gives a D3D12 device to nine processes at once; a tenth fails with 0x887A0005 | `victory warm` starts at most 8 worker processes on an AMD card by default (it started two thirds of the logical processors: 16 on a 24-thread CPU). `--jobs` is taken as given |
+| 0574950e: an AMD driver gives a D3D12 device to nine processes at once; a tenth fails with 0x887A0005 | `victory warm` starts at most 8 worker processes on an AMD card by default (it started two thirds of the logical processors: 10 on the Ryzen 7 7800X3D's 16 threads, which with the title makes 11 processes). `--jobs` is taken as given |
 
 `TRANSLATOR_VERSION` 5 → 7 for the first two (pull request #41 takes 6):
 cached translations are made again (`victory shaders`).
