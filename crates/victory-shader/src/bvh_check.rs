@@ -113,6 +113,14 @@ pub fn area(b: &Aabb) -> f64 {
     d[0] * d[1] + d[1] * d[2] + d[2] * d[0]
 }
 
+/// A coordinate this far out (10,000 km in metres) is no place in a scene.
+pub const HUGE: f32 = 1e7;
+
+/// A box with a coordinate past [`HUGE`] or not finite.
+pub fn huge(b: &Aabb) -> bool {
+    b.iter().any(|x| !(x.abs() <= HUGE))
+}
+
 fn valid(b: &Aabb) -> bool {
     b[0] <= b[3] && b[1] <= b[4] && b[2] <= b[5]
 }
@@ -203,6 +211,11 @@ pub struct Report {
     /// instances.
     pub expected_own: f64,
     pub expected: f64,
+    /// Boxes with a coordinate past [`HUGE`] or not finite (not counted as
+    /// loose: their surface means nothing).
+    pub huge: u64,
+    /// The union of the root's children's boxes.
+    pub root: Option<Aabb>,
 }
 
 impl Report {
@@ -226,6 +239,8 @@ pub struct Instanced {
     /// box, and the bottom level's estimate.
     pub chance: f64,
     pub expected: f64,
+    /// The box the top level keeps for the instance.
+    pub world: Aabb,
 }
 
 /// Walks the structure whose header is at `address`. For a top level, its
@@ -241,10 +256,17 @@ pub fn check(
     let mut r = Report::default();
     let root_kind = header.root & 7;
     let root = node_address(address, header.root);
-    let entry = if header.bounds.iter().all(|x| x.is_finite()) && valid(&header.bounds) {
-        header.bounds
-    } else {
-        [f32::MIN, f32::MIN, f32::MIN, f32::MAX, f32::MAX, f32::MAX]
+    // A ray through the root enters the union of its children's boxes (the
+    // header's bounds may be wider, or not finite).
+    let root_union = matches!(root_kind, 4 | 5)
+        .then(|| box_node(memory, root, root_kind))
+        .flatten()
+        .and_then(|c| c.iter().fold(None, |u, (_, b)| Some(union(u, b))));
+    r.root = root_union;
+    let entry = match root_union {
+        Some(u) if area(&u).is_finite() => u,
+        _ if header.bounds.iter().all(|x| x.is_finite()) && valid(&header.bounds) => header.bounds,
+        _ => [f32::MIN, f32::MIN, f32::MIN, f32::MAX, f32::MAX, f32::MAX],
     };
     // Iterative: (node address, kind, the box it was entered by, the chance
     // a ray through the root gets here, depth), and leaving a node's path.
@@ -297,6 +319,9 @@ pub fn check(
                 let mut entered = 0.0;
                 for (_, b) in &children {
                     tight = Some(union(tight, b));
+                    if huge(b) {
+                        r.huge += 1;
+                    }
                     if outside(b, &by) > 0.01 && by_area.is_finite() {
                         r.escapes += 1;
                     }
@@ -310,8 +335,8 @@ pub fn check(
                 r.entered_weight += chance;
                 if let Some(t) = tight {
                     let (outer, inner) = (area(&by), area(&t));
-                    if depth > 1 && outer.is_finite() && inner > 0.0 {
-                        let loose = outer / inner;
+                    let loose = outer / inner;
+                    if depth > 1 && !huge(&by) && !huge(&t) && inner > 0.0 && loose.is_finite() {
                         r.loose_sum += loose;
                         r.loose_count += 1;
                         r.loose_most = r.loose_most.max(loose);
@@ -362,6 +387,7 @@ pub fn check(
                                     static_root,
                                     chance,
                                     expected: b.expected,
+                                    world: by,
                                 });
                             }
                             None => r.missing += 1,
@@ -594,9 +620,19 @@ mod tests {
             ],
         );
         // The top level: one instance in a box with a quarter of the root's
-        // surface.
-        m.header(top, false, 4, cube(0.0, 2.0), at(1, 5));
-        m.box32(top, 1, [(at(3, 6), cube(0.0, 1.0)), EMPTY, EMPTY, EMPTY]);
+        // surface (the other child is the header's bounds' far corner, an
+        // instance of the same bottom level).
+        m.header(top, false, 6, cube(0.0, 2.0), at(1, 5));
+        m.box32(
+            top,
+            1,
+            [
+                (at(3, 6), cube(0.0, 1.0)),
+                (at(5, 6), cube(1.9, 2.0)),
+                EMPTY,
+                EMPTY,
+            ],
+        );
         let mut inst = [0u32; 16];
         inst[0] = 1f32.to_bits();
         inst[5] = 1f32.to_bits();
@@ -604,17 +640,46 @@ mod tests {
         inst[14] = at(1, 5) | STATIC_ROOT;
         inst[15] = (bottom >> 8) as u32;
         m.put(top + 3 * NODE, &inst);
+        m.put(top + 5 * NODE, &inst);
         let (mut bottoms, mut instanced) = (HashMap::new(), Vec::new());
         let r = check(&m.0, top, &mut bottoms, &mut instanced).unwrap();
-        assert_eq!((r.boxes, r.instances, r.missing), (1, 1, 0));
-        assert_eq!(instanced.len(), 1);
+        assert_eq!((r.boxes, r.instances, r.missing), (1, 2, 0));
+        assert_eq!(instanced.len(), 2);
         assert_eq!(instanced[0].address, bottom);
         assert!(instanced[0].static_root);
         // Bottom level: 1 + 2 triangles; entered with a quarter's chance.
         assert!((instanced[0].expected - 3.0).abs() < 1e-9);
         assert!((instanced[0].chance - 0.25).abs() < 1e-9);
         assert!((r.expected_own - 1.0).abs() < 1e-9);
-        assert!((r.expected - 1.75).abs() < 1e-9);
+        let far = area(&cube(1.9, 2.0)) / area(&cube(0.0, 2.0));
+        assert!((r.expected - (1.0 + 0.25 * 3.0 + far * 3.0)).abs() < 1e-9);
+        assert_eq!(instanced[0].world, cube(0.0, 1.0));
         assert!(bottoms[&bottom].is_some());
+    }
+
+    #[test]
+    fn the_root_is_entered_by_its_childrens_union_and_huge_boxes_are_not_loose() {
+        let mut m = Built::default();
+        let base = 0x70_0000;
+        // Header bounds far wider than what the root holds.
+        m.header(base, true, 8, cube(-1e20, 1e20), at(1, 5));
+        m.box32(
+            base,
+            1,
+            [
+                (at(3, 5), cube(0.0, 1.0)),
+                (at(5, 5), cube(-1e9, 1e9)),
+                EMPTY,
+                EMPTY,
+            ],
+        );
+        m.box32(base, 3, [(at(7, 0), cube(0.0, 1.0)), EMPTY, EMPTY, EMPTY]);
+        m.box32(base, 5, [(at(7, 1), cube(0.0, 0.5)), EMPTY, EMPTY, EMPTY]);
+        let r = check(&m.0, base, &mut HashMap::new(), &mut Vec::new()).unwrap();
+        assert_eq!(r.root, Some(cube(-1e9, 1e9)));
+        assert_eq!(r.huge, 1);
+        // Node 3 is tight; node 5's huge box is not counted as loose.
+        assert_eq!(r.loose_count, 1);
+        assert!(r.loose_mean().is_finite());
     }
 }

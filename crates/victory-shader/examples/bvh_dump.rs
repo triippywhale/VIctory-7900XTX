@@ -113,7 +113,8 @@ fn line(what: &str, address: u64, h: &Header, r: &Report) {
         "{what} {address:#x} marks {:#x} {} bytes: {} box nodes, {} triangles, {} instances, depth {}; \
          broken: {} cycles, {} reached twice, {} outside, {} not in the dump, {} odd; \
          loose: mean {:.2}, most {:.1}, {} over 2, {} escaping; \
-         children entered per box test {:.2}; expected node tests {:.1} (own {:.1})",
+         children entered per box test {:.2}; expected node tests {:.1} (own {:.1}); \
+         {} huge boxes; header bounds {:?}, root's children span {:?}",
         h.marks >> 16,
         h.bytes,
         r.boxes,
@@ -132,6 +133,9 @@ fn line(what: &str, address: u64, h: &Header, r: &Report) {
         r.children_entered(),
         r.expected,
         r.expected_own,
+        r.huge,
+        h.bounds,
+        r.root,
     );
 }
 
@@ -179,6 +183,33 @@ fn main() {
             ""
         };
         line(&format!("top{walked}"), h.address, h, &r);
+        // The instances whose boxes a ray through the root enters most often:
+        // one in nearly every ray's way is tested by nearly every ray.
+        let mut by_chance: Vec<&bvh_check::Instanced> = instanced.iter().collect();
+        by_chance.sort_by(|a, b| b.chance.total_cmp(&a.chance));
+        let wide = |share: f64| instanced.iter().filter(|i| i.chance >= share).count();
+        println!(
+            "  instances entered by a ray through the root: {} at 50 %+, {} at 10 %+, {} at 1 %+ of {}; {} with huge boxes; sum of chances {:.2}",
+            wide(0.5),
+            wide(0.1),
+            wide(0.01),
+            instanced.len(),
+            instanced
+                .iter()
+                .filter(|i| bvh_check::huge(&i.world))
+                .count(),
+            instanced.iter().map(|i| i.chance).sum::<f64>(),
+        );
+        for i in by_chance.iter().take(12) {
+            println!(
+                "    chance {:.3}, bottom {:#x} ({}, {:.1} tests a ray that enters it), box {:?}",
+                i.chance,
+                i.address,
+                if i.static_root { "static" } else { "dynamic" },
+                i.expected,
+                i.world
+            );
+        }
         for i in instanced {
             let c = cost
                 .entry(i.address)
