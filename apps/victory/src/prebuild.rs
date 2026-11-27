@@ -128,6 +128,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         // container's call to it is the translator's fetch call). Two
         // records of the title have one, a debug-draw vertex shader with
         // POSITION and COLOR; every other vertex record has it folded in.
+        // That vertex shader is in none of the title's files, so those two
+        // are still skipped, now as "vertex or mesh shader not found".
         let [ps, vs, gs, es, hs, ls, _fetch] = g.stages;
         if hs.is_some() || ls.is_some() {
             return Err("stages other than vertex, geometry, mesh and pixel".into());
