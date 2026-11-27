@@ -5,16 +5,23 @@ that runs an Xbox Series title natively on Windows from files the user supplies.
 
 ## The goal
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+**The Series X version at 4K output (drawn at 1440p) with ray tracing on,
+looking the way it does on the Xbox**, on an AMD RX 7900 XTX first.
+
+In this order:
+
+1. **A correct picture.** Textures and models reach full detail and stay there
+   (no pop-in or pop-out, no flickering trees), and ray-traced lighting is right:
+   not too dark, not too bright, no flicker.
+2. **Then the frame rate:** 30 fps or more with ray tracing on, then as high a
+   frame rate and as low frame times as the PC allows.
+3. **Then smaller PCs:** 32 GB (later 16 GB) of RAM and smaller cards.
 
 The way there is **porting, not emulating**: patching the title's renderer so it
 behaves the way a PC renderer does, rather than having the layer watch and copy
 the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+into a versioned store that is kept between builds. The Series S profile and
+ray tracing off stay available.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
@@ -23,7 +30,31 @@ or publisher.
 ## Where it stands (2026-11-26)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+RX 7900 XTX, renderer patches 1, 2, 5, 6 and 7 on. Runs of 270 s in a city
+street: standing still, then walking and turning the camera.
+
+| Version | Standing | Walking | RAM |
+|---|---|---|---|
+| **Series X, 4K drawn at 1440p, ray tracing on (the goal)** | 99 ms (10 fps) | ~110 ms (9 fps) | 45 GB |
+| Series X, 4K drawn at 1440p, ray tracing off | 49 ms (20 fps) | ~62 ms (16 fps) | 45 GB |
+| Series X, 1080p output, ray tracing off | 40 ms (25 fps) | ~43 ms (23 fps) | 42 GB |
+| Series S, ray tracing off | 43 ms (23 fps) | ~64 ms (16 fps) | 37 GB |
+
+Fixed 2026-11-26: trees and palms dropping out for a few frames, and most of the
+lighting swinging between too dark and too bright in lamp-lit rooms. Both came from
+indirect draws whose arguments sit in renderer patch 1's in-place memory being
+prepared before the title's culling had written them; they are now prepared one at
+a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
+2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
+(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+
+Still open: models and textures stay at their lowest detail for a long time while
+the title streams (worst in the intro): the title paces its streaming by its own
+frames, so it loads about three times slower at 10 fps than at 30; ray-traced
+structures of moving objects are partly corrupt (the rays follow some 450 stray
+pointers a frame).
+
+Earlier measurements with ray tracing off:
 
 | | |
 |---|---|
