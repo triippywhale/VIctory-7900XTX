@@ -896,6 +896,28 @@ impl Module {
                     _ => None,
                 }
             }
+            Op::Call(f, ref args) => {
+                // A bit count or reversal of a 32-bit constant is that
+                // constant's: AMD's compiler (`amdxc64.dll`) folds
+                // `Bfrev(Countbits(K))` for a constant K to `Bfrev(n) | n`
+                // (0x8000_0001 for K = 2). Folded here, the driver never sees
+                // the pair. (after xcl-dev/xcl 5b3f0a4b, found on an RX 9070 XT)
+                let name = self.funcs[f as usize].name.as_str();
+                if !matches!(name, "dx.op.unaryBits.i32" | "dx.op.unary.i32") || args.len() != 2 {
+                    return None;
+                }
+                let (Some((32, opcode)), Some((32, x))) = (self.int_k(args[0]), self.int_k(args[1]))
+                else {
+                    return None;
+                };
+                let x = x as u32;
+                let r = match opcode {
+                    30 => x.reverse_bits(),
+                    31 => x.count_ones(),
+                    _ => return None,
+                };
+                Some(self.k(ty, 32, u64::from(r)))
+            }
             _ => None,
         }
     }
@@ -1653,6 +1675,38 @@ mod tests {
         let minus4 = m.i32(-4i32 as u32);
         let stores = stores(&m, b);
         assert_eq!(stores, [vec![x, four], vec![minus4, wide]]);
+        m.write();
+    }
+
+    /// `Countbits` and `Bfrev` of 32-bit constants are folded, so AMD's
+    /// compiler never sees `Bfrev(Countbits(K))`; of a value they stay.
+    #[test]
+    fn bit_counts_and_reversals_of_constants_fold() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let fty = m.func_ty(i32t, vec![i32t, i32t]);
+        let bits = m.function("dx.op.unaryBits.i32", fty, Some(Attr::ReadNone), false);
+        let unary = m.function("dx.op.unary.i32", fty, Some(Attr::ReadNone), false);
+        let (k30, k31, two) = (m.i32(30), m.i32(31), m.i32(2));
+        // Bfrev(Countbits(2)) = Bfrev(1) = 0x8000_0000.
+        let n = m.call(b, bits, vec![k31, two]);
+        let r = m.call(b, unary, vec![k30, n]);
+        let one = m.i32(1);
+        let x = m.call(b, reads, vec![one, one]);
+        let kept = m.call(b, bits, vec![k31, x]);
+        m.call(b, writes, vec![r, kept]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | DEAD);
+        let top = m.i32(0x8000_0000);
+        let stores = stores(&m, b);
+        assert_eq!(stores, [vec![top, kept]]);
+        assert_eq!(body(&m, b), 3, "the read, the count of it and the store");
         m.write();
     }
 
