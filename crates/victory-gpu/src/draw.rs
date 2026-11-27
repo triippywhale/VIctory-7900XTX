@@ -414,6 +414,34 @@ fn batches() -> u8 {
     })
 }
 
+/// Whether a pass that bounds indirect arguments leaves out its wait for
+/// every earlier shader write when nothing that may write buffers was
+/// recorded since the last such wait in its host list
+/// (`VICTORY_CLAMP_AFTER_WAIT=1`; off by default; A/B-able with
+/// `VICTORY_AB=<s>,VICTORY_CLAMP_AFTER_WAIT`).
+///
+/// The title writes arguments with a dispatch, waits (a barrier group or a
+/// pipeline sync: a wait for every shader write, `crate::list`), sets its
+/// pipeline and roots, and executes. The pass then opened ([`batches`])
+/// waits again, with nothing new to wait for (run bvhcheck-4: 1,696 passes
+/// and 713 waits of the title's a frame; how many passes follow a wait
+/// directly is on the frame line with this on, and what a second wait
+/// costs the card is not measured yet). What may write arguments is what
+/// ends a batch
+/// ([`State::buffers_written`], [`State::drew`], [`State::copied`]), so
+/// the pass reads every record a pass with the wait would. A host list
+/// that starts (a new one, or after a cut) counts as written, and the wait
+/// behind a single record's pass and the state changes of the scratch
+/// buffer stay.
+fn clamp_after_wait() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CLAMP_AFTER_WAIT") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_AFTER_WAIT").is_some_and(|v| v == "1"))
+}
+
 /// The records clamped by the pass opened last ([`batches`]).
 struct Batch {
     table: crate::indirect::batch::Table,
@@ -479,6 +507,11 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// A wait for every earlier shader write was recorded in this host
+    /// list, and since then nothing that may write buffers (a dispatch, a
+    /// draw whose shaders store, a copy on the card, a pass of ours that
+    /// charges the budget): [`clamp_after_wait`].
+    waited: bool,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -4393,6 +4426,7 @@ impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self) {
+        self.waited = false;
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -4404,6 +4438,7 @@ impl State {
     fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
+            self.waited = false;
         }
         if let Some(p) = p
             && p.stages.iter().any(|s| s.shader.probe.is_some())
@@ -4416,6 +4451,24 @@ impl State {
     pub(crate) fn copied(&mut self) {
         self.window = None;
         self.batch = None;
+        self.waited = false;
+    }
+
+    /// A wait for every earlier shader write was recorded for the title (a
+    /// barrier group or a pipeline sync): [`clamp_after_wait`].
+    pub(crate) fn waited(&mut self) {
+        self.waited = true;
+    }
+
+    /// Whether the pass about to bound arguments in `list` waits for every
+    /// earlier shader write first ([`clamp_after_wait`]).
+    fn clamp_lead(&mut self, list: &HostList) -> bool {
+        const WAIT_USE: usize = usize::MAX - 0x79;
+        // A host list that starts has no wait of its own yet.
+        if list.first_use(WAIT_USE) {
+            self.waited = false;
+        }
+        !(self.waited && clamp_after_wait())
     }
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
@@ -4452,7 +4505,12 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let lead = self.clamp_lead(list);
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args), lead)?;
+        // What the pass charges the budget is waited for by the next pass
+        // (`crate::indirect::batch::record_lead`), unless the title waits
+        // first.
+        self.waited = false;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
@@ -4638,11 +4696,14 @@ impl State {
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
+                let lead = self.clamp_lead(list);
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), lead)
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), lead)
                 };
+                // (The pass waits behind itself.)
+                self.waited = bounded.is_some();
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");

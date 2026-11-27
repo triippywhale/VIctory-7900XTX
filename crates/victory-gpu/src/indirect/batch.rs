@@ -261,13 +261,29 @@ impl Table {
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
+#[cfg(test)]
 pub(super) fn record(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    sources: [u64; SOURCES],
+    jobs: u64,
+) {
+    record_lead(c, l, dst, budget, sources, jobs, true);
+}
+
+/// [`record`]; with `lead` false the wait for every earlier shader write
+/// in front of the pass is left out (none was recorded since the last one:
+/// `crate::indirect::open_batch`). The state change of `dst` stays.
+pub(super) fn record_lead(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    lead: bool,
 ) {
     let after = transition(
         dst,
@@ -277,10 +293,11 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
+        let first = [
             uav_barrier(),
             transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        ];
+        l.ResourceBarrier(&first[usize::from(!lead)..]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {

@@ -131,6 +131,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of the passes that bound indirect commands, those recorded without
+    /// their wait in front, right after another (`VICTORY_CLAMP_AFTER_WAIT`).
+    ClampWaitsLeft,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1507,10 +1510,11 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         such waits each), of them {:.0} without the wait in front (VICTORY_CLAMP_AFTER_WAIT); barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::ClampWaitsLeft as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of
