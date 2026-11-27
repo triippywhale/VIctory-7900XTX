@@ -371,6 +371,10 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // A NaN or infinity in the air is summed along every view ray through
+    // it: black or white patches floating in the room. No comparison with
+    // one holds, so the cap below left it; told by the exponent's bits.
+    if (any((asuint(c) & 0x7f800000u) == 0x7f800000u)) { scattered[at] = float3(0.0, 0.0, 0.0); return; }
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
 }
