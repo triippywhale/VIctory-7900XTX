@@ -3624,6 +3624,7 @@ fn land() {
 /// see it.
 fn late_helper() {
     crate::cores::keep_on_fast_cores("victory-late-wait");
+    crate::cores::many_ahead("victory-late-wait");
     let Some(host) = host() else {
         return;
     };
@@ -3768,6 +3769,7 @@ struct RelayFetch {
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
     crate::cores::keep_on_fast_cores("victory-relay");
+    crate::cores::ahead("victory-relay");
     let Some(host) = host() else {
         return;
     };
@@ -5613,6 +5615,7 @@ impl Host {
         }
         late_threads();
         if let Some(cut) = {
+            let _looking = crate::timeline::span("the line: looking for a cut behind a placed copy");
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
         } {
@@ -5640,6 +5643,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let _noting = crate::timeline::span("the line: a flight noted");
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {

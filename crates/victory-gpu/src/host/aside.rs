@@ -67,6 +67,7 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
             .name("victory-aside".into())
             .spawn(move || {
                 crate::cores::keep_on_fast_cores("victory-aside");
+                crate::cores::many_ahead("victory-aside");
                 jobs.into_iter().for_each(|job| job())
             })
             .ok()

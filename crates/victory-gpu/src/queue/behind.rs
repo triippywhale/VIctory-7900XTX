@@ -311,6 +311,10 @@ impl<W: Work> Lane<W> {
     /// Does one entry: the oldest that is the first of its queue and free to
     /// run. Whether there was one. Only one thread calls this.
     fn step(&self, limit: u64) -> bool {
+        // (Diagnostics: the thread's time between its submissions was 25 to
+        // 30 ms a frame in runs with renderer ports 1 and 5, outside every
+        // span: these name it.)
+        let mut looking = crate::timeline::span("the line: looking for what may run");
         // Each queue's first entry, oldest first.
         let mut heads: Vec<(u64, usize, Option<W::Ask>, bool)> = Vec::new();
         // Whether one of them stands for others not known yet.
@@ -370,6 +374,7 @@ impl<W: Work> Lane<W> {
             self.lock().raise(entry.queue, later);
         }
         if entry.what.folded() {
+            looking.next("the line: a submission's lists taken");
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
             // is found first).
@@ -383,6 +388,7 @@ impl<W: Work> Lane<W> {
         }
         // What follows it in its queue, if that can go with it. (Nobody else
         // takes anything out, and what comes in goes to the end.)
+        looking.next("the line: taking along what follows");
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
@@ -424,6 +430,7 @@ impl<W: Work> Lane<W> {
             let floor = self.lock().floor(entry.queue);
             entry.what.marked(mark.max(floor));
         }
+        looking.end();
         entry.what.go(forced);
         {
             let mut state = self.lock();

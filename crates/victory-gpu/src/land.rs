@@ -240,8 +240,10 @@ impl Pool {
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
+                    crate::cores::ahead(name);
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
+                    crate::cores::many_ahead(name);
                 }
                 pool.help()
             });
