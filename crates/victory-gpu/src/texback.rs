@@ -201,6 +201,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
+    static UNTILED: AtomicU64 = AtomicU64::new(0);
     let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
@@ -232,8 +233,13 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            // Counted, not said once: a texture that never lands is one the
+            // title's CPU keeps reading stale, every list that writes it.
+            let failed = UNTILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if failed.is_power_of_two() {
+                let d = &back.layout.desc;
+                tracing::warn!(?e, failed, mip, slice, swizzle = d.swizzle.0, width = d.width, height = d.height, element_bytes = d.element_bytes, "a texture copied back could not be tiled; title memory keeps what it had");
+            }
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
@@ -244,7 +250,7 @@ pub(crate) fn land(back: &Back) {
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        tracing::info!(copied, bytes = size, swizzle = back.layout.desc.swizzle.0, not_tiled = UNTILED.load(Ordering::Relaxed), "texture readback landed");
     }
 }
 

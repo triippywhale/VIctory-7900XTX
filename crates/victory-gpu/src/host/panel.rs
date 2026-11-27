@@ -863,8 +863,6 @@ impl Panel {
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
             self.buffers = Buffers::new(host, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
@@ -874,6 +872,12 @@ impl Panel {
             buffers.write(snap);
         }
         let (w, h) = size(scale);
+        // The list holds what it reads until it has run: a change of the
+        // picture's size replaces these buffers while it may be in flight.
+        list.keep(&buffers.card);
+        if buffers.fresh {
+            list.keep(&buffers.uploads[buffers.turn].0);
+        }
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {

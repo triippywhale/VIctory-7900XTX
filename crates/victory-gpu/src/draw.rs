@@ -1807,7 +1807,62 @@ impl State {
     }
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
+    /// A depth plane the draw uses before the pass that gives it its
+    /// twin's contents is given them first, and the draw prepared again
+    /// (`VICTORY_PLANE_NOW`, [`State::planes_due`]).
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        let done = self.prepare_for_once(list, indexed, mesh);
+        if done && self.planes_due(list) {
+            return self.prepare_for_once(list, indexed, mesh);
+        }
+        done
+    }
+
+    /// After a draw or dispatch is bound (`VICTORY_PLANE_NOW`): the depth
+    /// planes it uses that the list's shaders wrote through their twins
+    /// since the planes were last drawn from them. Their pass is recorded
+    /// now, before the draw or dispatch, and what the title set is set on
+    /// the list again (the pass left its own pipeline, heap, target,
+    /// viewport, scissor and topology): true then, and the caller binds
+    /// anew. Without it the draw read the plane as it was before the write.
+    fn planes_due(&mut self, list: &HostList) -> bool {
+        if !crate::host::plane_now() {
+            return false;
+        }
+        let late = list.take_plane_late();
+        if late.is_empty() {
+            return false;
+        }
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            for (depth, _) in &late {
+                // SAFETY: a live texture.
+                let d = unsafe { depth.texture.GetDesc() };
+                tracing::info!(
+                    pipeline = format_args!("{:#x}", self.pipeline),
+                    depth = format_args!("{}x{}x{} format {}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0),
+                    "a depth plane is given its twin's contents before the draw or dispatch that uses it, not at the list's close (VICTORY_PLANE_NOW; the first 8 said)"
+                );
+            }
+        }
+        list.planes_now(&late);
+        let set = self.targets_set.then(|| self.host_targets.clone());
+        self.replay(list);
+        // `replay` makes the target views from the handles' descriptors as
+        // they are now (its shortcut): said if that is not what was set.
+        if let Some(set) = set
+            && set.is_some()
+            && set != self.host_targets
+        {
+            once!(
+                pipeline = format_args!("{:#x}", self.pipeline),
+                "a depth plane's early pass set the targets again from descriptors rewritten since the title set them: other targets than it set (VICTORY_PLANE_NOW=0 leaves the pass at the list's close)"
+            );
+        }
+        true
+    }
+
+    fn prepare_for_once(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -3327,7 +3382,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if !self.bind(list, p, true) || (self.planes_due(list) && !self.bind(list, p, true)) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -4889,7 +4944,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
+            DISPATCH => self.bind(list, p, true) && (!self.planes_due(list) || self.bind(list, p, true)),
             _ => false,
         };
         if !ran {

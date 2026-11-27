@@ -267,6 +267,14 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // `VICTORY_RING_METER=1`: hooks on the title's read-back rings (a
+    // meter; nothing without the switch).
+    #[cfg(windows)]
+    {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the mapped title image, none of whose code has run yet.
+        unsafe { victory_hle::ringhook::install(image.base(), size) };
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

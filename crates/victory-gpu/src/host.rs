@@ -335,6 +335,24 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PLANE_NOW` (on by default, `0` turns it off): a depth plane
+/// whose twin the list wrote is given the twin's contents
+/// (`HostList::pass_plane`) before the draw or dispatch that next uses the
+/// plane, not when the list closes. Without it that draw or dispatch reads
+/// the plane as it was before the write (about one use a frame in the
+/// PR #45 run: 1272 uses), which the console's shared memory never shows.
+/// From PastiiJay/klbf-lab's `VICTORY_PLANE_NOW` (Op-lite's, off by default
+/// there and on in its launcher), where the stale plane was the tiled
+/// lighting's material class plane, tested depth-equal.
+pub(crate) fn plane_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_none_or(|v| v != "0"))
+}
+
+/// A depth texture (the title resource's host copy) and its twin, whose
+/// depth plane was used before its pass.
+pub(crate) type LatePlane = (std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>);
+
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
@@ -1624,6 +1642,11 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<ByCopy<TwinUse>>,
+    /// Depth planes used, since the last draw or dispatch was prepared,
+    /// before the pass that gives them their twin's contents
+    /// ([`HostList::twin_use`]): with `VICTORY_PLANE_NOW` the pass is
+    /// recorded before that draw or dispatch ([`HostList::planes_now`]).
+    plane_late: Mutex<Vec<LatePlane>>,
     /// The title textures this list writes whose placed views shaders pick
     /// by index (`crate::resource::picked_alias`): copied into those views
     /// when the list closes ([`HostList::aliases_current`]).
@@ -4344,6 +4367,7 @@ fn late_line(frames: f64) {
     crate::watch::view_once_line(frames);
     crate::port_journal::line(frames);
     crate::port_rt::line(frames);
+    crate::ringmeter::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4860,6 +4884,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                plane_late: Mutex::default(),
                 wrote_shown: Mutex::default(),
                 prelude,
                 pipelines,
@@ -7132,6 +7157,9 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        // Planes noted late by a use no draw or dispatch followed: their
+        // pass is `twins_to_depth`'s, as without `VICTORY_PLANE_NOW`.
+        self.plane_late.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins_to_depth();
         self.aliases_current();
         self.textures_back();
@@ -7193,6 +7221,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_late.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -7381,14 +7410,22 @@ impl HostList {
         if was != (u.needs, u.behind, u.writing) || copy || colour {
             self.changed_something();
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
+        // The depth plane's twin is not drawn into the plane here: the pass
+        // sets a pipeline and a target of ours, which a list still
+        // recording the title's commands cannot take as it is. With
+        // `VICTORY_PLANE_NOW` the draw or dispatch being prepared records
+        // the pass once it is bound, sets the title's state again and binds
+        // anew (`crate::draw::State::planes_due`), so it sees the plane as
+        // written. Else, and for a use that no draw or dispatch of this
+        // list follows (a copy, a clear), the use sees the plane as it was
+        // and the pass runs when the list closes (`twins_to_depth`).
+        // Counted.
         if copy && !colour && twin.plane.is_some() {
             u.late = true;
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+            if plane_now() {
+                self.plane_late.lock().unwrap_or_else(|e| e.into_inner()).push((depth.clone(), twin.clone()));
+            }
         }
         drop(twins);
         if copy {
@@ -7403,11 +7440,37 @@ impl HostList {
         true
     }
 
+    /// The depth planes used before their pass since the last call
+    /// (`VICTORY_PLANE_NOW`; none without it).
+    pub(crate) fn take_plane_late(&self) -> Vec<LatePlane> {
+        std::mem::take(&mut *self.plane_late.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// (`VICTORY_PLANE_NOW`) Records now the pass that draws each plane's
+    /// twin into the plane (`pass_plane`), which else runs when the list
+    /// closes. The pass leaves its own pipeline, heap, target, viewport,
+    /// scissor and topology on the list: the caller sets the title's state
+    /// again (`crate::draw::State::replay`) and binds anew before its draw
+    /// or dispatch.
+    pub(crate) fn planes_now(&self, late: &[LatePlane]) {
+        for (depth, twin) in late {
+            self.pass_plane(depth, twin);
+            // Not again at the close, unless the twin is written again.
+            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(twin) as usize)) {
+                u.late = false;
+            }
+        }
+        crate::resource::PLANES[3].fetch_add(late.len() as u64, Ordering::Relaxed);
+        self.changed_something();
+    }
+
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
-    /// for a list that records nothing of the title's afterwards
-    /// (`record_plane_pass`).
+    /// for a list that records nothing of the title's afterwards, or whose
+    /// caller sets the title's state again (`record_plane_pass`,
+    /// [`HostList::planes_now`]).
     fn pass_plane(
         &self,
         depth: &std::sync::Arc<crate::resource::HostTexture>,
@@ -10267,13 +10330,15 @@ impl Meter {
                     du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                     du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                     refused = format!(
-                        "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                        "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass, {} of those given the pass before the use after all (VICTORY_PLANE_NOW); shader views in the sRGB twin of their texture's format, read without the conversion: {}",
                         crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                         crate::shadow::OWN_MADE.load(Ordering::Relaxed),
                         crate::resource::TWINS[0].load(Ordering::Relaxed),
                         crate::resource::TWINS[1].load(Ordering::Relaxed),
                         crate::resource::PLANES[1].load(Ordering::Relaxed),
-                        crate::resource::PLANES[2].load(Ordering::Relaxed)
+                        crate::resource::PLANES[2].load(Ordering::Relaxed),
+                        crate::resource::PLANES[3].load(Ordering::Relaxed),
+                        crate::descriptor::host::SRGB_LOST_VIEWS.load(Ordering::Relaxed)
                     ),
                     making = crate::pipeline::making(),
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),

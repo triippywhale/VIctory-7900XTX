@@ -186,7 +186,7 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
 
 /// One writable page within `rel32` reach of `[base, base + size)`. Leaked:
 /// title code calls into it for the life of the process.
-fn near(base: usize, size: usize) -> Result<*mut u8> {
+pub(crate) fn near(base: usize, size: usize) -> Result<*mut u8> {
     const GRANULE: usize = 0x1_0000;
     // The search spans 1 GiB each side, so every call site stays in reach.
     if size >= 1 << 30 {

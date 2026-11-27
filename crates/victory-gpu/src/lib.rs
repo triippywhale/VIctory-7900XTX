@@ -114,6 +114,8 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+/// `VICTORY_RING_METER`: what the title reads from its read-back rings.
+pub mod ringmeter;
 
 #[cfg(windows)]
 pub use host::on_failure;
