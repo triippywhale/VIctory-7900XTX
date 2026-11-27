@@ -12591,6 +12591,15 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
+            // A level past the view's last: the console gives 0 for every
+            // size and keeps the level count. D3D12 asks the same and
+            // NVIDIA's driver does it; AMD's answers with the sizes of the
+            // level it clamped to. (after xcl-dev/xcl ea088a58)
+            let within = (!uav && dmask & 7 != 0).then(|| {
+                let levels = self.s.m.extract(c, d, 3);
+                self.s.m.cmp(c, pred::IULT, mip, levels)
+            });
+            let zero = self.s.m.i32(0);
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                 let x = if ch == 3 && uav {
                     one
@@ -12598,6 +12607,10 @@ impl<'a> Lower<'a> {
                     missing_extent
                 } else {
                     self.s.m.extract(c, d, ch)
+                };
+                let x = match within {
+                    Some(w) if ch < 3 => self.s.m.select(c, w, x, zero),
+                    _ => x,
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }

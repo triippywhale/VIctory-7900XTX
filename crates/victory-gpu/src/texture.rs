@@ -1587,6 +1587,14 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// (a texture streams in whole mips; the small ones lie first). Read
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    fingerprint_blank(at, len).0
+}
+
+/// [`fingerprint`], and whether every byte it read was zero: memory the
+/// title has mapped but not filled yet (a texture's pages are committed,
+/// then streamed or decompressed into later). Such a texture is shown
+/// black for as long as its host copy keeps those zeros.
+pub(crate) fn fingerprint_blank(at: u64, len: u64) -> (u64, bool) {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1595,12 +1603,14 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
     // Pieces of buffer copies left on the card there first (`crate::left`).
     crate::left::before_take(at as usize, at as usize + len, 0);
     let mut print = 0u128;
+    let mut blank = true;
     READ.with(|read| {
         let mut read = read.borrow_mut();
         read.resize(3 * WINDOW, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
             crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            blank &= all_zero(&read[..bytes]);
             print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
         };
         if len <= 3 * WINDOW {
@@ -1612,7 +1622,13 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
         }
     });
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
+    (u64::from_le_bytes(first) | 1, blank)
+}
+
+/// Whether every byte is zero (eight at a time).
+fn all_zero(bytes: &[u8]) -> bool {
+    let (words, rest) = bytes.as_chunks::<8>();
+    words.iter().all(|w| u64::from_ne_bytes(*w) == 0) && rest.iter().all(|&b| b == 0)
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its

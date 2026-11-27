@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use victory_hle::known_pipelines as known;
+use victory_shader::emit::host::preferred_vendor;
 
 /// Pipelines a process makes before another takes its place: the compiler's
 /// and the translations' memory goes with it.
@@ -20,6 +21,22 @@ const LONGEST: Duration = Duration::from_secs(180);
 
 /// As the runs count one that takes long.
 const SLOW_MS: f64 = 1000.0;
+
+/// The processes an AMD driver gives a D3D12 device at one time: in a tenth,
+/// `D3D12CreateDevice` fails with 0x887A0005 and the driver reports an error
+/// (xcl-dev/xcl 0574950e, Adrenalin 26.11.2 on an RX 9070).
+const AMD_DEVICE_PROCESSES: usize = 9;
+
+/// The warm workers by default: `workers`, and on an AMD card (`vendor`
+/// 0x1002) no more than leave the title (or another program) one device.
+/// `--jobs` is taken as given.
+fn with_devices(workers: usize, vendor: Option<u32>) -> usize {
+    if vendor == Some(0x1002) {
+        workers.min(AMD_DEVICE_PROCESSES - 1)
+    } else {
+        workers
+    }
+}
 
 fn folder() -> Result<PathBuf> {
     let cfg = victory_core::Config::load()?;
@@ -56,7 +73,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
+    let jobs = jobs
+        .unwrap_or_else(|| with_devices(cores * 2 / 3, preferred_vendor()))
+        .max(1);
     println!(
         "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
         keys.len(),
@@ -326,6 +345,16 @@ fn make(dir: &Path, these: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::windows::process::CommandExt;
+
+    /// On an AMD card the default leaves one device of the driver's nine for
+    /// the title; other vendors keep what the processors give.
+    #[test]
+    fn warm_workers_on_amd_leave_a_device() {
+        assert_eq!(with_devices(16, Some(0x1002)), 8);
+        assert_eq!(with_devices(4, Some(0x1002)), 4);
+        assert_eq!(with_devices(16, Some(0x10de)), 16);
+        assert_eq!(with_devices(16, None), 16);
+    }
 
     fn fake_child(script: &str, stdout: Stdio) -> Result<Child> {
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");

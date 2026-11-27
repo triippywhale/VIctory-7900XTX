@@ -6,7 +6,7 @@
 //! page instead of faulting: some 35,000 calls a frame, each of which locks
 //! the pages it copies, 39 ms of kernel time on the submitting thread alone.
 //!
-//! [`copy`] is one `rep movsb`. A fault in it is taken by the handler of
+//! [`copy`] is a loop of moves (or one `rep movsb`). A fault in it is taken by the handler of
 //! [`crate::watch`] (`on_write`, the first in the process), which opens a
 //! block we guard ourselves and lets the copy go on, and otherwise sends it
 //! to its failing exit. `VICTORY_SAFE_COPY=0`: through the kernel, as before.
@@ -21,20 +21,79 @@ std::arch::global_asm!(
     // rcx destination, rdx source, r8 bytes; eax: whether all were copied.
     // A leaf that leaves the stack alone (the two registers it must give
     // back are kept in volatile ones), so a stack walk through it works.
+    // `rep movsb` only for copies of 48 MiB and more whose destination is
+    // not 1 to 63 bytes ahead of the source within a page, else a loop of
+    // 32-byte moves ([`copy`] says why). Each instruction of either is
+    // whole or not done at all, so a fault the handler opens a block for
+    // goes on where it stood.
     "victory_safe_copy:",
     "mov r10, rsi",
     "mov r11, rdi",
     "mov rdi, rcx",
     "mov rsi, rdx",
     "mov rcx, r8",
+    "cmp rcx, 0x3000000",
+    "jb 2f",
+    "mov eax, edi",
+    "sub eax, esi",
+    "and eax, 4095",
+    "dec eax",
+    "cmp eax, 63",
+    "jb 2f",
     "victory_safe_copy_at:",
     "rep movsb",
+    "jmp 6f",
+    "2:",
+    "cmp rcx, 128",
+    "jb 3f",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovdqu ymm1, ymmword ptr [rsi + 32]",
+    "vmovdqu ymm2, ymmword ptr [rsi + 64]",
+    "vmovdqu ymm3, ymmword ptr [rsi + 96]",
+    "vmovdqu ymmword ptr [rdi], ymm0",
+    "vmovdqu ymmword ptr [rdi + 32], ymm1",
+    "vmovdqu ymmword ptr [rdi + 64], ymm2",
+    "vmovdqu ymmword ptr [rdi + 96], ymm3",
+    "add rsi, 128",
+    "add rdi, 128",
+    "sub rcx, 128",
+    "jmp 2b",
+    "3:",
+    "cmp rcx, 32",
+    "jb 4f",
+    "vmovdqu ymm0, ymmword ptr [rsi]",
+    "vmovdqu ymmword ptr [rdi], ymm0",
+    "add rsi, 32",
+    "add rdi, 32",
+    "sub rcx, 32",
+    "jmp 3b",
+    "4:",
+    "cmp rcx, 8",
+    "jb 5f",
+    "mov rax, qword ptr [rsi]",
+    "mov qword ptr [rdi], rax",
+    "add rsi, 8",
+    "add rdi, 8",
+    "sub rcx, 8",
+    "jmp 4b",
+    "5:",
+    "test rcx, rcx",
+    "jz 6f",
+    "mov al, byte ptr [rsi]",
+    "mov byte ptr [rdi], al",
+    "inc rsi",
+    "inc rdi",
+    "dec rcx",
+    "jmp 5b",
+    "6:",
     "victory_safe_copy_after:",
+    "vzeroupper",
     "mov eax, 1",
     "mov rsi, r10",
     "mov rdi, r11",
     "ret",
     "victory_safe_copy_failed:",
+    "vzeroupper",
     "xor eax, eax",
     "mov rsi, r10",
     "mov rdi, r11",
@@ -171,6 +230,86 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    // The two above with AVX-512's masked stores ([`mask512`]): on Zen 4 a
+    // `vpmaskmovd` store is 18 operations with one every 6 cycles at best
+    // (uops.info), where one masked by a k register is a plain store. What
+    // is stored, and what is not, is the same: lanes masked off are neither
+    // written nor fault.
+    ".globl victory_safe_put512",
+    ".globl victory_safe_put512_at",
+    ".globl victory_safe_put512_after",
+    ".globl victory_safe_put512_failed",
+    // As victory_safe_put.
+    "victory_safe_put512:",
+    "test r9, r9",
+    "jz 4f",
+    "2:",
+    "vmovdqu ymm1, ymmword ptr [r8]",
+    "vpcmpd k1, ymm1, ymmword ptr [rdx], 4",
+    "kortestw k1, k1",
+    "jz 3f",
+    "victory_safe_put512_at:",
+    "vmovdqu32 ymmword ptr [rcx] {{k1}}, ymm1",
+    "victory_safe_put512_after:",
+    "nop",
+    "3:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "vzeroupper",
+    "4:",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_put512_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
+    ".globl victory_safe_merge512",
+    ".globl victory_safe_merge512_at",
+    ".globl victory_safe_merge512_after",
+    ".globl victory_safe_merge512_failed",
+    // As victory_safe_merge.
+    "victory_safe_merge512:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "victory_safe_merge512_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpd k1, ymm3, ymm2, 4",
+    "kmovw eax, k1",
+    "test eax, eax",
+    "jz 4f",
+    "vmovdqu32 ymmword ptr [rcx] {{k1}}, ymm3",
+    "victory_safe_merge512_after:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "victory_safe_merge512_failed:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "mov rax, r9",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -190,6 +329,54 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+    fn victory_safe_put512(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    fn victory_safe_put512_at();
+    fn victory_safe_put512_after();
+    fn victory_safe_put512_failed();
+    fn victory_safe_merge512(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge512_at();
+    fn victory_safe_merge512_after();
+    fn victory_safe_merge512_failed();
+}
+
+/// Whether [`put_changed`] and [`merge`] store with AVX-512's masked stores
+/// (`victory_safe_put512`, `victory_safe_merge512`), where the processor has
+/// them (Zen 4 and later, Intel's server parts); `VICTORY_MASK512=0`: with
+/// AVX2's `vpmaskmovd`, as before. AMD runs that store as microcode (Zen 4:
+/// 18 operations, one every 6 cycles; Alder Lake: 3, one a cycle), and
+/// these are the loops that put what shaders wrote into title memory.
+fn mask512() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let has = std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512vl");
+        let on = has && std::env::var_os("VICTORY_MASK512").is_none_or(|v| v != "0");
+        tracing::info!(on, has, "dword stores into title memory with AVX-512 masked stores (VICTORY_MASK512=0: not)");
+        on
+    })
+}
+
+/// `victory_safe_put`, or its AVX-512 twin ([`mask512`]).
+///
+/// # Safety
+/// As the assembly's.
+unsafe fn safe_put(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32 {
+    // SAFETY: the caller's; the twin needs AVX-512F and VL (asked).
+    unsafe { if mask512() { victory_safe_put512(dst, was, now, blocks) } else { victory_safe_put(dst, was, now, blocks) } }
+}
+
+/// `victory_safe_merge`, or its AVX-512 twin ([`mask512`]).
+///
+/// # Safety
+/// As the assembly's.
+unsafe fn safe_merge(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: &mut [u64; 2]) -> usize {
+    // SAFETY: the caller's; the twin needs AVX-512F and VL (asked).
+    unsafe {
+        if mask512() {
+            victory_safe_merge512(title, now, held, blocks, counts)
+        } else {
+            victory_safe_merge(title, now, held, blocks, counts)
+        }
+    }
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -276,7 +463,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             unsafe {
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
-                let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                let stuck = safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
                 out.there &= stuck == 0;
                 let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
                 std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
@@ -285,7 +472,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         } else {
             let blocks = left / 32;
             // SAFETY: whole blocks of the stretch.
-            let stuck = unsafe { victory_safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            let stuck = unsafe { safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
             if stuck != 0 {
                 out.there = false;
                 if take {
@@ -355,7 +542,7 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     if blocks > 0 {
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
-        all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
+        all &= unsafe { safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
     }
     let single = |from: usize, to: usize| {
         let mut all = true;
@@ -392,6 +579,15 @@ pub(crate) fn on() -> bool {
 /// of the destination cannot be written; then some of the bytes may have
 /// been copied.
 ///
+/// This was one `rep movsb`. On a Ryzen 7 7800X3D (Zen 4) that runs at
+/// 4.7 GB/s, against 110-130, whenever the destination is 1 to 63 bytes
+/// ahead of the source within a page, whatever the length (a single byte
+/// so: 0.3 GB/s); and from 4 MiB on it streams past the caches, 32 GB/s
+/// against 56 for plain moves that the 96 MB cache keeps. A loop of 32-byte
+/// moves was as fast or faster at every length up to 32 MiB and every
+/// alignment measured there, so `rep movsb` is left only for copies of
+/// 48 MiB and more (memory-bound: 30 GB/s against 24).
+///
 /// # Safety
 /// Of the two ranges, what is not title memory must be valid, and no Rust
 /// reference may cover the destination. [`on`] must have been asked.
@@ -415,6 +611,14 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_changed_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_put512_at as *const () as usize, victory_safe_put512_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put512_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge512_at as *const () as usize, victory_safe_merge512_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_merge512_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
     (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
@@ -511,6 +715,65 @@ mod tests {
         assert_eq!(found, [0]);
         assert_eq!(seen[..32], title[..32]);
         assert_ne!(seen[200 * 32..201 * 32], title[200 * 32..201 * 32]);
+    }
+
+    /// The AVX-512 twins ([`mask512`]) store what the AVX2 loops store, and
+    /// count what they count, where the processor has them.
+    #[test]
+    fn the_avx512_twins_store_the_same() {
+        if !(std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512vl")) {
+            return;
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..2000 {
+            let blocks = (next() % 9) as usize;
+            let rare = [2, 5, 40][round % 3];
+            let title: Vec<u8> = (0..blocks * 32).map(|_| next() as u8).collect();
+            let mut changed = |from: &[u8]| -> Vec<u8> {
+                from.iter().map(|&b| if next() % rare == 0 { next() as u8 } else { b }).collect()
+            };
+            let held = changed(&title);
+            let now = changed(&held);
+            let (mut a, mut b) = (title.clone(), title.clone());
+            // SAFETY: our own buffers of `blocks` blocks each.
+            unsafe {
+                assert_eq!(victory_safe_put(a.as_mut_ptr(), held.as_ptr(), now.as_ptr(), blocks), 1);
+                assert_eq!(victory_safe_put512(b.as_mut_ptr(), held.as_ptr(), now.as_ptr(), blocks), 1);
+            }
+            assert_eq!(a, b, "put, round {round}");
+            let (mut a, mut b) = (title.clone(), title.clone());
+            let (mut ha, mut hb) = (held.clone(), held.clone());
+            let (mut ca, mut cb) = ([0u64; 2], [0u64; 2]);
+            // SAFETY: as above.
+            unsafe {
+                assert_eq!(victory_safe_merge(a.as_mut_ptr(), now.as_ptr(), ha.as_mut_ptr(), blocks, &mut ca), 0);
+                assert_eq!(victory_safe_merge512(b.as_mut_ptr(), now.as_ptr(), hb.as_mut_ptr(), blocks, &mut cb), 0);
+            }
+            assert_eq!((a, ha, ca), (b, hb, cb), "merge, round {round}");
+        }
+    }
+
+    /// Copies of 48 MiB and more go through `rep movsb` unless the
+    /// destination is just ahead of the source; both ways copy every byte.
+    #[test]
+    fn long_copies_take_either_way() {
+        assert!(on());
+        let len = (48 << 20) + 77;
+        let (a, b) = (Pages::new(len + 4096), Pages::new(len + 4096));
+        a.fill();
+        for (da, sa) in [(0usize, 0usize), (3, 0), (0, 3)] {
+            // SAFETY: inside the two allocations.
+            unsafe {
+                assert!(copy(b.0.add(da), a.0.add(sa), len));
+                assert!(std::slice::from_raw_parts(b.0.add(da), len) == std::slice::from_raw_parts(a.0.add(sa), len));
+            }
+        }
     }
 
     /// The dwords that changed are stored, and no byte of any other, at

@@ -84,3 +84,11 @@ codegen-units = 1
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# The diagnostics build for this fork's own PC, a Ryzen 7 7800X3D (Zen 4: AVX-512,
+# BMI2, POPCNT): `cargo x3d` (.cargo/config.toml) builds it into target\x3d with
+# `-C target-cpu=znver4`, and `scripts\play.ps1 -Build x3d` runs it. Its own folder,
+# so that switching between it and target\diag does not rebuild either. It does not
+# start on a processor without AVX-512 (Zen 3 and older, Intel's desktop parts).
+[profile.x3d]
+inherits = "diag"

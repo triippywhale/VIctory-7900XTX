@@ -6,6 +6,7 @@
 //! capture holds, `pso` pipeline descriptions, `states` the states textures
 //! are in, `edit` the experiments, `gpu` helpers.
 
+mod dred;
 mod edit;
 mod gpu;
 mod hook;

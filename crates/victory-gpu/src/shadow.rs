@@ -1589,9 +1589,19 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`]: `VICTORY_WIDE_THREADS` (1 to
+/// 16), else a quarter of the logical processors, 2 to 6. That is 6 on the
+/// 24-thread processor the figure was set on and 4 on a 7800X3D (16), where
+/// a submission's refreshes, its largest piece, are spread over these and
+/// the submitting thread: `VICTORY_WIDE_THREADS=6` there is the A/B run.
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        asked
+            .map(|n| n.clamp(1, 16))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6))
+    })
 }
 
 fn workers() -> &'static Workers {
