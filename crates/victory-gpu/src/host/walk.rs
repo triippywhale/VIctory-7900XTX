@@ -131,7 +131,14 @@ struct Sums {
     /// Threads by tests (box + triangle), in buckets of powers of two.
     buckets: [u64; 24],
     most: u64,
+    /// Threads with [`CUT`] tests or more.
+    cut: u64,
 }
+
+/// Tests from which a thread counts as ended by the translation's loop limit
+/// (4,096 rounds in compute, a test a round at most; the walkers' longest
+/// threads make 4,085-4,089, run rtwalk-B).
+const CUT: u64 = 4000;
 
 static SUMS: Mutex<Option<HashMap<Arc<str>, Sums>>> = Mutex::new(None);
 
@@ -158,6 +165,7 @@ pub(crate) fn reset(taken: &Taken) {
                 s.triangles += triangles;
                 s.buckets[(64 - n.leading_zeros() as usize).min(23)] += 1;
                 s.most = s.most.max(n);
+                s.cut += u64::from(n >= CUT);
             }
             // SAFETY: mapped above.
             unsafe { back.Unmap(0, None) };
@@ -196,7 +204,8 @@ pub(crate) fn line(frames: f64) {
         tracing::info!(
             "node tests per ray (VICTORY_BVH_WALK): {:.1} dispatches a frame, {:.0} threads testing a node per dispatch; \
              tests per such thread: mean {:.1} ({:.1} boxes, {:.1} triangles), median <= {}, p90 <= {}, p99 <= {}, max {}; \
-             threads at 1024+ tests {:.2} %, at 8192+ {:.3} %: {}",
+             threads at 1024+ tests {:.2} %, at 2048+ {:.2} %, at 4000+ (ended by the loop limit, their results lost) {:.2} %, \
+             at 8192+ {:.3} %: {}",
             s.dispatches as f64 / frames,
             s.threads as f64 / s.dispatches.max(1) as f64,
             all as f64 / s.threads.max(1) as f64,
@@ -207,6 +216,8 @@ pub(crate) fn line(frames: f64) {
             at(0.99),
             s.most,
             over(1024),
+            over(2048),
+            100.0 * s.cut as f64 / s.threads.max(1) as f64,
             over(8192),
             name.chars().take(200).collect::<String>()
         );

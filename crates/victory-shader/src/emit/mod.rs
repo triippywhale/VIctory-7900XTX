@@ -205,6 +205,39 @@ pub fn bvh_walk() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_BVH_WALK_LIMIT=<n>` (unset or 0: none): in a compute program a
+/// lane whose loop has gone round `n` times gets no more node tests: a box
+/// node answers with no child and anything else with a miss, without a load,
+/// so the walk runs out of nodes and the program ends as it does for a ray
+/// that hit nothing more. Without it such a lane goes on to the loop limit
+/// (4,096 rounds in compute) and is then killed, its result never written.
+///
+/// What it is for (7900 XT, run rtwalk-B, `VICTORY_BVH_WALK=1`): the title's
+/// rays test 130-370 nodes a thread, median under 256 and p90 under 512, but
+/// 0.2-5.6 % of the two big tracers' threads pass 1,024 and the most is
+/// 4,085-4,089: they go round in a structure that is not right until the
+/// loop limit ends them, and a wave waits for its longest lane. Part of the
+/// translation: the shader cache keys on it.
+pub fn bvh_walk_limit() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(n) = TEST_WALK_LIMIT.get() {
+        return Some(n);
+    }
+    *LIMIT.get_or_init(|| parse_walk_limit(std::env::var("VICTORY_BVH_WALK_LIMIT").ok().as_deref()))
+}
+
+/// `VICTORY_BVH_WALK_LIMIT`'s value. Pure, for testing.
+fn parse_walk_limit(value: Option<&str>) -> Option<u32> {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`bvh_walk_limit`], for its thread only.
+    pub(crate) static TEST_WALK_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader

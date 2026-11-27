@@ -54,6 +54,12 @@ const WHOLE: Descriptor = Descriptor::Numbers(0, bvh::BOX_SORT);
 /// the instruction's result in v13-v16 (under a lane mask of the threads
 /// whose record says so), stored to the UAV at 16 bytes a thread.
 fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
+    program_rounds(wide, descriptor, None)
+}
+
+/// [`program`], with the instruction in a loop that goes round `rounds`
+/// times (each round tests the same node again) when that is given.
+fn program_rounds(wide: bool, descriptor: Descriptor, rounds: Option<u32>) -> Vec<u32> {
     let mut w = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202,
@@ -97,6 +103,9 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
         0xBE94_037E, // s_mov_b32 s20, exec_lo
         0x7DAA_2280, // v_cmpx_ne_u32 exec_lo, 0, v17
     ]);
+    if rounds.is_some() {
+        w.push(0xBE95_0380); // s_mov_b32 s21, 0
+    }
     let first = 0x0000_0D01 | (rsrc >> 2) << 16;
     if wide {
         // image_bvh64_intersect_ray v[13:16], [v1 .. v12], s[rsrc:rsrc+3]
@@ -104,6 +113,14 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
     } else {
         // image_bvh_intersect_ray v[13:16], [v1, v3 .. v12], s[rsrc:rsrc+3]
         w.extend([0xF198_9F07, first, 0x0605_0403, 0x0A09_0807, 0x0000_0C0B]);
+    }
+    if let Some(rounds) = rounds {
+        assert!((1..=64).contains(&rounds));
+        w.extend([
+            0x8115_8115,                  // s_add_i32 s21, s21, 1
+            0xBF0A_0015 | (0x80 + rounds) << 8, // s_cmp_lt_u32 s21, rounds
+            0xBF85_FFF8,                  // s_cbranch_scc1 back to the instruction
+        ]);
     }
     w.extend([
         0xBEFE_0314, // s_mov_b32 exec_lo, s20
@@ -627,6 +644,101 @@ fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 #[test]
 fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
+}
+
+/// (`VICTORY_BVH_WALK_LIMIT`) The node test in a loop of `rounds` rounds
+/// with a limit of `limit`: the registers hold the last round's result, the
+/// reference's while the loop has gone round fewer than `limit` times
+/// before it, and afterwards no child of a box node and a miss of anything
+/// else. Lanes masked out keep what they had.
+fn run_limited(rounds: u32, limit: u32) {
+    super::TEST_WALK_LIMIT.set(Some(limit));
+    let built = build_compute_shader(&native(&program_rounds(true, Descriptor::Table, Some(rounds))));
+    super::TEST_WALK_LIMIT.set(None);
+    let (shader, res) = built.expect("the program lowers");
+    assert_eq!(res.bvh.len(), 1);
+    let (scene, batches) = scene();
+    let spent = rounds > limit;
+    let want = |case: &Case| match case {
+        Some((_, 4 | 5, _)) if spent => [bvh::NONE; 4],
+        Some(_) if spent => bvh::MISS.map(f32::to_bits),
+        _ => expected(&scene, case, true),
+    };
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (b, batch) in batches.iter().enumerate() {
+            let data = buffer(&scene, batch, u64::from(NODES));
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for t in 0..THREADS as usize {
+                let want = batch.get(t).map_or(BEFORE, &want);
+                let got = &out[0][4 * t..4 * t + 4];
+                assert_eq!(
+                    got, want,
+                    "{label}, {rounds} rounds, limit {limit}, batch {b} thread {t}: {:x?}",
+                    batch.get(t)
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
+fn a_loop_within_the_walk_limit_tests_its_nodes_as_without_one_on_the_card() {
+    // Rounds 0 and 1 run below a limit of 2, and below one of 3.
+    run_limited(2, 2);
+    run_limited(2, 3);
+}
+
+#[test]
+fn a_loop_past_the_walk_limit_gets_no_child_and_a_miss_on_the_card() {
+    // The third round (two behind it) is at the limit of 2.
+    run_limited(3, 2);
+    run_limited(5, 1);
+}
+
+#[test]
+fn the_walk_limit_leaves_a_program_without_a_loop_and_one_without_the_switch_alone() {
+    let plain = build(true, Descriptor::Table).unwrap().0.dxil;
+    super::TEST_WALK_LIMIT.set(Some(2));
+    let limited = build(true, Descriptor::Table).map(|b| b.0.dxil);
+    super::TEST_WALK_LIMIT.set(None);
+    assert_eq!(limited.unwrap(), plain, "no loop: nothing to count");
+    let looped = |limit| {
+        super::TEST_WALK_LIMIT.set(limit);
+        let built = build_compute_shader(&native(&program_rounds(true, Descriptor::Table, Some(3))));
+        super::TEST_WALK_LIMIT.set(None);
+        built.unwrap().0.dxil
+    };
+    assert_ne!(looped(None), looped(Some(2)));
 }
 
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
