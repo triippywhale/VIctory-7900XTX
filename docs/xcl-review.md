@@ -114,6 +114,18 @@ functions (`hooks.rs`, `retour`). What it has that is closest to porting:
   What it says for porting: memory left in place costs about 1 ms of card
   time per 26 MB the card reads from it in a frame, and much more for chains
   of dependent reads; only memory the card reads little of belongs in place.
+  **A recorded world frame (2026-11-27, capture-port1/capture-2, ray tracing,
+  port 1 on).** Replays of it removed the device until 8294933: the host makes
+  memory not resident and has it made resident before use
+  (`VICTORY_WAIT_RESIDENT`), and replay copied that flag and never made it
+  resident. Now: 198.4 ms of card time as recorded (median of 5), 202.0 ms
+  with every buffer in card memory (`--buffers vram`), 189.4 ms with
+  `--timing detailed`. Both runs were over the card's memory budget (17.9 of
+  17.8 GB as recorded, 25.0 GB with `vram`), so the system moved memory to
+  the PC's and these are not clean card times; port 1's own share (3,898
+  buffers, 418 MB, in place) cannot be told from them. Two dispatches are 40%
+  of the frame: `CS_ScreenProbes_ActivateRays` 54.8 ms and
+  `CS_GatherRaymarchedLocalLightsClassified16` 20.4 ms.
 - **Command lists that never have room** (`title_list`): the title's inlined
   writers call list methods instead of writing packets. Ours does the same
   (`victory-gpu/src/lib.rs`).
