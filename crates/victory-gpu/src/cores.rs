@@ -202,8 +202,10 @@ pub(crate) fn settle() {
             Some((own, _)) if lane => own,
             _ => &helpers,
         };
-        // SAFETY: a handle kept open, and the system's own set ids.
-        unsafe { SetThreadSelectedCpuSets(thread as _, sets.as_ptr(), sets.len() as u32) };
+        // (None: the thread's own choice cleared, so it follows the process's.)
+        let at = if sets.is_empty() { null } else { sets.as_ptr() };
+        // SAFETY: a handle kept open, and the system's own set ids (or none).
+        unsafe { SetThreadSelectedCpuSets(thread as _, at, sets.len() as u32) };
     }
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
@@ -306,8 +308,13 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but for the
+    // submitting thread, whose own core (`VICTORY_LANE_CORE`) needs no
+    // second kind. Left out here, it never had that core on a processor of
+    // one kind and one cache (7800X3D, 9800X3D): `settle` kept every thread
+    // of the process off that core, the submitting one too.
+    let lane = what == "victory-submit";
+    if fast.is_empty() && !lane {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -316,7 +323,7 @@ fn ask(what: &str, from: u32) {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
         return;
     }
-    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit"));
+    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, lane));
     settle();
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
