@@ -140,6 +140,17 @@ functions (`hooks.rs`, `retour`). What it has that is closest to porting:
   `--no-restore` removes the device on this capture (a page fault in a
   dispatch near the frame's end), so these runs had to keep the restore
   copies.
+  **Which part, and the game (2026-11-27).** Replays moving one part of
+  port 1's memory to the card: the 185 MB region (the title's big buffer)
+  alone 118.9 ms, within the memory budget; the 3,897 small heaps alone
+  187.7 ms. So the cost is the big buffer. In the game, standing still from
+  the same save with ray tracing, about 230 s each: all in place (port 1
+  level 1, as main was) median 99.7 ms, p95 120.3, card 90% busy; the big
+  buffer as a card copy (a 64 MB cap tried here, which in practice turned
+  port 1 and port 5 off) 75.8 ms, p95 87.0, card 76%; PR #44's level 3
+  (constants in place, everything else a card copy; now main's default)
+  77.2 ms, p95 87.8, card 75%, over 150 s. Level 3 matches the cap's frame
+  time and keeps constants in place, so the cap was dropped.
 - **Command lists that never have room** (`title_list`): the title's inlined
   writers call list methods instead of writing packets. Ours does the same
   (`victory-gpu/src/lib.rs`).
