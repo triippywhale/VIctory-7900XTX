@@ -95,6 +95,25 @@ functions (`hooks.rs`, `retour`). What it has that is closest to porting:
   probe would need a dependent-load pass to answer it on the 7900. Port 1's
   pages are a view of a section the title also maps itself, so xcl's trick
   does not drop in: the section would have to be the driver's heap.
+
+  **Measured here (2026-11-27, `examples/heap_speed.rs`, no title): it makes no
+  difference on this PC.** RX 7900 XT, driver 32.0.32029.2010, Ryzen 7 7800X3D:
+
+  | 256 MB buffer | dependent load | streaming read |
+  |---|---|---|
+  | card memory | 490 ns | 0.52 ms (518 GB/s) |
+  | driver `CUSTOM` L0 | 19,959 ns | 10.04 ms (26.7 GB/s) |
+  | imported private | 19,951 ns | 10.04 ms (26.7 GB/s) |
+  | imported view (port 1's way) | 20,007 ns | 10.03 ms (26.8 GB/s) |
+
+  At 64 MB: 341 ns and 2,038 GB/s for card memory (in the Infinity Cache),
+  18.3-18.4 us and 25.7-25.9 GB/s for all three kinds of PC memory. On AMD
+  the driver's own heap and imported pages are the same memory to the card:
+  every read crosses the bus (about 26 GB/s, about 20 us a dependent load,
+  40-54x card memory's latency). xcl's driver heap would buy nothing here.
+  What it says for porting: memory left in place costs about 1 ms of card
+  time per 26 MB the card reads from it in a frame, and much more for chains
+  of dependent reads; only memory the card reads little of belongs in place.
 - **Command lists that never have room** (`title_list`): the title's inlined
   writers call list methods instead of writing packets. Ours does the same
   (`victory-gpu/src/lib.rs`).
