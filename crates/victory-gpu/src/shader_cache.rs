@@ -134,7 +134,7 @@ fn build() -> [u8; 32] {
         // The node-test meter adds code. Only when on, so the translations
         // cached without it keep their key.
         if victory_shader::emit::bvh_walk() {
-            bytes.extend_from_slice(b"VICTORY_BVH_WALK=1");
+            bytes.extend_from_slice(b"VICTORY_BVH_WALK=1 detail");
         }
         // And the bound on a ray's node tests.
         if let Some(limit) = victory_shader::emit::bvh_walk_limit() {

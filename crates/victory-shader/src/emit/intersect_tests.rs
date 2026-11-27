@@ -741,6 +741,28 @@ fn the_walk_limit_leaves_a_program_without_a_loop_and_one_without_the_switch_alo
     assert_ne!(looped(None), looped(Some(2)));
 }
 
+#[test]
+fn the_meter_counts_children_entered_and_pages_with_no_copy_in_every_form() {
+    // `VICTORY_BVH_WALK=1`: a second count per node test, at the join of
+    // the box, triangle and other paths, in every form of the instruction,
+    // in and out of a loop; the DXIL validates (when the validator is here).
+    for wide in [true, false] {
+        for descriptor in [Descriptor::Table, WHOLE] {
+            for rounds in [None, Some(3)] {
+                let built = |walk| {
+                    super::TEST_WALK.set(walk);
+                    let b = build_compute_shader(&native(&program_rounds(wide, descriptor, rounds)));
+                    super::TEST_WALK.set(false);
+                    b.unwrap().0
+                };
+                let (plain, metered) = (built(false), built(true));
+                assert!(!plain.root_uavs.contains(&super::SLOT_WALK));
+                assert!(metered.root_uavs.contains(&super::SLOT_WALK));
+            }
+        }
+    }
+}
+
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
 const BASE: u64 = 0x12_3456_7800;
 

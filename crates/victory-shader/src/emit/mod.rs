@@ -202,6 +202,10 @@ pub fn builder_fences() -> bool {
 /// of the translation: the shader cache keys on it.
 pub fn bvh_walk() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if TEST_WALK.get() {
+        return true;
+    }
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
 }
 
@@ -236,6 +240,8 @@ fn parse_walk_limit(value: Option<&str>) -> Option<u32> {
 thread_local! {
     /// A test's [`bvh_walk_limit`], for its thread only.
     pub(crate) static TEST_WALK_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// [`bvh_walk`] on for a test's thread.
+    pub(crate) static TEST_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the structure builder's accesses through its root views stay near

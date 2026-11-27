@@ -69,10 +69,12 @@ pub const SLOT_FAULTS: u8 = 253;
 /// root UAV `u<SLOT_WALK>` in [`ROOT_CBV_SPACE`], [`WALK_SLOTS`] dwords, one per
 /// thread of a dispatch (its `SV_DispatchThreadID` x + 4096 y, modulo the
 /// slots). Each ray-tracing node test a thread runs adds 1 (a box node) or
-/// 0x10000 (a triangle) to its dword; the host reads the buffer back after
-/// each dispatch that has it.
+/// 0x10000 (a triangle) to its dword, and to a second dword [`WALK_SLOTS`]
+/// dwords further the box node's children the ray entered and 0x10000 for a
+/// node whose page had no copy (it read zeros); the host reads the buffer
+/// back after each dispatch that has it.
 pub const SLOT_WALK: u8 = 251;
-/// Dwords of the [`SLOT_WALK`] buffer.
+/// Threads of the [`SLOT_WALK`] buffer (it holds twice as many dwords).
 pub const WALK_SLOTS: u32 = 1 << 22;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
