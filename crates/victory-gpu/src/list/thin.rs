@@ -309,6 +309,7 @@ fn start() {
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
+            crate::cores::many_ahead("victory-list");
             crate::queue::no_drain_here();
             loop {
                 let recording = {

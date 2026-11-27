@@ -246,6 +246,52 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// `VICTORY_HELPER_PRIORITY`: unset or 0: our helper threads run at normal
+/// priority, as they did; 1: the threads a frame waits for beside the
+/// submitting one (the relay, and the pools a submission's refreshes and a
+/// landing are spread over) run above normal, as the submitting thread does;
+/// 2: the other pools too (lists translated, the heaps' records, the pass
+/// over the heap's views).
+///
+/// The title's priorities are passed through (`VICTORY_TITLE_PRIORITIES=0`
+/// in `play.ps1`), and it has some 25 threads; ours are about 40. On a
+/// processor of 8 cores and 16 threads (run rt-vram1: a 7800X3D, the process
+/// 8 to 9 processors busy) a frame's chain of work held 3.7 ms a frame of
+/// "woken, not running yet": a helper the submitting thread or the relay
+/// waited for stood behind threads nothing waited for.
+fn helper_priority() -> u32 {
+    static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| std::env::var("VICTORY_HELPER_PRIORITY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Whether a thread that asks from stage `from` on is raised
+/// ([`helper_priority`]).
+fn raised(stage: u32, from: u32) -> bool {
+    from >= 1 && stage >= from
+}
+
+/// The calling thread, one a frame waits for, runs above normal priority
+/// with `VICTORY_HELPER_PRIORITY=1` or more ([`helper_priority`]).
+pub(crate) fn ahead(what: &str) {
+    raise(what, 1);
+}
+
+/// [`ahead`] for one of many threads whose work is ahead of what a frame
+/// waits for: with `VICTORY_HELPER_PRIORITY=2`.
+pub(crate) fn many_ahead(what: &str) {
+    raise(what, 2);
+}
+
+fn raise(what: &str, from: u32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    if !raised(helper_priority(), from) {
+        return;
+    }
+    // SAFETY: this thread's own priority.
+    let set = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } != 0;
+    tracing::info!(what, set, "the thread runs above normal priority (VICTORY_HELPER_PRIORITY=0: not)");
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThreadId, OpenThread, THREAD_SET_LIMITED_INFORMATION,
@@ -278,6 +324,14 @@ fn ask(what: &str, from: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helpers_are_raised_from_their_stage_on() {
+        assert!(!raised(0, 1) && !raised(0, 2));
+        assert!(raised(1, 1) && !raised(1, 2));
+        assert!(raised(2, 1) && raised(2, 2));
+        std::thread::spawn(|| ahead("test")).join().unwrap();
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
