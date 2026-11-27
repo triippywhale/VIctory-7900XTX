@@ -1930,6 +1930,15 @@ impl State {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // A builder stage that would read zeros where its pages are
+                // is a dropped stage: the builder stops instead of handing
+                // the title structures and results it never wrote (after
+                // PalmVI 080fb856, fxceless/victory-fork #1257: the title
+                // faulted).
+                if !ready.whole && crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("title memory by address has no number left for another copy");
+                    return false;
+                }
                 Some(ready)
             } else {
                 None
