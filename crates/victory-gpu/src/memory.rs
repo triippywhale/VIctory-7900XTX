@@ -1627,6 +1627,35 @@ mod dump {
                 copies.push((to, data as usize));
             }
             self.dump.due = Some((self.frame + 12, copies));
+            self.title_side(folder);
+        }
+
+        /// The CPU's side of every held page, as title memory has it while the
+        /// arenas' copies are recorded (`title.bin`, pages in the order of
+        /// `title-pages.txt`: page, index, the frame it came in and was last
+        /// looked at, the write-watch asking it was last taken after): to
+        /// tell what the card's copy of a page lacks from what title memory
+        /// itself holds (run bvhcheck-2: moving objects built from vertex
+        /// bytes that are not positions, in memory the builder reaches by
+        /// pointer).
+        fn title_side(&self, folder: &std::path::Path) {
+            use std::io::Write;
+            let Ok(file) = std::fs::File::create(folder.join("title.bin")) else { return };
+            let mut out = std::io::BufWriter::with_capacity(1 << 22, file);
+            let mut text = format!("frame {}\n", self.frame);
+            let mut buf = vec![0u8; PAGE as usize];
+            let mut pages: Vec<(&u64, &Held)> = self.pages.iter().collect();
+            pages.sort_unstable_by_key(|p| *p.0);
+            for (n, (page, held)) in pages.into_iter().enumerate() {
+                crate::host::copy_mapped(buf.as_mut_ptr(), (page * PAGE) as *const u8, PAGE as usize, false);
+                if out.write_all(&buf).is_err() {
+                    return;
+                }
+                text += &format!("{:#x} {n} {} {} {}\n", page * PAGE, held.born, held.looked, held.taken);
+            }
+            let _ = out.flush();
+            let _ = std::fs::write(folder.join("title-pages.txt"), text);
+            tracing::info!("title memory by address: the CPU's side of the held pages is written out");
         }
     }
 }
