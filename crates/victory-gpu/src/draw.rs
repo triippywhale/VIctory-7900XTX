@@ -1056,6 +1056,35 @@ fn blank_recheck() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BLANK_RECHECK").is_none_or(|v| v != "0"))
 }
 
+/// Names a texture picked by index whose memory reads all zeros (the first
+/// 300 such lines): its slot, memory and view, whether its pages are shown
+/// at other addresses too (written there, the pass would not see it here),
+/// and whether a title buffer holds its memory (shaders or copies may
+/// write it on the card through that buffer, out of this pass's sight).
+fn blank_texture_said(what: &str, slot: u32, address: u64, bytes: u64, frames: u64, view: Option<&View>) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 300 {
+        return;
+    }
+    let shown_elsewhere = crate::inplace::shown_elsewhere(address as usize & !0xffff, (address + bytes) as usize).len();
+    let in_buffers: Vec<String> = crate::shadow::spans()
+        .into_iter()
+        .filter(|&(start, len, _)| start < address + bytes && address < start + len)
+        .take(4)
+        .map(|(start, len, window)| format!("{start:#x}+{len:#x}{}", if window { " (window)" } else { "" }))
+        .collect();
+    tracing::warn!(
+        slot,
+        address = format_args!("{address:#x}"),
+        bytes,
+        frames_since_upload = frames,
+        blocks_shown_elsewhere = shown_elsewhere,
+        in_buffers = ?in_buffers,
+        view = ?view,
+        "a texture picked by index: {what}"
+    );
+}
+
 /// Since the start: whole uploads of textures picked by index from memory
 /// that read all zeros, and of those found filled by a later look.
 pub(crate) static HEAP_TEXTURES_BLANK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2806,6 +2835,12 @@ impl State {
                     checked;
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    // Still all zeros some 250 frames on: named once, with
+                    // what may fill it where this pass does not read.
+                    if checked.blank && looks == 5 {
+                        let view = heap.handle(index).and_then(crate::descriptor::view);
+                        blank_texture_said("still all zeros", index, at, len, frame.saturating_sub(uploaded), view.as_ref());
+                    }
                     match next_texture_recheck(recheck_frames(), looks, checked.changed_in_place, checked.blank) {
                         Some((looks, wait)) => {
                             checked.unchanged_looks = looks;
@@ -2850,6 +2885,8 @@ impl State {
                 let (fingerprint, blank) = crate::texture::fingerprint_blank(address, bytes);
                 if blank {
                     HEAP_TEXTURES_BLANK[0].fetch_add(1, Ordering::Relaxed);
+                    let view = heap.handle(index).and_then(crate::descriptor::view);
+                    blank_texture_said("uploaded from memory that reads all zeros", index, address, bytes, 0, view.as_ref());
                 }
                 let checked = TextureRecheck {
                     address,

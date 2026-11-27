@@ -121,7 +121,10 @@ pub(crate) struct Band {
 /// room) and black blocks of the screen probes' tiles on shaded walls (run
 /// capture-port1, 2026-11-27: `scripts/play.ps1 -RayTracing` did not set
 /// the band the README said it did).
-const DEFAULT_BAND: Band = Band { least: 0.7, most: 1.5, level: 0.8 };
+/// Its floor is the estimate itself (as without rays): at 0.7 of it the
+/// bad blocks were no longer black but still a darker patch on the wall
+/// (PR #45's run, 2026-11-27).
+const DEFAULT_BAND: Band = Band { least: 1.0, most: 1.5, level: 0.8 };
 
 pub(crate) fn rt_band() -> Option<Band> {
     static SET: OnceLock<Option<Band>> = OnceLock::new();

@@ -46,7 +46,7 @@ indirect draws whose arguments sit in renderer patch 1's in-place memory being
 prepared before the title's culling had written them; they are now prepared one at
 a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
 2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
-(`VICTORY_AMBIENT_RT=0.7,1.5`, the default whenever `VICTORY_BVH_BUILDER=1`; `scripts\play.ps1 -RayTracing` sets it too, `VICTORY_AMBIENT_RT=off` turns it off).
+(`VICTORY_AMBIENT_RT=1,1.5`, the default whenever `VICTORY_BVH_BUILDER=1`; `scripts\play.ps1 -RayTracing` sets it too, `VICTORY_AMBIENT_RT=off` turns it off).
 
 Still open: models and textures stay at their lowest detail for a long time while
 the title streams (worst in the intro): the title paces its streaming by its own
