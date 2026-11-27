@@ -347,10 +347,11 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
     MAPPED[1].fetch_add(us, Ordering::Relaxed);
     MAPPED[2].fetch_max(us, Ordering::Relaxed);
+    let by = new_memory_waited(&MAPPED_BY, us);
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; {by}",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
             MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
         );
@@ -360,6 +361,39 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`mapped`]'s and [`resident`]'s waits by the kind of thread that waited
+/// ([`NEW_MEMORY_THREADS`]): times and microseconds of each.
+static MAPPED_BY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static RESIDENT_BY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// The kinds of thread [`new_memory_waited`] tells apart. In steady play
+/// (run wt2-run1, RT on) new memory was waited for about 13 times a frame
+/// in each of [`resident`] and [`mapped`], some 9 ms a frame together: on
+/// the frame's way only if the threads that wait are the submitting one or
+/// the title's recording ones, which these say.
+const NEW_MEMORY_THREADS: [&str; 4] = ["the submitting thread", "threads translating lists", "the title's threads", "other threads of ours"];
+
+/// Counts a wait of `us` microseconds by the calling thread's kind; the
+/// counts so far, for the log line.
+fn new_memory_waited(by: &[std::sync::atomic::AtomicU64; 8], us: u64) -> String {
+    let kind = match std::thread::current().name() {
+        Some("victory-submit") => 0,
+        Some(name) if name.starts_with("victory-list") => 1,
+        Some(name) if name.starts_with("victory") || name.starts_with("dstorage") => 3,
+        _ => 2,
+    };
+    by[2 * kind].fetch_add(1, Ordering::Relaxed);
+    by[2 * kind + 1].fetch_add(us, Ordering::Relaxed);
+    let parts: Vec<String> = NEW_MEMORY_THREADS
+        .iter()
+        .enumerate()
+        .map(|(i, what)| {
+            format!("{what} {} times {:.1} ms", by[2 * i].load(Ordering::Relaxed), by[2 * i + 1].load(Ordering::Relaxed) as f64 / 1000.0)
+        })
+        .collect();
+    format!("by thread: {}", parts.join(", "))
+}
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
@@ -374,12 +408,13 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
     RESIDENT[2].fetch_max(us, Ordering::Relaxed);
+    let by = new_memory_waited(&RESIDENT_BY, us);
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = RESIDENT[0].load(Ordering::Relaxed);
     if n >= 1000 * (SAID.load(Ordering::Relaxed) + 1) {
         SAID.store(n / 1000, Ordering::Relaxed);
         tracing::info!(
-            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; {by}",
             RESIDENT[1].load(Ordering::Relaxed) as f64 / 1000.0,
             RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0
         );
