@@ -155,19 +155,19 @@ fn main() {
         let hw = |k: usize| u16::from_le_bytes(bytes[k..k + 2].try_into().unwrap());
         for k in (0..bytes.len() - 12).step_by(4) {
             if want32.contains_key(&[dw(k), dw(k + 4), dw(k + 8)]) {
-                found32
-                    .entry(page)
-                    .or_default()
-                    .push(page * PAGE + k as u64);
+                let at = page * PAGE + k as u64;
+                if !own.contains(&at) {
+                    found32.entry(page).or_default().push(at);
+                }
             }
         }
         for k in (0..bytes.len() - 6).step_by(2) {
             let h = [hw(k), hw(k + 2), hw(k + 4)];
             if h != [0, 0, 0] && want16.contains_key(&h) {
-                found16
-                    .entry(page)
-                    .or_default()
-                    .push(page * PAGE + k as u64);
+                let at = page * PAGE + k as u64;
+                if !own.contains(&at) {
+                    found16.entry(page).or_default().push(at);
+                }
             }
         }
     }
