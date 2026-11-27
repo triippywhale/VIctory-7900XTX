@@ -100,7 +100,8 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// mapped other pages there. Then, since the last line: fills read out of
 /// ported memory on the CPU, their bytes, buffer copies on the CPU that
 /// touch it, their bytes.
-static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// Last: title buffers left out for their size ([`most_buffer`]).
+static STATS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
 
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
 /// memory.
@@ -108,11 +109,37 @@ pub(crate) fn wanted(at: u64, len: u64) -> bool {
     on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
 }
 
+/// `VICTORY_PORT_CONSTANTS_MAX_MB` (64): title buffers bigger than this are
+/// not put in place but copied as before (in the card's memory when big,
+/// `crate::shadow`'s `cards`). In place, every shader read of a buffer
+/// crosses the bus: a replay of a world frame took 197 ms with all of port
+/// 1's memory in place and 170 ms with it in the card's memory, and most of
+/// that memory is the title's 174 MB buffer that the skinning passes write
+/// and later passes read (the card's own traffic, sent through the PC's
+/// memory). Windows of title memory stay in place whatever their size.
+fn most_buffer() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_PORT_CONSTANTS_MAX_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64) << 20
+    })
+}
+
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
 /// memory is one stretch of a section: a buffer placed in the region's
 /// heap. `None` leaves the caller to do what it did before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if !wanted(start, len) {
+        return None;
+    }
+    if !window && len > most_buffer() {
+        let n = STATS[13].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                "renderer port 1: a title buffer over VICTORY_PORT_CONSTANTS_MAX_MB is copied as before, not in place"
+            );
+        }
         return None;
     }
     let host = crate::host::host()?;
@@ -290,12 +317,12 @@ pub(crate) fn log(frames: f64) {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let per: Vec<f64> = STATS[9..13].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
-         forgotten (other pages mapped there)",
+         forgotten (other pages mapped there); {} title buffers over VICTORY_PORT_CONSTANTS_MAX_MB copied as before",
         s[0],
         s[1] >> 20,
         s[2],
@@ -308,6 +335,7 @@ pub(crate) fn log(frames: f64) {
         s[5],
         s[6],
         s[7],
+        s[13],
     );
 }
 
