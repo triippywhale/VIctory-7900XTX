@@ -88,8 +88,11 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         e.usage = (1 << e.cols) - 1;
     }
     let mut s = Shader::new(false);
+    let (input, topology) = Geometry::TRIANGLES;
     s.geometry = Some(Geometry {
         max_vertices: VERTICES,
+        input,
+        topology,
     });
     s.inputs = outputs.clone();
     // The primitive id the pixel shader declares, as one more output.

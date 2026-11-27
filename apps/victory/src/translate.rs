@@ -71,6 +71,11 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// The same for geometry programs.
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
+    gs_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -132,6 +137,10 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
+        self.gs_pipelines += other.gs_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -516,6 +525,10 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated, {} pipelines",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.gs_pipelines
+    );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -745,7 +758,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs) {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -883,6 +896,7 @@ fn check(
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+            HwStage::Gs => h.geometry_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
         match made {
@@ -952,6 +966,12 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_emitted,
             &mut t.ms_validated,
             &mut t.ms_pipelines,
+        ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.gs_pipelines,
         ],
         _ => [
             &mut t.emit_programs,

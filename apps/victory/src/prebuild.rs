@@ -122,11 +122,27 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                 return Ok(Prebuild::compute(&cs));
             }
         };
-        let [ps, vs, gs, ..] = g.stages;
-        if g.stages[3..].iter().any(Option::is_some) {
-            return Err("stages other than vertex, mesh and pixel".into());
+        let [ps, vs, gs, es, ..] = g.stages;
+        if g.stages[4..].iter().any(Option::is_some) {
+            return Err("stages other than vertex, geometry, mesh and pixel".into());
         }
-        let (first, stage) = vs.or(gs).and_then(|s| container(s.program)).ok_or("shader not found")?;
+        // A geometry pipeline: the vertex shader runs as the ES, the GS slot
+        // has the geometry program (the VS slot its copy shader, which is
+        // part of the geometry program's container).
+        let mut geometry = None;
+        let (first, stage) = match es {
+            Some(es) => {
+                let (vs, stage) = container(es.program).ok_or("shader not found")?;
+                let (g, gstage) =
+                    gs.and_then(|s| container(s.program)).ok_or("shader not found")?;
+                if (stage, gstage) != (HwStage::Es, HwStage::Gs) {
+                    return Err("an ES without a geometry program".into());
+                }
+                geometry = Some(g);
+                (vs, HwStage::Vs)
+            }
+            None => vs.or(gs).and_then(|s| container(s.program)).ok_or("shader not found")?,
+        };
         let pixel = match ps {
             Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
             None => None,
@@ -136,7 +152,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             HwStage::Vs => false,
             _ => return Err("first stage not a vertex or mesh shader".into()),
         };
-        let stream = pipelines::stream(g, &named, &first, mesh, pixel.as_deref()).map_err(|u| {
+        let (pixel, geometry) = (pixel.as_deref(), geometry.as_deref());
+        let stream = pipelines::stream(g, &named, &first, mesh, pixel, geometry).map_err(|u| {
             match u {
                 Unnamed::DepthStencil => "depth-stencil state not named",
                 Unnamed::Rasterizer => "rasteriser state not named",
@@ -145,8 +162,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
             }
             .to_owned()
         })?;
-        // SAFETY: the stream points at `first`, `pixel` and its own input
-        // elements, all alive here.
+        // SAFETY: the stream points at `first`, `pixel`, `geometry` and its
+        // own input elements, all alive here.
         Ok(unsafe { Prebuild::graphics(stream.bytes()) })
     };
 

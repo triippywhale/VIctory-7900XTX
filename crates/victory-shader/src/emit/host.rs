@@ -426,6 +426,23 @@ impl Host {
         Ok((root, pso))
     }
 
+    /// A graphics pipeline of a translated geometry shader, behind a
+    /// vertex shader that writes its inputs ([`stub_vs`]), before `ps`.
+    pub fn geometry_pipeline(
+        &self,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let vs = stub_vs(gs)?;
+        let root = self.root_signature_for(&[
+            (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// A graphics pipeline with the given root signature; vertex inputs
     /// packed in register order.
     pub fn pipeline_with(
@@ -633,7 +650,8 @@ impl Host {
     }
 }
 
-/// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
+/// A vertex shader that feeds `ps`'s inputs (zeros) and a position (`ps` a
+/// pixel or geometry shader).
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
     let mut outputs: Vec<SigElement> = inputs

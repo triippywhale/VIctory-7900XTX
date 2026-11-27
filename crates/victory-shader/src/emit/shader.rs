@@ -146,11 +146,33 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
-/// What a geometry shader declares: triangles in, triangle strips out on
-/// stream 0, one instance.
-#[derive(Debug, Clone, Copy)]
+/// What a geometry shader declares: its input primitive, output topology
+/// and maximum vertices, on stream 0, one instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Geometry {
     pub max_vertices: u32,
+    /// `D3D_PRIMITIVE` (DXIL `InputPrimitive`): 1 points, 2 lines, 3
+    /// triangles, 6 lines and 7 triangles with adjacency.
+    pub input: u32,
+    /// `D3D_PRIMITIVE_TOPOLOGY`: 1 points, 3 line strips, 5 triangle strips.
+    pub topology: u32,
+}
+
+impl Geometry {
+    /// Triangles in, triangle strips out (the rectangle stage).
+    pub const TRIANGLES: (u32, u32) = (3, 5);
+
+    /// The vertices of an input primitive.
+    pub fn input_vertices(self) -> Option<u32> {
+        match self.input {
+            1 => Some(1),
+            2 => Some(2),
+            3 => Some(3),
+            6 => Some(4),
+            7 => Some(6),
+            _ => None,
+        }
+    }
 }
 
 /// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
@@ -874,10 +896,11 @@ impl Shader {
             props.push(self.m.md_value(f));
         }
         if let Some(g) = self.geometry {
-            // Input primitive (3: triangles), maximum vertices, stream
-            // mask, output topology (5: triangle strips), instances.
+            // Input primitive, maximum vertices, stream mask, output
+            // topology, instances.
             props.push(i32c(&mut self, 1));
-            let state = [3, g.max_vertices, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            let state = [g.input, g.max_vertices, 1, g.topology, 1];
+            let state = state.map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
         if let Some(threads) = self.threads {
@@ -1002,7 +1025,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
-            geometry: self.geometry.map(|g| g.max_vertices),
+            geometry: self.geometry.map(|g| (g.input, g.topology, g.max_vertices)),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

@@ -484,11 +484,61 @@ pub(crate) fn raise(
             }
         }
     }
+    // The translation keeps the ring and the vertices emitted in values as
+    // it goes (`lower`): each access and message must run once, on the way
+    // to every end of the program.
+    let blocks = out
+        .writes
+        .iter()
+        .map(|w| w.0)
+        .chain(out.messages.iter().map(|m| m.0));
+    if let Some(s) = blocks.map(|s| s.0).find(|&b| !once_on_every_path(p, b)) {
+        let at = p.blocks[s].offset;
+        return Err(unsupported(
+            at,
+            "a geometry program that emits in a branch or loop",
+        ));
+    }
     if let Some((s, what)) = tainted_use(p, &e, &out) {
         let at = p.blocks[s.0].insts[s.1].machine.offset;
         return Err(unsupported(at, what));
     }
     Ok(out)
+}
+
+/// Whether block `b` dominates every end of the program and lies on no
+/// cycle.
+fn once_on_every_path(p: &Program, b: usize) -> bool {
+    let order = ir::reverse_postorder(&p.blocks);
+    let mut index = vec![usize::MAX; p.blocks.len()];
+    for (n, &k) in order.iter().enumerate() {
+        index[k] = n;
+    }
+    let idom = ir::idoms(&p.blocks, &order, &index);
+    let dominates = |mut d: usize| loop {
+        if d == b {
+            break true;
+        }
+        match idom.get(d) {
+            Some(&up) if up != d && up != usize::MAX => d = up,
+            _ => break false,
+        }
+    };
+    let every_end = (p.blocks.iter().enumerate())
+        .filter(|(_, k)| matches!(k.exit, ir::Exit::End | ir::Exit::Indirect))
+        .all(|(e, k)| k.exit == ir::Exit::End && dominates(e));
+    // On a cycle: reached again from its successors.
+    let mut seen = vec![false; p.blocks.len()];
+    let mut work = p.blocks[b].exit.successors();
+    while let Some(k) = work.pop() {
+        if k == b {
+            return false;
+        }
+        if !std::mem::replace(&mut seen[k], true) {
+            work.extend(p.blocks[k].exit.successors());
+        }
+    }
+    every_end
 }
 
 /// Where a value made of the ring inputs (the vertex offsets in v0, v1 and

@@ -145,7 +145,10 @@ fn stores_picked(program: &victory_shader::NativeProgram) -> bool {
     use victory_shader::native::RootType;
     use victory_shader::resource::{Role, Source};
     // (The programs that are translated.)
-    if !matches!(program.stage, HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms) {
+    if !matches!(
+        program.stage,
+        HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
+    ) {
         return false;
     }
     let heap = |param: usize| program.layout.get(param).is_some_and(|p| p.root == RootType::ResourceHeap);

@@ -223,8 +223,58 @@ impl NativeProgram {
                 }
             }
         }
+        if let StageIo::Gs(_) = &self.io
+            && let Some(at) = gs_lane_count(&code)
+        {
+            code[at..at + 4].copy_from_slice(&S_MOV_B64_EXEC_ALL.to_le_bytes());
+        }
         code
     }
+}
+
+/// `s_mov_b64 exec, -1`.
+const S_MOV_B64_EXEC_ALL: u32 = 0xBEFE_04C1;
+
+/// Where a geometry program sets EXEC to its wave's primitives: the GS
+/// lane count (bits 8-15 of the merged wave info in s3, `s_bfe_* sN, s3,
+/// 0x80008`) made into a mask (`s_bfm_b64 exec, sN, 0`) before the first
+/// branch. On the host every lane is a primitive: there the code is
+/// patched to all lanes, as the same lane count of a full wave would set
+/// them. (A count of 64 goes through `s_cselect_b64 exec, -1, exec` after
+/// it, which then keeps all lanes.)
+fn gs_lane_count(code: &[u8]) -> Option<usize> {
+    use crate::gfx10::{Fields, Operand};
+    let insts = crate::gfx10::decode(code).ok()?;
+    let mut count = None;
+    for i in insts.iter().take(64) {
+        let fields = i.fields(true);
+        let name = i.name().unwrap_or("");
+        let Fields::Sop { dst, src, .. } = &fields else {
+            if matches!(fields, Fields::Sopp { .. }) && name.starts_with("s_cbranch") {
+                return None;
+            }
+            continue;
+        };
+        let dst = match dst {
+            Some(Operand::Scalar { code, .. }) => Some(*code),
+            _ => None,
+        };
+        match (name, &src[..]) {
+            (
+                "s_bfe_i32" | "s_bfe_u32",
+                [Operand::Scalar { code: 3, .. }, Operand::Literal(0x0008_0008)],
+            ) => count = dst,
+            ("s_bfm_b64", [Operand::Scalar { code, .. }, Operand::Const(128)])
+                if dst == Some(126) && count == Some(*code) && i.words.len() == 1 =>
+            {
+                return Some(i.offset);
+            }
+            // The count is overwritten, or s3 is.
+            _ if dst.is_some() && (dst == count || dst == Some(3)) => count = None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// What a semantic is, as the stage data names it.
@@ -1036,6 +1086,48 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// A geometry program's record: its outputs, ring layout and copy
+    /// shader; a layout whose item is not the vertices times their size is
+    /// refused.
+    #[test]
+    fn reads_geometry_stage_data() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Gs)).unwrap() as usize;
+        // The copy shader: the first half of the program's code.
+        let code = u64_at(&blob, record).unwrap();
+        let mut put = |at: usize, v: &[u8]| blob[e + at..e + at + v.len()].copy_from_slice(v);
+        put(GS_COPY, &code.to_le_bytes());
+        put(GS_COPY + 8, &4u64.to_le_bytes());
+        put(GS_OUTPUTS, &[6, 1, 0, 1, 0, 0, 6, 2, 1, 2, 0, 0]);
+        put(GS_OUTPUT_COUNT, &2u32.to_le_bytes());
+        put(GS_ITEM, &48u32.to_le_bytes());
+        put(GS_MAX_VERTICES, &3u32.to_le_bytes());
+        put(GS_VERTEX, &16u32.to_le_bytes());
+        let found = programs(&blob).unwrap();
+        let output = |row, param| VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        assert_eq!(
+            found[0].io,
+            StageIo::Gs(GeometryIo {
+                outputs: vec![output(1, 0), output(2, 1)],
+                max_vertices: 3,
+                vertex_dwords: 16,
+                copy: VS_CODE[..4].to_vec(),
+            })
+        );
+        blob[e + GS_ITEM] = 47;
+        assert_eq!(
+            programs(&blob),
+            Err(Malformed("implausible GS-VS ring layout"))
+        );
     }
 
     #[test]
