@@ -33,8 +33,83 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 }
 
 /// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
+/// ring of host descriptors is enough: one per recording thread
+/// ([`OutputRings`]), and the shared one in [`Host`] only for a thread that
+/// could not make its own.
 const RTV_RING: u32 = 1024;
+
+/// One thread's rings of render target and depth views. With one ring for
+/// every thread, a recording thread paused between making its views and
+/// recording the call that reads them could find their slots made again for
+/// another thread's textures by then (1,024 views later, all threads
+/// together), and its clear or draw reached the wrong target. A thread's own
+/// ring is only ever moved on by that thread, and it makes at most nine views
+/// (eight targets and a depth) before recording the call that reads them.
+/// (After PalmVI 82998eb25, after avatarmanz/VIctory-7900XTX pull request
+/// #42 by gomeaw, which scopes each call's views to a closure; this keeps
+/// the call sites as they are.)
+struct OutputRings {
+    rtvs: ID3D12DescriptorHeap,
+    rtv_size: u32,
+    next_rtv: u32,
+    dsvs: ID3D12DescriptorHeap,
+    dsv_size: u32,
+    next_dsv: u32,
+}
+
+impl OutputRings {
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        let heap = |kind| -> windows::core::Result<ID3D12DescriptorHeap> {
+            // SAFETY: a CPU-only heap description and a live device.
+            unsafe {
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: RTV_RING,
+                    ..Default::default()
+                })
+            }
+        };
+        // SAFETY: plain queries of a live device.
+        let (rtv_size, dsv_size) = unsafe {
+            (
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV),
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV),
+            )
+        };
+        Ok(Self {
+            rtvs: heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)?,
+            rtv_size,
+            next_rtv: 0,
+            dsvs: heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV)?,
+            dsv_size,
+            next_dsv: 0,
+        })
+    }
+
+    /// The next slot of the render target ring (`depth` false) or the depth
+    /// one.
+    fn next(&mut self, depth: bool) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let (heap, size, next) = if depth {
+            (&self.dsvs, self.dsv_size, &mut self.next_dsv)
+        } else {
+            (&self.rtvs, self.rtv_size, &mut self.next_rtv)
+        };
+        let slot = *next;
+        *next = (slot + 1) % RTV_RING;
+        // SAFETY: a live heap.
+        let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * size) as usize;
+        handle
+    }
+}
+
+thread_local! {
+    /// This thread's [`OutputRings`] of the one host device ([`host`]):
+    /// made at its first view (`None` until then; `Some(None)` for good if
+    /// they could not be made).
+    static OUTPUT_RINGS: std::cell::RefCell<Option<Option<OutputRings>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -1308,6 +1383,156 @@ mod tests {
 
     use super::*;
 
+    /// `VICTORY_MERGE_RUNS` and `VICTORY_SETTLE_ROOM`: the caps are as
+    /// before unless given, and more room raises both within the bound.
+    #[test]
+    fn the_flights_caps_are_as_before_unless_given_or_given_room() {
+        assert_eq!(merge_runs_with(None, false, false), 512);
+        assert_eq!(merge_runs_with(None, true, false), 4096);
+        assert_eq!(merge_runs_with(Some(32_768), false, false), 32_768);
+        assert_eq!(merge_runs_with(Some(32_768), true, false), 32_768);
+        assert_eq!(merge_runs_with(Some(0), false, false), 1);
+        assert_eq!(merge_runs_with(Some(usize::MAX), false, false), MERGE_RUNS_MOST);
+        assert_eq!(merge_runs_with(None, false, true), 4096);
+        assert_eq!(merge_runs_with(None, true, true), 32_768);
+        assert_eq!(merge_runs_with(Some(200_000), false, true), MERGE_RUNS_MOST);
+        assert_eq!(lists_with_room(256, false), 256);
+        assert_eq!(lists_with_room(256, true), 512);
+        assert_eq!(lists_with_room(usize::MAX, true), usize::MAX);
+    }
+
+    /// Views made on one recording thread stay its own until it records the
+    /// call that reads them, however many views another thread makes in
+    /// between (a whole ring's worth here). (After PalmVI 82998eb25, after
+    /// avatarmanz/VIctory-7900XTX pull request #42 by gomeaw.)
+    #[test]
+    fn another_thread_cannot_retarget_a_pending_clear() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        let make = |format, flags, state| {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: flags,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a valid texture description and a live out pointer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut texture)
+            }
+            .unwrap();
+            texture.unwrap()
+        };
+        let color = || {
+            make(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )
+        };
+        let depth = || {
+            make(
+                DXGI_FORMAT_D32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+            )
+        };
+        let [first_color, second_color] = [color(), color()];
+        let [first_depth, second_depth] = [depth(), depth()];
+        let list = host.new_list().unwrap();
+        for (color, depth) in [(&first_color, &first_depth), (&second_color, &second_depth)] {
+            let rtv = host.rtv(Some(color), None);
+            let dsv = host.dsv(depth, None);
+            // SAFETY: an open list; the textures are in their clear states.
+            unsafe {
+                list.list.ClearRenderTargetView(rtv, &[0.0; 4], None);
+                list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+            }
+        }
+        let rtv = host.rtv(Some(&first_color), None);
+        let dsv = host.dsv(&first_depth, None);
+        // Another thread makes a whole ring of views of the other pair
+        // between this thread's views and the clears that read them.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..RTV_RING {
+                    host.rtv(Some(&second_color), None);
+                    host.dsv(&second_depth, None);
+                }
+            });
+        });
+        // SAFETY: an open list; both pairs of textures are alive.
+        unsafe {
+            list.list.ClearRenderTargetView(rtv, &[1.0, 0.0, 0.0, 0.0], None);
+            list.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.25, 0, None);
+        }
+        let readback = host.read_back_buffer(2048).unwrap();
+        let textures = [
+            (&first_color, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            (&second_color, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            (&first_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+            (&second_depth, D3D12_RESOURCE_STATE_DEPTH_WRITE),
+        ];
+        for (i, (texture, before)) in textures.into_iter().enumerate() {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: an open list, live textures, disjoint footprints.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(),
+                    0,
+                    1,
+                    512 * i as u64,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    None,
+                );
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                list.list.ResourceBarrier(&[transition(texture, before, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the GPU has written the 2,048-byte read-back buffer.
+        let pixels: [u32; 4] = unsafe {
+            readback
+                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 2048 }), Some(&mut mapped))
+                .unwrap();
+            let values = std::array::from_fn(|i| mapped.cast::<u32>().add(128 * i).read());
+            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            values
+        };
+        assert_eq!(
+            pixels,
+            [255, 0, 0.25f32.to_bits(), 1.0f32.to_bits()],
+            "pending clears reached the wrong textures"
+        );
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -1396,7 +1621,7 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
-    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    twins: Mutex<ByCopy<TwinUse>>,
     /// The title textures this list writes whose placed views shaders pick
     /// by index (`crate::resource::picked_alias`): copied into those views
     /// when the list closes ([`HostList::aliases_current`]).
@@ -1468,10 +1693,7 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = std::collections::HashMap<
-    usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
->;
+type States = ByCopy<(u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2536,7 +2758,7 @@ struct Deferred {
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2920,12 +3142,57 @@ mod relay_tests {
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
-/// all at once ran the slots out before (run 45).
+/// all at once ran the slots out before (run 45). Twice that with
+/// [`settle_room`].
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        let most = std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1);
+        lists_with_room(most, settle_room())
     })
+}
+
+/// Whether the flights get more room before they are settled
+/// (`VICTORY_SETTLE_ROOM=1`, read once here; off by default): twice the
+/// lists in the air ([`late_most`]) and eight times the changed runs the
+/// merge under the flights' writes takes ([`merge_runs`], up to its bound).
+/// The source measured 11.5 ms less of the preparing thread's work at
+/// equal draws, from 256 lists and 4,096 runs; what to watch here is how
+/// often the frame line still settles for the lists in the air or for more
+/// changed runs than the cap, and "tables asked, N refused" (dynamic slots
+/// are held while lists fly). The source's `alt` (in turn every twenty
+/// seconds) is not taken: both values are read once here.
+/// (After fxceless 06702fe, PalmVI b7bbf59f4.)
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SETTLE_ROOM").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn lists_with_room(most: usize, room: bool) -> usize {
+    if room { most.saturating_mul(2) } else { most }
+}
+
+/// The most changed runs [`stale_under_flights`] merges under the flights'
+/// writes before it gives up and the flights are settled
+/// (`VICTORY_MERGE_RUNS=<n>`, 1 to 2^20, read once here; unset: 512, or
+/// 4,096 with [`card_steps`], as before), eight times that with
+/// [`settle_room`]. Each run is a copy of its own to a copy in the card's
+/// memory, at about 1.5 us a run. Another tree's run 218 had 500 to 5,400
+/// changed runs a frame of a few bytes each, and the cap of 512 settled the
+/// flights twice a frame, 50 ms of the submitting thread.
+/// (The name and the bound after PalmVI b7bbf59f4 / fxceless 06702fe.)
+fn merge_runs() -> usize {
+    static GIVEN: OnceLock<Option<usize>> = OnceLock::new();
+    let given = *GIVEN.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse().ok()));
+    merge_runs_with(given, card_steps::stage() > 0, settle_room())
+}
+
+/// The bound of [`merge_runs`], with [`settle_room`] or without.
+const MERGE_RUNS_MOST: usize = 1 << 20;
+
+fn merge_runs_with(given: Option<usize>, card_steps: bool, room: bool) -> usize {
+    let cap = given.map_or(if card_steps { 4096 } else { 512 }, |n| n.clamp(1, MERGE_RUNS_MOST));
+    if room { cap.saturating_mul(8).min(MERGE_RUNS_MOST) } else { cap }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3419,7 +3686,8 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        // ([`merge_runs`]: `VICTORY_MERGE_RUNS`, `VICTORY_SETTLE_ROOM`.)
+        let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
@@ -4032,6 +4300,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
+    crate::watch::view_once_line(frames);
     crate::port_journal::line(frames);
     crate::port_rt::line(frames);
     crate::picked::log(frames);
@@ -6665,39 +6934,70 @@ impl Host {
             .as_ref()
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// The next slot of this thread's ring of render target views (`depth`
+    /// false) or depth views ([`OutputRings`]); of the shared ring if this
+    /// thread could not make its own.
+    fn output_slot(&self, depth: bool) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let own = OUTPUT_RINGS.with(|rings| {
+            let mut rings = rings.borrow_mut();
+            let rings = rings.get_or_insert_with(|| match OutputRings::new(&self.device) {
+                Ok(rings) => Some(rings),
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(error = %e, "no render target views of a thread's own; it shares the host's ring")
+                    });
+                    None
+                }
+            });
+            rings.as_mut().map(|rings| rings.next(depth))
+        });
+        if let Some(handle) = own {
+            return handle;
+        }
+        let (heap, size, next) = if depth {
+            (&self.dsvs, self.dsv_size, &self.next_dsv)
+        } else {
+            (&self.rtvs, self.rtv_size, &self.next_rtv)
+        };
+        let slot = next.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a live heap.
+        let mut handle = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        handle.ptr += (slot * size) as usize;
+        handle
+    }
+
+    /// A host render target view of `resource`, valid until it is recorded
+    /// on this thread ([`OutputRings`]).
     pub(crate) fn rtv(
         &self,
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = self.output_slot(false);
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
-    /// A host depth view of `resource`, valid until it is recorded.
+    /// A host depth view of `resource`, valid until it is recorded on this
+    /// thread ([`OutputRings`]).
     pub(crate) fn dsv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = self.output_slot(true);
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 }
 
@@ -8306,7 +8606,7 @@ struct Batch {
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
