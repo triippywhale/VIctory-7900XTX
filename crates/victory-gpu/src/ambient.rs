@@ -547,6 +547,15 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
+/// The passes made ahead of the first frame's light (`crate::helpers`),
+/// if the stand-in is set: with the structure builder asked for too, it
+/// runs until the builder does.
+pub(crate) fn ahead() {
+    if set() != Set::Off {
+        let _ = pass();
+    }
+}
+
 /// The probe's sums and the cells (with the slow mean), once the passes are
 /// made and the stand-in is on.
 pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {

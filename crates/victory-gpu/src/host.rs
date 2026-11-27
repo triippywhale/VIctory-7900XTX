@@ -1001,13 +1001,22 @@ pub(crate) fn made_host() -> Option<&'static Host> {
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            // (Its thread waits in `host()` until this returns.)
+            crate::helpers::start();
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
+}
+
+/// Whether the host device has been made (or refused) already.
+pub(crate) fn host_made() -> bool {
+    HOST.get().is_some()
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -1573,9 +1582,32 @@ fn plane_pass() -> Option<&'static PlanePass> {
     .as_ref()
 }
 
-/// Compiles function `entry` of `source` for `target` with the system's
-/// compiler, as the indirect-argument clamp is (`crate::indirect`).
+/// Function `entry` of `source` compiled for `target`: as an earlier run
+/// kept it (`crate::helpers`), else from the system's compiler, and kept.
 pub(crate) fn compile(
+    source: &str,
+    entry: windows::core::PCSTR,
+    target: windows::core::PCSTR,
+) -> windows::core::Result<Vec<u8>> {
+    use crate::helpers::{COUNTS, folder, key, read, write};
+    let Some(dir) = folder() else {
+        return compile_now(source, entry, target);
+    };
+    // SAFETY: both are NUL-terminated literals of ours.
+    let key = unsafe { key(source, entry.as_bytes(), target.as_bytes()) };
+    if let Some(code) = read(&dir, &key) {
+        COUNTS[0].fetch_add(1, Ordering::Relaxed);
+        return Ok(code);
+    }
+    let code = compile_now(source, entry, target)?;
+    COUNTS[1].fetch_add(1, Ordering::Relaxed);
+    write(&dir, &key, &code);
+    Ok(code)
+}
+
+/// Compiles function `entry` of `source` for `target` with the system's
+/// compiler.
+fn compile_now(
     source: &str,
     entry: windows::core::PCSTR,
     target: windows::core::PCSTR,
@@ -1619,6 +1651,16 @@ pub(crate) fn compile(
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
     };
     Ok(bytes.to_vec())
+}
+
+/// The depth-plane pass's code compiled ahead (`crate::helpers`): its
+/// pipelines are made per depth format, on the first plane of each.
+pub(crate) fn planes_ahead() {
+    use windows::core::s;
+    let _ = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"));
+    for source in [PLANE_STEPS, PLANE_FLOATS] {
+        let _ = compile(source, s!("plane"), s!("ps_5_1"));
+    }
 }
 
 impl PlanePass {
@@ -4579,37 +4621,17 @@ impl Host {
     }
 
     fn make_card_work(&self) -> windows::core::Result<CardWork> {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
-                windows::core::s!("card compare"),
-                None,
-                None,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-        }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let code = compile(CARD_COMPARE, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the code lives through the calls; the root signature is
+        // inside the shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = &code[..];
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
