@@ -214,6 +214,11 @@ pub struct Report {
     /// Boxes with a coordinate past [`HUGE`] or not finite (not counted as
     /// loose: their surface means nothing).
     pub huge: u64,
+    /// Triangles with a vertex past [`HUGE`] or not finite; the others'
+    /// span; and those of the others whose parent keeps a huge box for them.
+    pub huge_triangles: u64,
+    pub triangle_span: Option<Aabb>,
+    pub huge_over_triangle: u64,
     /// The union of the root's children's boxes.
     pub root: Option<Aabb>,
 }
@@ -337,8 +342,12 @@ pub fn check(
                     let (outer, inner) = (area(&by), area(&t));
                     let loose = outer / inner;
                     if depth > 1 && !huge(&by) && !huge(&t) && inner > 0.0 && loose.is_finite() {
-                        r.loose_sum += loose;
-                        r.loose_count += 1;
+                        // (A flat union, a point or a sheet, would make
+                        // one ratio outweigh all the others in the mean.)
+                        if loose <= 1e3 {
+                            r.loose_sum += loose;
+                            r.loose_count += 1;
+                        }
                         r.loose_most = r.loose_most.max(loose);
                         r.loose_over_2 += u64::from(loose > 2.0);
                     }
@@ -364,6 +373,29 @@ pub fn check(
                 r.triangles += 1;
                 r.expected_own += tests;
                 r.expected += tests;
+                // Where the triangle is, against the box its parent keeps
+                // for it: a huge box over a triangle that is not tells the
+                // builder's bounds from its input.
+                let Some(first) = memory.dwords::<16>(at) else {
+                    r.missing += 1;
+                    continue;
+                };
+                let mut words = [0u32; 28];
+                words[..16].copy_from_slice(&first);
+                let corners = bvh::triangle_vertices(&words, kind);
+                let span = corners.iter().fold(None, |u, v| {
+                    Some(union(u, &[v[0], v[1], v[2], v[0], v[1], v[2]]))
+                });
+                if let Some(span) = span {
+                    if huge(&span) {
+                        r.huge_triangles += 1;
+                    } else {
+                        r.triangle_span = Some(union(r.triangle_span, &span));
+                        if huge(&by) {
+                            r.huge_over_triangle += 1;
+                        }
+                    }
+                }
             }
             6 => {
                 r.instances += 1;
@@ -674,10 +706,14 @@ mod tests {
             ],
         );
         m.box32(base, 3, [(at(7, 0), cube(0.0, 1.0)), EMPTY, EMPTY, EMPTY]);
-        m.box32(base, 5, [(at(7, 1), cube(0.0, 0.5)), EMPTY, EMPTY, EMPTY]);
+        m.box32(base, 5, [(at(7, 1), cube(-1e9, 1e9)), EMPTY, EMPTY, EMPTY]);
         let r = check(&m.0, base, &mut HashMap::new(), &mut Vec::new()).unwrap();
         assert_eq!(r.root, Some(cube(-1e9, 1e9)));
-        assert_eq!(r.huge, 1);
+        assert_eq!(r.huge, 2);
+        // Node 7 reads zeros: triangles at the origin. Triangle 1's parent
+        // keeps a huge box for it.
+        assert_eq!((r.huge_triangles, r.huge_over_triangle), (0, 1));
+        assert_eq!(r.triangle_span, Some([0.0; 6]));
         // Node 3 is tight; node 5's huge box is not counted as loose.
         assert_eq!(r.loose_count, 1);
         assert!(r.loose_mean().is_finite());

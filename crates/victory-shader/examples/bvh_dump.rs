@@ -114,7 +114,8 @@ fn line(what: &str, address: u64, h: &Header, r: &Report) {
          broken: {} cycles, {} reached twice, {} outside, {} not in the dump, {} odd; \
          loose: mean {:.2}, most {:.1}, {} over 2, {} escaping; \
          children entered per box test {:.2}; expected node tests {:.1} (own {:.1}); \
-         {} huge boxes; header bounds {:?}, root's children span {:?}",
+         {} huge boxes; {} huge triangles, {} sane triangles under a huge box, triangles span {:?}; \
+         header bounds {:?}, root's children span {:?}",
         h.marks >> 16,
         h.bytes,
         r.boxes,
@@ -134,6 +135,9 @@ fn line(what: &str, address: u64, h: &Header, r: &Report) {
         r.expected,
         r.expected_own,
         r.huge,
+        r.huge_triangles,
+        r.huge_over_triangle,
+        r.triangle_span,
         h.bounds,
         r.root,
     );
