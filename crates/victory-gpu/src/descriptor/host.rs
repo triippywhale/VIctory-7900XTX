@@ -163,7 +163,7 @@ pub(crate) struct HostHeap {
     /// The slots made from a texture whose memory was found away, with what
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
-    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
+    away: Mutex<std::collections::HashMap<u32, (u64, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -629,10 +629,10 @@ pub(crate) struct Spans {
     /// When a newer view makes an older one stale.
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
-    by_slot: std::collections::HashMap<u32, u64>,
+    by_slot: std::collections::HashMap<u32, u64, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The level each slot's view starts at, and where what it is read from
     /// ends ([`Spans::shows`]).
-    first: std::collections::HashMap<u32, (u32, u64)>,
+    first: std::collections::HashMap<u32, (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).

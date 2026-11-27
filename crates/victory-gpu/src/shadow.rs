@@ -1060,7 +1060,7 @@ pub(crate) fn relay_fetched(number: u64) {
 /// writing: the next refresh would have put title bytes over what the
 /// second flight's shaders were writing.
 #[derive(Default)]
-struct Flights(std::collections::HashMap<(usize, usize), (u32, u64)>);
+struct Flights(std::collections::HashMap<(usize, usize), (u32, u64), std::hash::BuildHasherDefault<crate::host::AddressHash>>);
 
 impl Flights {
     /// Submission `number` declares `range`: counted once for it, however
