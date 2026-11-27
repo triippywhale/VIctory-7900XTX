@@ -941,6 +941,29 @@ impl Memory {
             s.left as f64 / frames,
             faults_all()
         );
+        // Where the copies shaders walk lie: a read of the PC's memory
+        // crosses the bus.
+        let in_pc = |shadow: &Arc<Shadow>| {
+            let mut props = D3D12_HEAP_PROPERTIES::default();
+            // SAFETY: a live committed buffer.
+            unsafe { shadow.buffer.GetHeapProperties(Some(&mut props), None) }.is_ok()
+                && props.Type != D3D12_HEAP_TYPE_DEFAULT
+                && !(props.Type == D3D12_HEAP_TYPE_CUSTOM && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+        };
+        let arena = |n: usize| self.arenas.iter().any(|a| a.0 == n);
+        let (mut pc, mut pc_mb, mut pc_arenas) = (0, 0u64, 0);
+        for (n, shadow) in self.copies.iter().enumerate() {
+            if in_pc(shadow) {
+                pc += 1;
+                pc_mb += shadow.span().1 >> 20;
+                pc_arenas += usize::from(arena(n));
+            }
+        }
+        tracing::info!(
+            "title memory by address: of the {} copies, {pc} in the PC's memory ({pc_mb} MB; arenas {pc_arenas} of {})",
+            self.copies.len(),
+            self.arenas.len()
+        );
         self.stats.from = Some((now, self.frame));
     }
 }

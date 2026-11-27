@@ -121,6 +121,19 @@ something is wrong. `-RayTracing` turns the title's ray-traced indirect light on
 `-Ports 1,5`, `-Ports all` or `-Ports none` sets renderer patches by number for A/B
 runs, the unlisted ones to 0 (see "Renderer patches" below); without it each keeps its default.
 
+For PC FSR 4.1.2, set `[paths].fidelityfx_dir` in `victory.toml` or
+`VICTORY_FIDELITYFX_DIR` to the folder containing AMD's signed
+`amd_fidelityfx_upscaler_dx12.dll`. Use the DirectX 12 upscaler in
+`Kits/FidelityFX/signedbin`. [AMD FSR SDK 2.4.0](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v2.4.0/Kits/FidelityFX/signedbin)
+
+`scripts\play.ps1 -Exe <path> -Fsr4K quality` selects 2560×1440 input for
+the retail 1.0.2.1 Series X 4K SDR profile. `balanced` selects 2258×1270
+and `performance` selects 1920×1080. All three output 3840×2160. With
+`victory run` directly, set `VICTORY_FSR_4K` to the preset name.
+The log reports the provider at context creation and the actual input and
+output sizes at the first successful temporal dispatch. The title profile
+and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+
 On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
 high-performance adapter with Shader Model 6.6. The runtime logs its adapter
 name, PCI vendor and device IDs, and dedicated VRAM. Set

@@ -1128,6 +1128,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A host compute library bound its own pipeline, root signature and heaps.
+    pub(crate) fn external_compute(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        self.host_heaps_set = false;
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {
@@ -2916,6 +2924,19 @@ impl State {
         });
     }
 
+    /// Diagnostics: what kind of dispatch `p` is, for the stamps around it.
+    #[cfg(feature = "diagnostics")]
+    fn stamp_kind(&self, p: &HostPipeline) -> crate::host::rtstamps::Kind {
+        use crate::host::rtstamps::Kind;
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            Kind::Builder
+        } else if p.stages.iter().any(|s| s.translated().host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)) {
+            Kind::Walks
+        } else {
+            Kind::Other
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -2986,8 +3007,14 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let stamp = crate::host::rtstamps::before(&list.list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+        }
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4303,6 +4330,8 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        #[cfg(feature = "diagnostics")]
+        let stamp = if kind == DISPATCH { crate::host::rtstamps::before(&list.list) } else { None };
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -4315,6 +4344,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if stamp.is_some() {
+            crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
         }
         if kind == DISPATCH {
             self.buffers_written();
