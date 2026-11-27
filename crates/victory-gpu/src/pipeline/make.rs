@@ -367,6 +367,11 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Early ones that write depth alone (shadow maps, depth prepasses:
+    /// [`GraphicsState::writes_depth_only`]), made before the other early
+    /// ones: several later draws of a frame depend on each (after
+    /// DexNom/VIctory 921d8d3b).
+    early_depth: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -384,6 +389,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            early_depth: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -421,6 +427,7 @@ impl Queue {
             (true, false, false) => &mut self.requested,
             (true, false, true) => &mut self.slow_requested,
             (false, _, true) => &mut self.slow,
+            (false, _, false) if p.graphics.as_ref().is_some_and(|g| g.writes_depth_only()) => &mut self.early_depth,
             (false, _, false) => &mut self.early,
         };
         list.push_back(p.clone());
@@ -449,6 +456,9 @@ impl Queue {
             if p.is_none() && free {
                 p = unclaimed(&mut self.slow_requested, REQUESTED);
                 slow = p.is_some();
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early_depth, EARLY);
             }
             if p.is_none() {
                 p = unclaimed(&mut self.early, EARLY);
@@ -680,6 +690,33 @@ mod low_memory_tests {
         // The stale early entry of the promoted one is not made again.
         assert!(queue.pop(false, 1).is_none());
         assert_eq!(queue.slow_now, 0);
+    }
+
+    /// Early ones that write depth alone are made before other early ones,
+    /// and requested ones before both.
+    #[test]
+    fn early_depth_ones_go_before_other_early_ones() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_WRITE_MASK_ALL;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let depth = || {
+            let mut g = Box::new(GraphicsState::default());
+            g.depth_format = DXGI_FORMAT_D32_FLOAT;
+            g.depth.DepthEnable = true.into();
+            g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            g.targets.NumRenderTargets = 0;
+            assert!(g.writes_depth_only());
+            Arc::new(Pending::new(Vec::new(), Some(g)))
+        };
+        let (other, shadow, promoted) = (job(false), depth(), depth());
+        let mut queue = Queue::new();
+        for p in [&other, &shadow, &promoted] {
+            assert_eq!(queue.push_in(p, EARLY, false, false), Some(true));
+        }
+        assert_eq!(queue.push_in(&promoted, REQUESTED, false, false), Some(false));
+        for expected in [&promoted, &shadow, &other] {
+            assert!(pops(&mut queue, false, 1, expected));
+        }
+        assert!(queue.pop(false, 1).is_none());
     }
 
     /// Workers that make passes over the screen alone take a long one too
