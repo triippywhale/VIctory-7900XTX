@@ -284,6 +284,11 @@ impl Report {
 /// `seen=<how the CPU saw it>`, `id=<a>..<b>`; with `!` in front: that does not.
 fn chosen(r: &wire::Resource, only: &[String]) -> bool {
     only.iter().all(|f| {
+        // `opened`: the heaps opened on title memory (renderer port 1),
+        // moved whole in `make_resources`; no committed buffer is in one.
+        if f == "opened" {
+            return false;
+        }
         let (no, f) = match f.strip_prefix('!') {
             Some(f) => (true, f),
             None => (false, f.as_str()),
@@ -848,13 +853,21 @@ impl Player {
             tracing::info!("replay: {line}");
             self.notes.push(line);
         }
+        // `--only-buffers opened`: of the heaps, only those opened on title
+        // memory move (renderer port 1's memory, as if the port were off).
+        let only_opened = only.iter().any(|f| f == "opened");
         for h in &self.frame.heaps {
             if leave_opened && opened.contains(&h.id) {
                 continue;
             }
+            let moved = if only_opened {
+                opened.contains(&h.id)
+            } else {
+                only.is_empty() && used_by_buffers_only.contains(&h.id)
+            };
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
-                Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
+                Properties: props(&h.props, moved),
                 Alignment: h.alignment,
                 Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
             };
