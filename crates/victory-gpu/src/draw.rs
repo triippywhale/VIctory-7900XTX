@@ -536,9 +536,10 @@ pub(crate) struct State {
     /// (`VICTORY_TABLE_MEMO`) Root views brought up to date in this list:
     /// (address, kind) -> (epoch after, host address).
     view_memo: std::collections::HashMap<(u64, u8), (u64, Option<u64>), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap (address and
+    /// [`crate::descriptor::Heap::serial`]), first, count; given back when
+    /// the list has run, is reset or released, to that heap only.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -567,14 +568,14 @@ impl State {
         count: u32,
     ) -> Option<u32> {
         let first = host.dynamic(count)?;
-        self.dynamic.push((std::ptr::from_ref(heap) as usize, first, count));
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, heap.serial(), first, count));
         Some(first)
     }
 
     /// Release the GPU's descriptor slots while keeping the list's other state alive.
     pub(crate) fn release_dynamic_slots(&mut self) {
-        for (heap, first, count) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, count);
+        for (heap, serial, first, count) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, serial, first, count);
         }
     }
 

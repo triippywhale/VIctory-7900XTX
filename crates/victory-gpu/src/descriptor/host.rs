@@ -1934,6 +1934,12 @@ impl HostHeap {
         self.dynamic
     }
 
+    /// How many dynamic slots are free (tests).
+    #[cfg(test)]
+    pub(crate) fn dynamic_free(&self) -> u32 {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).available()
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
