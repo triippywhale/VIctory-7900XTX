@@ -171,7 +171,8 @@ pub(crate) static PICKED_ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync:
 /// with what the host wrote to `source`: the texels of every level and
 /// layer are copied as they are, through a buffer (the host copies between
 /// two formats of one texel width in no other way). Recorded the first time
-/// the list reads the view
+/// the list reads the view through `source` (also after an upload of the
+/// view from title memory earlier in the list)
 /// and again whenever the list used `source` in another way since (wrote
 /// it, or read it itself). Leaves `placed` in the copy destination state,
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
@@ -275,7 +276,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // The view counts as brought up to date by this list from here on (an
+    // upload of it from title memory later in the list is left out). An
+    // upload earlier in the list has used that first use already, so
+    // whether the copy from the card-written source is still owed is told
+    // by the source the list last copied into the view, not by the first
+    // use: keyed on the first use, the copy was skipped after an upload
+    // and the shader read the uploaded title bytes instead of the card's.
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -290,7 +299,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

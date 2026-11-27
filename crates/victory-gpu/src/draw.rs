@@ -14,6 +14,7 @@ use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+use crate::descriptor::host::TextureRecheck;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -536,16 +537,17 @@ pub(crate) struct State {
     /// (`VICTORY_TABLE_MEMO`) Root views brought up to date in this list:
     /// (address, kind) -> (epoch after, host address).
     view_memo: std::collections::HashMap<(u64, u8), (u64, Option<u64>), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap (address and
+    /// [`crate::descriptor::Heap::serial`]), first, count; given back when
+    /// the list has run, is reset or released, to that heap only.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
@@ -567,14 +569,14 @@ impl State {
         count: u32,
     ) -> Option<u32> {
         let first = host.dynamic(count)?;
-        self.dynamic.push((std::ptr::from_ref(heap) as usize, first, count));
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, heap.serial(), first, count));
         Some(first)
     }
 
     /// Release the GPU's descriptor slots while keeping the list's other state alive.
     pub(crate) fn release_dynamic_slots(&mut self) {
-        for (heap, first, count) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, count);
+        for (heap, serial, first, count) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, serial, first, count);
         }
     }
 
@@ -642,7 +644,7 @@ fn memo_copy(view: &crate::descriptor::View) -> Option<Seen> {
     // A view in another format over a texture the card writes: its texels
     // are copied in when the source was written since the last copy
     // (`crate::texture::alias`), which no change of the list's says.
-    let aliased = |r: usize| crate::resource::alias_of(r as This).is_some();
+    let aliased = |r: usize| crate::resource::is_alias(r as This);
     if let View::Shader(r, _) | View::Unordered(r, _, _) = view
         && aliased(*r)
     {
@@ -1000,8 +1002,35 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// memory is looked at again, each counted from the look before. With
+/// `VICTORY_RECHECK_LATE=1` two more looks, at 1,200 and 3,600 frames
+/// ([`recheck_frames`]): in a six-minute run at the source more changes
+/// turned up at the fifth look than at the fourth, so some textures change
+/// later still. Off unless asked: not measured here.
+const RECHECK_FRAMES: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
+
+/// The looks of [`RECHECK_FRAMES`] in use: the first five, or all seven
+/// with `VICTORY_RECHECK_LATE=1`.
+fn recheck_frames() -> &'static [u64] {
+    static LATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let late = *LATE.get_or_init(|| std::env::var_os("VICTORY_RECHECK_LATE").is_some_and(|v| v == "1"));
+    &RECHECK_FRAMES[..if late { 7 } else { 5 }]
+}
+
+/// The look after one that found a texture unchanged for the
+/// `unchanged_looks`-th time, with the waits `frames`
+/// ([`recheck_frames`]): the number of looks to note and the frames to
+/// wait, or none when the looks are over. One that changed in place before
+/// with nothing to tell of it (`changed_in_place`) is looked at for good,
+/// at the last wait: it stopped after the last look, and what the title
+/// painted into it later was never shown.
+fn next_texture_recheck(frames: &[u64], unchanged_looks: u8, changed_in_place: bool) -> Option<(u8, u64)> {
+    let next = usize::from(unchanged_looks) + 1;
+    match frames.get(next) {
+        Some(&wait) => Some((next as u8, wait)),
+        None => frames.last().filter(|_| changed_in_place).map(|&wait| (unchanged_looks, wait)),
+    }
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -1397,7 +1426,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
-        for &h in handles {
+        // (The host takes at most eight targets; more is an invalid call.)
+        for &h in handles.iter().take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -1930,6 +1960,15 @@ impl State {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // A builder stage that would read zeros where its pages are
+                // is a dropped stage: the builder stops instead of handing
+                // the title structures and results it never wrote (after
+                // PalmVI 080fb856, fxceless/victory-fork #1257: the title
+                // faulted).
+                if !ready.whole && crate::pipeline::is_builder(self.pipeline as This) {
+                    crate::pipeline::builder_off("title memory by address has no number left for another copy");
+                    return false;
+                }
                 Some(ready)
             } else {
                 None
@@ -2724,6 +2763,8 @@ impl State {
             // it. The host copy then kept what the memory held at the
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
+            // One that changed so once is looked at for as long as its view
+            // stays, at the last wait (`next_texture_recheck`).
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
             // One found changed by such a look is looked at in the next frame
             // again: the textures left that change unnoticed are ones the
@@ -2731,17 +2772,22 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+            let mut changed_in_place = false;
+            if let Some(mut checked) = host.texture_slot_checked(index, write) {
+                let TextureRecheck { address: at, bytes: len, fingerprint: print, unchanged_looks: looks, uploaded, .. } =
+                    checked;
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                    match next_texture_recheck(recheck_frames(), looks, checked.changed_in_place) {
+                        Some((looks, wait)) => {
+                            checked.unchanged_looks = looks;
+                            host.texture_slot_recheck(index, write, frame + wait, checked);
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
+                changed_in_place = true;
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -2767,6 +2813,19 @@ impl State {
                     );
                 }
             }
+            // The slot was uploaded whole from `bytes` at `address`: its
+            // first look is due.
+            let schedule_recheck = |address, bytes| {
+                let checked = TextureRecheck {
+                    address,
+                    bytes,
+                    fingerprint: crate::texture::fingerprint(address, bytes),
+                    unchanged_looks: 0,
+                    uploaded: frame,
+                    changed_in_place,
+                };
+                host.texture_slot_recheck(index, write, frame + again_in, checked);
+            };
             let mut partly = None;
             let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
@@ -2893,6 +2952,8 @@ impl State {
                 && crate::resource::alias_picked()
                 && let Some(source) = crate::resource::alias_of(resource)
             {
+                // (Held until the copy is recorded.)
+                let source = source.get();
                 crate::resource::picked_alias(resource, source);
                 let copied = crate::texture::alias(list, resource, source);
                 #[cfg(feature = "diagnostics")]
@@ -2956,10 +3017,7 @@ impl State {
                 let again = partly.map(|mapped| (frame + 1, mapped));
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
-                    Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                    }
+                    Some((at, len)) => schedule_recheck(at, len),
                     None => host.texture_slot_done(index, write, again),
                 }
                 continue;
@@ -3081,10 +3139,7 @@ impl State {
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
                 // Whole and uploaded: looked at again (see above).
-                Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
-                }
+                Some((at, len)) => schedule_recheck(at, len),
                 None => host.texture_slot_done(index, write, again),
             }
         }
@@ -5008,7 +5063,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             #[cfg(feature = "diagnostics")]
             if !aliased && placed.is_some() {
                 crate::resource::alias_watch(*resource as This);
@@ -5306,7 +5361,28 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{RECHECK_FRAMES, next_texture_recheck, staging_budget_per_frame};
+
+    /// A texture never found changed in place stops after the last look;
+    /// one that was keeps the last wait, with the later looks
+    /// (`VICTORY_RECHECK_LATE=1`) too.
+    #[test]
+    fn only_previously_changed_textures_keep_the_final_recheck_interval() {
+        let frames = &RECHECK_FRAMES[..5];
+        for changed in [false, true] {
+            assert_eq!(next_texture_recheck(frames, 0, changed), Some((1, 12)));
+            assert_eq!(next_texture_recheck(frames, 1, changed), Some((2, 40)));
+            assert_eq!(next_texture_recheck(frames, 2, changed), Some((3, 120)));
+            assert_eq!(next_texture_recheck(frames, 3, changed), Some((4, 400)));
+        }
+        assert_eq!(next_texture_recheck(frames, 4, false), None);
+        let (looks, wait) = next_texture_recheck(frames, 4, true).unwrap();
+        assert_eq!((looks, wait), (4, 400));
+        assert_eq!(next_texture_recheck(frames, looks, true), Some((4, 400)));
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 4, false), Some((5, 1200)));
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, false), None);
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, true), Some((6, 3600)));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

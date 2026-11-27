@@ -75,6 +75,19 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     }
 }
 
+/// Takes a reference to `this` only if it still has one: false once the
+/// last was released (the object is being freed, or about to be). For a
+/// caller that found `this` in a table objects leave before they are freed,
+/// under that table's lock.
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n > 0).then(|| n.saturating_add(1))
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;

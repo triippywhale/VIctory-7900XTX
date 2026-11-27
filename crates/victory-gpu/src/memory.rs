@@ -15,7 +15,8 @@
 //!
 //! - the **directory**: per 64 KiB page of title address space the number
 //!   of the copy that holds the page (0: none) and the page's byte offset
-//!   in it; one for all lists, entries only ever go from empty to filled.
+//!   in it; one for all lists. An entry goes from empty to filled, and back
+//!   to empty when its page is given back.
 //!   The CPU writes it in memory of its own and shaders read a copy of that
 //!   on the card, brought up to date as title memory is (over the bus, every
 //!   step of every ray waited for it);
@@ -24,7 +25,9 @@
 //!   copy);
 //! - the **faults**: the page numbers shaders found empty, read back here
 //!   once a frame, so the pages are there from the next frame on. A pointer a
-//!   shader takes out of memory cannot be known before it runs.
+//!   shader takes out of memory cannot be known before it runs. The programs
+//!   that walk leave theirs in the first half of the notes, the builder in
+//!   the second: what the builder found empty it may store in later.
 //!
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
@@ -62,11 +65,22 @@
 //! A packed structure is gone when title memory has no header of it any more
 //! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
 //!
-//! shortcut: a page held for anything else is kept for the rest of the run.
+//! **Pages from faults go round**: at most [`FAULT_MB`] of arena pages are
+//! held because a shader found them empty. A present page leaves no note, so
+//! whether such a page is still read is not known; at the limit the oldest
+//! goes for the new one, and if it was still read its note comes back in the
+//! next frame and it is made again from title memory (one frame of zeros
+//! there; counted, see [`Memory::report`]). A page a list names, or a packed
+//! structure is unpacked in, is no longer one of these: it may hold what is
+//! on the card alone. A page whose title memory is gone goes at once.
+//! (`VICTORY_BVH_FAULTS_RECYCLE=0`: a count for the whole run, as before;
+//! see [`recycle`].)
+//!
+//! shortcut: a page a list named is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY};
@@ -101,23 +115,55 @@ const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
-/// Pages taken from the faults, of one frame and in all, at most: a ray in a
-/// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// Pages taken from the faults in one frame, at most: a ray in a structure
+/// that is not right goes anywhere, and 2,048 a frame took all the pages
+/// there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
+/// Pages taken from faults in a whole run, the old way ([`recycle`] off).
 const FAULTS_ALL: usize = 2048;
+/// Arena pages held from the faults at a time, at most, in MiB. Not a count
+/// for the run any more: with ray tracing on, the 2,048 pages of the run were
+/// gone 7-20 seconds after the builder started (7900 XT runs, 2026-11-26),
+/// and from then on up to about 1,000 pages a frame that structures point
+/// into read as zeros for the rest of the run, which looks like dark and
+/// flickering indirect light. What rays touch follows where the player goes,
+/// so at the limit the oldest such page is given back for the new one
+/// ([`Memory::give_back`]). 512 is fxceless's number (3e573d2: what its runs
+/// came to hold from faults on a 12 GB card). Whether it is enough the
+/// report says: pages given back and wanted again.
+const FAULT_MB: usize = 512;
+const FAULT_PAGES: usize = (FAULT_MB << 20) / PAGE as usize;
+/// A page from a fault is not given back for so many frames after it came.
+/// When more new pages are wanted than that lets through (all of
+/// [`faults_most`] in under so many frames: rays that go anywhere), the new
+/// ones wait, instead of the pages in use going round at [`FAULTS`] a frame.
+const FAULT_YOUNG: u64 = 128;
+/// A page given back and wanted again within so many frames was still read
+/// (a submission lands up to two frames late).
+const FAULT_SOON: u64 = 4;
 
-/// Pages taken from faults in all ([`FAULTS_ALL`] unless
-/// `VICTORY_BVH_FAULTS_ALL`, or else `VICTORY_BVH_FAULTS`, says another number; held pages stay under [`MOST`]
-/// either way). With ray tracing on, the 2,048 were gone 7-20 seconds after
-/// the builder started (7900 XT runs, 2026-11-26), and from then on up to
-/// about 1,000 pages a frame that structures point into read as zeros, which
-/// looks like dark and flickering indirect light. The switch is for measuring
-/// what a bigger budget gives against the memory it holds.
-fn faults_all() -> usize {
+/// Whether the pages taken from faults go round (`VICTORY_BVH_FAULTS_RECYCLE=0`:
+/// they are kept for the rest of the run and counted for the whole run, as
+/// before fxceless 3e573d2; then no more than [`faults_most`] are ever made,
+/// and what is touched after that reads zeros for good).
+fn recycle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FAULTS_RECYCLE").is_none_or(|v| v != "0"))
+}
+
+/// The number `VICTORY_BVH_FAULTS_ALL`, or else `VICTORY_BVH_FAULTS`, gives:
+/// with [`recycle`], the arena pages held from faults at a time
+/// ([`FAULT_PAGES`], 512 MB, unless given); without it, the pages taken from
+/// faults in the whole run ([`FAULTS_ALL`] unless given). Held pages stay
+/// under [`MOST`] either way.
+fn faults_most() -> usize {
     static ALL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ALL.get_or_init(|| {
-        std::env::var("VICTORY_BVH_FAULTS_ALL").ok().or_else(|| std::env::var("VICTORY_BVH_FAULTS").ok()).and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+        let given = std::env::var("VICTORY_BVH_FAULTS_ALL")
+            .ok()
+            .or_else(|| std::env::var("VICTORY_BVH_FAULTS").ok())
+            .and_then(|v| v.trim().parse().ok());
+        given.unwrap_or(if recycle() { FAULT_PAGES } else { FAULTS_ALL })
     })
 }
 /// Frames over which every page is looked at once.
@@ -169,6 +215,11 @@ struct Held {
     /// The frame it was last looked at in, and the one it came in.
     looked: u64,
     born: u64,
+    /// Which of all holdings this is (a page given back may come again).
+    serial: u64,
+    /// Taken from a fault and named by no list since: 1 if the programs that
+    /// walk found it empty, 2 if the builder did (0: not so).
+    fault: u8,
     /// Packed structures that have bytes in it, and whether it is held for
     /// them alone.
     owners: u32,
@@ -199,8 +250,9 @@ struct Memory {
     told: HashMap<usize, std::collections::BTreeMap<usize, u64>>,
     /// By title page.
     pages: HashMap<u64, Held>,
-    /// Their numbers in the order they came, and where the sweep is.
-    order: Vec<u64>,
+    /// Their numbers and serials in the order they came, and where the sweep
+    /// is.
+    order: Vec<(u64, u64)>,
     sweep: usize,
     /// Windows of title memory itself ([`Memory::map`]), and their pages.
     windows: usize,
@@ -217,8 +269,28 @@ struct Memory {
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
-    /// Pages taken from faults.
+    /// Pages taken from faults, in all.
     faulted: usize,
+    /// Holdings so far ([`Held::serial`]).
+    holdings: u64,
+    /// The arena pages held from faults (the walking programs', the
+    /// builder's) with their serials, in the order they came; how many of
+    /// them are still so.
+    fault_order: [VecDeque<(u64, u64)>; 2],
+    fault_held: [usize; 2],
+    /// Pages given back for others: the frame, and whether a shader was seen
+    /// to want the page again within [`FAULT_SOON`] frames.
+    given: HashMap<u64, (u64, bool)>,
+    /// A bit per page above 4 GiB a shader found empty, in all and since the
+    /// last report; how many are set.
+    wanted: [Vec<u64>; 2],
+    wanted_pages: [u64; 2],
+    /// Whether the card has room for another arena, once asked this frame.
+    room: Option<bool>,
+    /// No room was found for a page from a fault this frame (not looked for
+    /// again in it); the page last asked for got no place for want of room.
+    full: bool,
+    turned: bool,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -231,6 +303,9 @@ struct Memory {
     /// window's place in `copies`: where a copy of those results reads them
     /// ([`results`]).
     results: HashMap<u64, usize>,
+    /// A page the current [`ready`] named found no number left for the copy
+    /// that would hold it ([`Memory::number`]).
+    short: bool,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -258,10 +333,20 @@ struct Stats {
     micros: u64,
     /// Runs of arena pages lists were given to bring up ([`arenas_told`]).
     told_runs: u64,
-    /// Pages found without a copy that were left so because of the bounds on
-    /// pages taken from faults, and the different pages faulted.
-    left: u64,
+    /// The different pages faulted.
     distinct: std::collections::HashSet<u64>,
+    /// Of the pages shaders found empty: made; left over the frame's limit,
+    /// without room, not the title's; below 4 GiB; left by the builder.
+    made: u64,
+    left: [u64; 3],
+    low: u64,
+    builders: u64,
+    /// Pages from faults given back for others, of them wanted again at
+    /// once; gone with the title's memory; named by a list since.
+    given: u64,
+    again: u64,
+    dead: u64,
+    adopted: u64,
     /// Ranges copied from shader-written buffers into pages they share.
     mirrored: u64,
 }
@@ -275,9 +360,14 @@ static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
 /// What a draw binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,
+    /// The half of the notes this draw's shader leaves its faults in.
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// No page the dispatch names was left without a copy for want of a
+    /// number. False once the numbers have run out ([`COPIES`]): what it
+    /// names then reads zeros, a dropped stage for the structure builder.
+    pub(crate) whole: bool,
 }
 
 impl Memory {
@@ -288,10 +378,12 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        // Twice the notes a shader knows of: the programs that walk leave
+        // theirs in the first half, the builder in the second ([`ready`]).
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 8) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -314,10 +406,20 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            holdings: 0,
+            fault_order: Default::default(),
+            fault_held: [0; 2],
+            given: HashMap::new(),
+            wanted: [vec![0; MEMORY_PAGES as usize / 64], vec![0; MEMORY_PAGES as usize / 64]],
+            wanted_pages: [0; 2],
+            room: None,
+            full: false,
+            turned: false,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
             results: HashMap::new(),
+            short: false,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -368,8 +470,18 @@ impl Memory {
             return Some(n);
         }
         if self.copies.len() >= COPIES as usize {
+            self.short = true;
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
+            ONCE.call_once(|| {
+                let (arenas, windows) = (self.arenas.len(), self.windows);
+                tracing::warn!(
+                    COPIES,
+                    arenas,
+                    windows,
+                    title_buffers = self.copies.len().saturating_sub(arenas + windows),
+                    "title memory by address: no number left for another copy; its pages read zeros, and a stage of the structure builder that names one turns the builder off (numbered so far, by what they are)"
+                )
+            });
             return None;
         }
         // SAFETY: a live buffer.
@@ -383,10 +495,20 @@ impl Memory {
         Some(n)
     }
 
-    /// Gives `page` a place, if it has none and the memory is the title's;
-    /// whether it has one then.
+    /// Gives `page` a place for a list that names it, if it has none and the
+    /// memory is the title's; whether it has one then.
     fn map(&mut self, page: u64) -> bool {
+        self.map_for(page, None)
+    }
+
+    /// [`Memory::map`]; `fault`: for a page a shader found empty (whether the
+    /// builder did), which takes an arena's place only within
+    /// [`Memory::fault_room`].
+    fn map_for(&mut self, page: u64, fault: Option<bool>) -> bool {
         if self.copy_of(page).is_some() {
+            if fault.is_none() {
+                self.adopt(page);
+            }
             return true;
         }
         if !self.possible(page) {
@@ -438,23 +560,121 @@ impl Memory {
             }
             return false;
         }
+        if fault.is_some() && (self.full || !self.fault_room()) {
+            (self.full, self.turned) = (true, true);
+            return false;
+        }
         if self.pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
-        if let Some((copy, at)) = self.free.pop() {
-            self.hold(page, at, copy);
-            return true;
-        }
-        if !self.another() {
+        if self.free.is_empty() && !self.another() {
             return false;
         }
         let Some((copy, at)) = self.free.pop() else {
             return false;
         };
         self.hold(page, at, copy);
+        if let Some(builds) = fault
+            && let Some(held) = self.pages.get_mut(&page)
+        {
+            let kind = usize::from(builds);
+            held.fault = kind as u8 + 1;
+            self.fault_order[kind].push_back((page, held.serial));
+            self.fault_held[kind] += 1;
+        }
         true
+    }
+
+    /// A list names `page`, or a packed structure is unpacked in it: if it
+    /// was held from a fault it is not given back any more (it may hold what
+    /// is on the card alone, as any page a list names).
+    fn adopt(&mut self, page: u64) {
+        if self.fault_held == [0, 0] {
+            return;
+        }
+        if let Some(held) = self.pages.get_mut(&page)
+            && held.fault != 0
+        {
+            self.fault_held[usize::from(held.fault) - 1] -= 1;
+            held.fault = 0;
+            self.stats.adopted += 1;
+        }
+    }
+
+    /// Whether the card has room for another arena, by the rule its copy is
+    /// made by ([`crate::shadow::by_address`]: under 97 hundredths of the
+    /// budget; past it the arena lies in the PC's memory and every step of
+    /// every ray crosses the bus). Asked once a frame.
+    fn card_room(&mut self) -> bool {
+        *self.room.get_or_insert_with(|| {
+            host().and_then(|h| h.video_memory()).is_none_or(|[budget, used, ..]| used + ARENA < budget / 100 * 97)
+        })
+    }
+
+    /// Room for one more page from a fault: under [`faults_most`], while the
+    /// card has room for the arena it may come to take; else the place of
+    /// the oldest such page.
+    fn fault_room(&mut self) -> bool {
+        (self.fault_held[0] + self.fault_held[1] < faults_most() && self.card_room()) || self.give_back()
+    }
+
+    /// Gives back the oldest page held from a fault, unless it is younger
+    /// than [`FAULT_YOUNG`] frames. Whether it is still read is not known (a
+    /// present page leaves no note): if it is, its note comes back with the
+    /// next frame and [`Memory::take_faults`] makes it again, first.
+    fn give_back(&mut self) -> bool {
+        let kind = goes_first(self.fault_held, faults_most());
+        while let Some(&(page, serial)) = self.fault_order[kind].front() {
+            let Some(born) = self.pages.get(&page).filter(|h| h.serial == serial && h.fault != 0).map(|h| h.born) else {
+                // Named by a list since, or gone.
+                self.fault_order[kind].pop_front();
+                continue;
+            };
+            if self.frame.wrapping_sub(born) < FAULT_YOUNG {
+                return false;
+            }
+            self.fault_order[kind].pop_front();
+            self.let_go(page);
+            self.given.insert(page, (self.frame, false));
+            self.stats.given += 1;
+            return true;
+        }
+        false
+    }
+
+    /// `page`, held from a fault, is given up: its place is free and shaders
+    /// find it empty again.
+    fn let_go(&mut self, page: u64) {
+        let Some(held) = self.pages.remove(&page) else { return };
+        if held.fault != 0 {
+            self.fault_held[usize::from(held.fault) - 1] -= 1;
+        }
+        self.free.push((held.copy, held.at));
+        // (Its place is another page's from here on.)
+        self.over.remove(&page);
+        // SAFETY: an entry of the directory, under the mutex.
+        unsafe { self.entry(page).write_volatile(0) };
+    }
+
+    /// The age in frames of the oldest page held from a fault.
+    fn oldest(&mut self) -> u64 {
+        let mut age = 0;
+        for kind in 0..2 {
+            while let Some(&(page, serial)) = self.fault_order[kind].front() {
+                match self.pages.get(&page) {
+                    Some(h) if h.serial == serial && h.fault != 0 => {
+                        age = age.max(self.frame.wrapping_sub(h.born));
+                        break;
+                    }
+                    _ => {
+                        self.fault_order[kind].pop_front();
+                    }
+                }
+            }
+        }
+        age
     }
 
     /// Another arena's pages.
@@ -473,8 +693,13 @@ impl Memory {
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
-        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
-        self.order.push(page);
+        self.holdings += 1;
+        let serial = self.holdings;
+        self.pages.insert(
+            page,
+            Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, serial, fault: 0, owners: 0, theirs: false },
+        );
+        self.order.push((page, serial));
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
         self.shares(page);
     }
@@ -590,8 +815,19 @@ impl Memory {
         }
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
-            let page = self.order[self.sweep];
-            if self.pages.contains_key(&page) {
+            let (page, serial) = self.order[self.sweep];
+            let fault = self.pages.get(&page).filter(|h| h.serial == serial).map(|h| h.fault);
+            // The title's memory under a page from a fault is gone: so is
+            // what was read there. (A question to the system: put for a
+            // page every fourth time the sweep comes to it.)
+            let dead = fault.is_some_and(|f| f != 0)
+                && (self.frame / SWEEP as u64 + page).is_multiple_of(4)
+                && !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize);
+            if dead {
+                self.let_go(page);
+                self.stats.dead += 1;
+            }
+            if fault.is_some() && !dead {
                 self.shares(page);
                 self.bring(page, page + 1);
             } else {
@@ -760,6 +996,8 @@ impl Memory {
                     held.owners += 1;
                     held.theirs |= new;
                 }
+                // (Unpacked in place, on the card alone.)
+                self.adopt(page);
             }
             self.stats.packed_bytes += len;
         }
@@ -822,50 +1060,113 @@ impl Memory {
         }
     }
 
-    /// The pages shaders found empty since the last frame.
+    /// The pages shaders found empty since the last frame: those that are
+    /// the title's get a place, at most [`FAULTS`] a frame, and at most
+    /// [`faults_most`] arena pages are held so (with [`recycle`] off: are
+    /// ever made so).
     fn take_faults(&mut self) {
-        let mut pages = Vec::new();
-        for i in 1..MEMORY_FAULTS as usize {
+        let mut raw = Vec::new();
+        // (Dword 0 of each half is a sink.)
+        for i in (1..2 * MEMORY_FAULTS as usize).filter(|&i| i != MEMORY_FAULTS as usize) {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
-                pages.push(u64::from(page));
+                raw.push((u64::from(page), i > MEMORY_FAULTS as usize));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }
         }
-        if pages.is_empty() {
+        if raw.is_empty() {
             return;
         }
-        pages.sort_unstable();
-        let mut made = 0;
-        let all = faults_all();
-        for &page in &pages {
+        let mut pages = noted(raw);
+        let builders = pages.iter().filter(|p| p.1).count();
+        // Below 4 GiB there is no title memory a shader reads by address: a
+        // pointer made of zeros, or of something that is no pointer.
+        let low = pages.partition_point(|p| p.0 < 0x1_0000);
+        let frame = self.frame;
+        let mut again = 0;
+        for &(page, _) in &pages[low..] {
             self.stats.distinct.insert(page);
+            for i in 0..2 {
+                self.wanted_pages[i] += u64::from(mark(&mut self.wanted[i], page));
+            }
+            if let Some(given) = self.given.get_mut(&page)
+                && !given.1
+                && frame.wrapping_sub(given.0) <= FAULT_SOON
+            {
+                given.1 = true;
+                again += 1;
+            }
+        }
+        // Each is an access that read 0 or was dropped.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let say = said < 40 || said.is_multiple_of(100);
+        // (Of those above 4 GiB: the others are counted, and tell nothing.)
+        let some: Vec<String> = pages[low..]
+            .iter()
+            .step_by(pages[low..].len().div_ceil(12).max(1))
+            .filter(|_| say)
+            .map(|&(p, _)| format!("{:#x}", p * PAGE))
+            .collect();
+        // Those given back and wanted again first: they are read.
+        if !self.given.is_empty() {
+            let given = &self.given;
+            pages.sort_by_cached_key(|p| !given.contains_key(&p.0));
+        }
+        let (mut made, gave) = (0, self.stats.given);
+        // The old way: kept for the run, and no more than so many in it.
+        let (round, most) = (recycle(), faults_most());
+        // Why the others got none: the frame's limit; no room (the limit of
+        // pages from faults with its oldest too young to go, or the card's
+        // memory: only arena pages, a title buffer's copy takes none; the
+        // old way, the run's count); not the title's memory; no place (a
+        // copy that cannot be numbered, no arena).
+        let mut left = [0u32; 4];
+        for &(page, builds) in &pages {
             if self.copy_of(page).is_some() {
                 continue;
             }
-            if made < FAULTS && self.faulted < all {
-                if self.map(page) {
-                    made += 1;
-                    self.faulted += 1;
-                    self.bring(page, page + 1);
-                }
+            if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+                left[2] += 1;
+            } else if made >= FAULTS {
+                left[0] += 1;
+            } else if !round && self.faulted >= most {
+                left[1] += 1;
+            } else if self.map_for(page, round.then_some(builds)) {
+                made += 1;
+                self.faulted += 1;
+                self.given.remove(&page);
+                self.bring(page, page + 1);
+            } else if self.refused.contains(&page) {
+                left[2] += 1;
+            } else if std::mem::take(&mut self.turned) {
+                left[1] += 1;
             } else {
-                self.stats.left += 1;
+                left[3] += 1;
             }
         }
-        self.stats.faults += pages.len() as u64;
-        // The first frames that leave pages without a copy: all of them, and
-        // which of them hold a packed structure's first bytes or lie in a
-        // title buffer (to tell walked structures from stray pointers).
+        let s = &mut self.stats;
+        s.faults += pages.len() as u64;
+        s.made += made as u64;
+        for (sum, n) in s.left.iter_mut().zip(left) {
+            *sum += u64::from(n);
+        }
+        s.low += low as u64;
+        s.builders += builders as u64;
+        s.again += again;
+        // The first frames that leave pages without a copy for want of room:
+        // all of them, and which of them hold a packed structure's first
+        // bytes or lie in a title buffer (to tell walked structures from
+        // stray pointers).
         static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if made < pages.len() && self.faulted >= faults_all() && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+        if left[1] > 0 && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
             let mut text = String::new();
-            for &page in pages.iter().filter(|&&p| self.copy_of(p).is_none()) {
+            for &(page, _) in pages.iter().filter(|p| p.0 >= 0x1_0000 && self.copy_of(p.0).is_none()) {
                 let at = page * PAGE;
                 let committed = crate::texture::committed(at as *const u8, PAGE as usize);
                 let buffer = crate::shadow::in_buffer(at, 1).is_some();
@@ -874,20 +1175,23 @@ impl Memory {
             }
             tracing::warn!(frame = self.frame, "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}");
         }
-        // Each is an access that read 0 or was dropped.
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if said < 40 || said.is_multiple_of(100) {
-            let some: Vec<String> = pages
-                .iter()
-                .step_by(pages.len().div_ceil(12))
-                .map(|&p| format!("{:#x}", p * PAGE))
-                .collect();
+        if say {
+            let (given_back, oldest) = (self.stats.given - gave, self.oldest());
             tracing::warn!(
                 frame = self.frame,
                 pages = pages.len(),
                 made,
                 held = self.pages.len(),
+                over_the_frame = left[0],
+                no_room = left[1],
+                not_the_titles = left[2],
+                no_place = left[3],
+                below_4_gib = low,
+                by_the_builder = builders,
+                from_faults = self.fault_held[0] + self.fault_held[1],
+                given_back,
+                wanted_again = again,
+                oldest,
                 ?some,
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
@@ -973,13 +1277,31 @@ impl Memory {
             return;
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
+        let oldest = self.oldest();
+        let wanted = self.wanted_pages;
+        self.wanted[1].fill(0);
+        self.wanted_pages[1] = 0;
+        // (What is not asked about any more.)
+        let now_frame = self.frame;
+        self.given.retain(|_, given| now_frame.wrapping_sub(given.0) < 2 * FAULT_YOUNG);
+        for kind in 0..2 {
+            if self.fault_order[kind].len() > 2 * self.fault_held[kind] + 4096 {
+                let pages = &self.pages;
+                self.fault_order[kind].retain(|&(p, serial)| pages.get(&p).is_some_and(|h| h.serial == serial && h.fault != 0));
+            }
+        }
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
              and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}; {:.1} runs of arena pages brought up \
-             (VICTORY_ARENAS_TOLD=0: arenas whole); since the last line {} different pages faulted, {:.1} a frame left without a copy by the bounds ({} in all); {:.1} ranges a frame mirrored from buffers shaders write (VICTORY_BVH_MIRROR=1)",
+             (VICTORY_ARENAS_TOLD=0: arenas whole); since the last line {} different pages faulted; {:.1} ranges a frame mirrored from buffers shaders write (VICTORY_BVH_MIRROR=1); \
+             from faults {} pages held ({} MB of at most {}{}: the walking programs' {}, the builder's {}), the oldest {} frames old; \
+             since the last line {} made, {} given back for others ({} of them wanted again within {} frames), \
+             {} gone with the title's memory, {} named by a list since; per frame {:.1} not the title's ({:.1} of them below 4 GiB), \
+             {:.1} over the frame's limit, {:.1} without room, {:.1} left by the builder; \
+             pages wanted above 4 GiB: {} since the last line, {} in all",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1004,9 +1326,27 @@ impl Memory {
             self.faulted,
             s.told_runs as f64 / frames,
             s.distinct.len(),
-            s.left as f64 / frames,
-            faults_all(),
-            s.mirrored as f64 / frames
+            s.mirrored as f64 / frames,
+            self.fault_held[0] + self.fault_held[1],
+            ((self.fault_held[0] + self.fault_held[1]) as u64 * PAGE) >> 20,
+            (faults_most() as u64 * PAGE) >> 20,
+            if recycle() { "" } else { "; VICTORY_BVH_FAULTS_RECYCLE=0: none held so, the number is for the run" },
+            self.fault_held[0],
+            self.fault_held[1],
+            oldest,
+            s.made,
+            s.given,
+            s.again,
+            FAULT_SOON,
+            s.dead,
+            s.adopted,
+            s.left[2] as f64 / frames,
+            s.low as f64 / frames,
+            s.left[0] as f64 / frames,
+            s.left[1] as f64 / frames,
+            s.builders as f64 / frames,
+            wanted[1],
+            wanted[0]
         );
         // Where the copies shaders walk lie: a read of the PC's memory
         // crosses the bus.
@@ -1153,6 +1493,39 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
     asked
 }
 
+/// The notes of a frame (the page, whether the builder left it) in page
+/// order, a page both left once, as the builder's.
+fn noted(mut raw: Vec<(u64, bool)>) -> Vec<(u64, bool)> {
+    raw.sort_unstable();
+    raw.dedup_by(|later, first| {
+        let same = first.0 == later.0;
+        first.1 |= same && later.1;
+        same
+    });
+    raw
+}
+
+/// Whose page from a fault is given back first, of `held` (the walking
+/// programs', the builder's) with at most `most` held in all: the walking
+/// programs', which read the title's own bytes and get them again whole.
+/// What the builder found empty it may have stored in since, and that is on
+/// the card alone: its pages go only once they are more than half of `most`,
+/// or all there are.
+fn goes_first(held: [usize; 2], most: usize) -> usize {
+    usize::from(held[0] == 0 || held[1] > most / 2)
+}
+
+/// Sets `page`'s bit; whether it was not set.
+fn mark(bits: &mut [u64], page: u64) -> bool {
+    let Some(word) = bits.get_mut((page / 64) as usize) else {
+        return false;
+    };
+    let bit = 1 << (page % 64);
+    let new = *word & bit == 0;
+    *word |= bit;
+    new
+}
+
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
@@ -1223,6 +1596,7 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        (m.room, m.full) = (None, false);
         m.take_faults();
         m.look_again();
         m.report();
@@ -1238,6 +1612,9 @@ pub(crate) fn ready(
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    // From here on: what this dispatch names. (The faults' pages and the
+    // spare arena are not its own.)
+    m.short = false;
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1385,8 +1762,10 @@ pub(crate) fn ready(
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
-        faults: m.faults.2,
+        // (The shader's places are the same in either half.)
+        faults: m.faults.2 + if builds { u64::from(MEMORY_FAULTS) * 4 } else { 0 },
         base,
+        whole: !m.short,
     })
 }
 
@@ -1838,6 +2217,35 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    #[test]
+    fn a_frames_notes_come_once_a_page_and_the_builders_stay_the_builders() {
+        let notes = noted(vec![(0x2_0000, false), (0x10, true), (0x1_0005, true), (0x1_0005, false), (0x1_0004, false)]);
+        assert_eq!(notes, [(0x10, true), (0x1_0004, false), (0x1_0005, true), (0x2_0000, false)]);
+        // Those below 4 GiB are the first of them.
+        assert_eq!(notes.partition_point(|p| p.0 < 0x1_0000), 1);
+    }
+
+    #[test]
+    fn the_walking_programs_pages_from_faults_go_first() {
+        assert_eq!(FAULT_PAGES, 8192);
+        assert_eq!(goes_first([100, 100], FAULT_PAGES), 0);
+        assert_eq!(goes_first([1, FAULT_PAGES / 2], FAULT_PAGES), 0);
+        // The builder's once they are more than half, or all there are.
+        assert_eq!(goes_first([100, FAULT_PAGES / 2 + 1], FAULT_PAGES), 1);
+        assert_eq!(goes_first([0, 3], FAULT_PAGES), 1);
+    }
+
+    #[test]
+    fn a_page_wanted_is_counted_once() {
+        let mut bits = vec![0u64; 4];
+        assert!(mark(&mut bits, 65));
+        assert!(!mark(&mut bits, 65));
+        assert!(mark(&mut bits, 64));
+        assert_eq!(bits, [0, 3, 0, 0]);
+        // Past the directory: not counted.
+        assert!(!mark(&mut bits, 4 * 64));
     }
 
     #[test]
