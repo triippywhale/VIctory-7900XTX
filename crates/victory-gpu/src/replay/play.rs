@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
+use super::dred;
 use super::edit::{self, Clamp, RESULTS};
 use super::gpu::{self, Seen, Worker};
 use super::snap::read_sub;
@@ -364,7 +365,11 @@ pub fn title_shaders(folder: &Path) -> Result<std::collections::BTreeSet<(String
                 && let Some(hash) = title_hash(p, *blob)
             {
                 let at = p.name.find(hash).unwrap_or(0);
-                let stage = p.name[..at].trim_end().rsplit(['[', ' ']).next().unwrap_or("");
+                let stage = p.name[..at]
+                    .trim_end()
+                    .rsplit(['[', ' '])
+                    .next()
+                    .unwrap_or("");
                 all.insert((stage.to_owned(), hash.to_owned()));
             }
         }
@@ -431,15 +436,21 @@ pub fn dump(folder: &Path, text: &str) -> Result<Vec<String>> {
 /// frame), and before them the frame's buffers: `--listing`.
 pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> Result<()> {
     let frame = Frame::read(&find(folder)?.join("frame.bin"))?;
-    let pipelines: HashMap<u32, &str> =
-        frame.pipelines.iter().map(|p| (p.id, p.name.as_str())).collect();
+    let pipelines: HashMap<u32, &str> = frame
+        .pipelines
+        .iter()
+        .map(|p| (p.id, p.name.as_str()))
+        .collect();
     for r in &frame.resources {
         if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
             let place = match &r.place {
                 Place::Committed { props, .. } => format!("{:?}", gpu::seen(props)),
                 other => format!("{other:?}"),
             };
-            line(&format!("buffer {} {} bytes, {place}: {}", r.id, r.desc.width, r.name));
+            line(&format!(
+                "buffer {} {} bytes, {place}: {}",
+                r.id, r.desc.width, r.name
+            ));
         } else {
             let d = &r.desc;
             line(&format!(
@@ -457,10 +468,16 @@ pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> 
                 continue;
             }
             line(&format!("list {here} of submission {i}"));
-            for (n, c) in Cmd::all(&frame.lists[l as usize].commands.0)?.iter().enumerate() {
+            for (n, c) in Cmd::all(&frame.lists[l as usize].commands.0)?
+                .iter()
+                .enumerate()
+            {
                 match c {
                     Cmd::Pipeline { pso } => {
-                        line(&format!("{n} Pipeline {pso} {}", pipelines.get(pso).copied().unwrap_or_default()));
+                        line(&format!(
+                            "{n} Pipeline {pso} {}",
+                            pipelines.get(pso).copied().unwrap_or_default()
+                        ));
                     }
                     c => line(&format!("{n} {c:?}")),
                 }
@@ -499,7 +516,10 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
             stamps_b.push(player.once(options, &mut b)?);
         }
         out.push(("unchanged".into(), player.finish(&plain, a, &stamps_a)?));
-        out.push(("with the experiments".into(), player.finish(options, b, &stamps_b)?));
+        out.push((
+            "with the experiments".into(),
+            player.finish(options, b, &stamps_b)?,
+        ));
         return Ok(out);
     }
     let what = if options.edited() {
@@ -651,16 +671,30 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
-        step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
-        step("pipelines", &mut at);
-        player.make_descriptors()?;
-        step("descriptors", &mut at);
-        player.load_contents()?;
-        step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
-        step("copies to restore from", &mut at);
+        // Each step said as it starts, and the breadcrumbs read when the
+        // device goes: a setup that removes the device says where.
+        dred::name(&player.worker.queue, "replay queue");
+        let set_up = (|| -> Result<()> {
+            tracing::info!("replay: making resources");
+            player.make_resources(options.buffers, &options.only_buffers)?;
+            step("resources", &mut at);
+            tracing::info!("replay: making pipelines");
+            player.make_pipelines(options.shaders.as_deref())?;
+            step("pipelines", &mut at);
+            tracing::info!("replay: making descriptors");
+            player.make_descriptors()?;
+            step("descriptors", &mut at);
+            tracing::info!("replay: loading contents");
+            player.load_contents()?;
+            step("contents", &mut at);
+            tracing::info!("replay: copies to restore from");
+            player.make_masters(options.buffers, options.restore)?;
+            step("copies to restore from", &mut at);
+            Ok(())
+        })();
+        if let Err(e) = set_up {
+            return Err(dred::explain(&player.device, e));
+        }
         let steps: Vec<String> = steps
             .iter()
             .map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64()))
@@ -785,10 +819,79 @@ impl Player {
                 .filter(|id| !textures.contains(id))
                 .collect()
         };
+        // Heaps the host opened on title memory (renderer port 1) are
+        // shared across adapters, and no heap the host makes is: how many,
+        // and what is placed in them. `VICTORY_REPLAY_OPENED=0` leaves them
+        // out (and what is placed in them), to tell whether they are what
+        // a replay trips on.
+        let opened: HashSet<u32> = self
+            .frame
+            .heaps
+            .iter()
+            .filter(|h| h.flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0 != 0)
+            .map(|h| h.id)
+            .collect();
+        let leave_opened = std::env::var("VICTORY_REPLAY_OPENED").is_ok_and(|v| v.trim() == "0");
+        {
+            let mb = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+            let (all, all_bytes) = (
+                self.frame.heaps.len(),
+                self.frame.heaps.iter().map(|h| h.size).sum::<u64>(),
+            );
+            let opened_bytes: u64 = self
+                .frame
+                .heaps
+                .iter()
+                .filter(|h| opened.contains(&h.id))
+                .map(|h| h.size)
+                .sum();
+            let (mut buffers, mut textures, mut placed_bytes) = (0u32, 0u32, 0u64);
+            for r in &self.frame.resources {
+                if let Place::Placed { heap, .. } = r.place
+                    && opened.contains(&heap)
+                {
+                    if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                        buffers += 1;
+                        placed_bytes += r.desc.width;
+                    } else {
+                        textures += 1;
+                    }
+                }
+            }
+            let largest = self
+                .frame
+                .heaps
+                .iter()
+                .filter(|h| opened.contains(&h.id))
+                .map(|h| h.size)
+                .max()
+                .unwrap_or(0);
+            let line = format!(
+                "{all} heaps ({:.0} MB); {} opened on title memory ({:.0} MB, the largest {:.1} MB), holding {buffers} buffers ({:.0} MB) and {textures} textures{}",
+                mb(all_bytes),
+                opened.len(),
+                mb(opened_bytes),
+                mb(largest),
+                mb(placed_bytes),
+                if leave_opened {
+                    ": left out (VICTORY_REPLAY_OPENED=0)"
+                } else {
+                    ""
+                }
+            );
+            tracing::info!("replay: {line}");
+            self.notes.push(line);
+        }
         for h in &self.frame.heaps {
+            if leave_opened && opened.contains(&h.id) {
+                continue;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
-                Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
+                Properties: props(
+                    &h.props,
+                    only.is_empty() && used_by_buffers_only.contains(&h.id),
+                ),
                 Alignment: h.alignment,
                 Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
             };
@@ -974,7 +1077,11 @@ impl Player {
                         let taken = std::cell::Cell::new(false);
                         let mut m = super::pso::make(&device, &p.parts, root, |i| {
                             let other = shaders.and_then(|dir| {
-                                let own = || frame.codes.get(i as usize).map(|c| c.hash[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                let own = || {
+                                    frame.codes.get(i as usize).map(|c| {
+                                        c.hash[..8].iter().map(|b| format!("{b:02x}")).collect()
+                                    })
+                                };
                                 let hash = title_hash(p, i).map(str::to_owned).or_else(own)?;
                                 std::fs::read(dir.join(format!("{hash}.dxil"))).ok()
                             });
@@ -1418,7 +1525,14 @@ impl Player {
             )?;
             stagings.push((b, data as usize, 0));
         }
+        tracing::info!(
+            "replay: {} parts, {} MB, in {} batches",
+            parts.len(),
+            parts.iter().map(|p| p.1).sum::<u64>() >> 20,
+            batches.len()
+        );
         for (n, batch) in batches.iter().enumerate() {
+            tracing::debug!("replay: batch {n}");
             let k = n % stagings.len();
             self.worker.wait(stagings[k].2)?;
             let map = stagings[k].1;
@@ -2072,7 +2186,11 @@ impl Player {
                 if let Some((list, command)) = o.until
                     && here >= list
                 {
-                    let from = if here > list { 0 } else { (command + 1).min(cmds.len()) };
+                    let from = if here > list {
+                        0
+                    } else {
+                        (command + 1).min(cmds.len())
+                    };
                     let rest = cmds.split_off(from);
                     cmds.extend(edit::barriers_only(rest));
                 }
@@ -3073,7 +3191,8 @@ impl Player {
                 if !o.wait_lists {
                     self.worker.queue.ExecuteCommandLists(all);
                     if o.pace > 0.0 {
-                        let until = Instant::now() + std::time::Duration::from_secs_f64(o.pace / 1e3);
+                        let until =
+                            Instant::now() + std::time::Duration::from_secs_f64(o.pace / 1e3);
                         while Instant::now() < until {
                             std::thread::yield_now();
                         }
@@ -3081,7 +3200,9 @@ impl Player {
                     continue;
                 }
                 for l in all {
-                    self.worker.queue.ExecuteCommandLists(std::slice::from_ref(l));
+                    self.worker
+                        .queue
+                        .ExecuteCommandLists(std::slice::from_ref(l));
                     self.worker.idle()?;
                 }
             }
@@ -3098,8 +3219,17 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
+        self.run_inner(o)
+            .map_err(|e| dred::explain(&self.device, e))
+    }
+
+    fn run_inner(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
-        let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
+        let _awake = if o.awake {
+            crate::host::awake::start(&self.device, || true)
+        } else {
+            None
+        };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
             stamps.push(self.once(o, &mut made)?);
@@ -3162,7 +3292,12 @@ impl Player {
     }
 
     /// The report after the last run.
-    fn finish(&mut self, o: &Options, (built, mut report): (Sends, Report), stamps: &[Vec<u64>]) -> Result<Report> {
+    fn finish(
+        &mut self,
+        o: &Options,
+        (built, mut report): (Sends, Report),
+        stamps: &[Vec<u64>],
+    ) -> Result<Report> {
         if o.detailed {
             self.detail(&built, stamps, o, &mut report);
         }
@@ -3182,7 +3317,11 @@ impl Player {
     fn detail(&self, built: &Sends, stamps: &[Vec<u64>], o: &Options, report: &mut Report) {
         let mut kinds: BTreeMap<&str, (Vec<f64>, u32)> = BTreeMap::new();
         let mut shaders: HashMap<u32, (Vec<f64>, u32)> = HashMap::new();
-        let loops = if stamps.len() > 2 { &stamps[1..] } else { stamps };
+        let loops = if stamps.len() > 2 {
+            &stamps[1..]
+        } else {
+            stamps
+        };
         for stamps in loops {
             let mut of_kind: BTreeMap<&str, (f64, u32)> = BTreeMap::new();
             let mut of_shader: HashMap<u32, (f64, u32)> = HashMap::new();
@@ -3211,7 +3350,9 @@ impl Player {
             }
         }
         let kinds = kinds.into_iter().map(|(k, (ms, n))| (k, (median(&ms), n)));
-        let shaders = shaders.into_iter().map(|(k, (ms, n))| (k, (median(&ms), n)));
+        let shaders = shaders
+            .into_iter()
+            .map(|(k, (ms, n))| (k, (median(&ms), n)));
         report.categories = kinds
             .into_iter()
             .map(|(k, (ms, n))| (k.to_owned(), ms, n))
@@ -3226,7 +3367,11 @@ impl Player {
         report.shaders = all
             .into_iter()
             .map(|(ms, n, pso)| {
-                let name = match self.objects.get(&(pso & !COPY_TO)).filter(|_| pso & COPY_TO != 0) {
+                let name = match self
+                    .objects
+                    .get(&(pso & !COPY_TO))
+                    .filter(|_| pso & COPY_TO != 0)
+                {
                     Some(o) => {
                         let r = &self.frame.resources[o.index];
                         format!("copies to #{} {}", pso & !COPY_TO, r.name)
@@ -3449,7 +3594,11 @@ fn read_at(file: &File, mut to: &mut [u8], mut at: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12Device, Option<ID3D12InfoQueue>)> {
+fn make_device(
+    frame: &Frame,
+    debug: bool,
+    breadcrumbs: bool,
+) -> Result<(ID3D12Device, Option<ID3D12InfoQueue>)> {
     // SAFETY: plain creation and queries.
     unsafe {
         if debug {
