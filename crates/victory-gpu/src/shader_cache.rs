@@ -131,6 +131,15 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // The node-test meter adds code. Only when on, so the translations
+        // cached without it keep their key.
+        if victory_shader::emit::bvh_walk() {
+            bytes.extend_from_slice(b"VICTORY_BVH_WALK=1");
+        }
+        // And the bound on a ray's node tests.
+        if let Some(limit) = victory_shader::emit::bvh_walk_limit() {
+            bytes.extend_from_slice(format!("VICTORY_BVH_WALK_LIMIT={limit}").as_bytes());
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw

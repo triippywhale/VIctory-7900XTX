@@ -134,6 +134,22 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        // (`VICTORY_BVH_WALK_LIMIT`) A lane whose loop has gone round that
+        // often tests no more nodes: no load, and the answer of a node with
+        // nothing in the ray's way.
+        let spent = self.bvh_spent(b);
+        let run = match (guard, spent) {
+            (g, None) => g,
+            (g, Some(s)) => {
+                let c = self.cur;
+                let t = self.s.m.bool(true);
+                let fresh = self.s.m.bin(c, Bin::Xor, s, t);
+                Some(match g {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, fresh),
+                    None => fresh,
+                })
+            }
+        };
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
@@ -164,7 +180,7 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, run);
                 NodeAt::Memory {
                     handle,
                     byte,
@@ -175,13 +191,31 @@ impl<'a> Lower<'a> {
             }
         };
         let zero = self.s.m.i32(0);
-        let gate = self.begin_guarded(guard);
+        // What a lane that does not run the test gets: nothing a masked lane
+        // keeps (its write is guarded), and for a spent one no child of a
+        // box node and a miss of anything else.
+        let mut skipped = [zero; 4];
+        if spent.is_some() {
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, v) in skipped.iter_mut().enumerate() {
+                let miss = self.s.m.i32(bvh::MISS[k].to_bits());
+                *v = self.s.m.select(c, is_box, none, miss);
+            }
+        }
+        let gate = self.begin_guarded(run);
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
         let kind = self.s.m.bin(head, Bin::And, pointer, k7);
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        if crate::emit::bvh_walk() && self.s.threads.is_some() {
+            self.bvh_walk_count(is_box, is_triangle);
+        }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -214,13 +248,69 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            results.push((phi, skipped[k]));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// (`VICTORY_BVH_WALK_LIMIT=<n>`) Whether this lane's innermost loop
+    /// around IR block `b` has gone round `n` times: the loop's own counter
+    /// ([`Lower::counters`], 0 on entry) against the limit. `None` with the
+    /// switch off, outside compute and outside a loop.
+    fn bvh_spent(&mut self, b: usize) -> Option<V> {
+        let limit = crate::emit::bvh_walk_limit()?;
+        self.s.threads?;
+        let p = self.x.p;
+        // The loop of each header: the blocks that reach one of its back
+        // edges without passing it. The smallest that holds `b`.
+        let mut best: Option<(usize, usize, V)> = None;
+        for (&h, &(phi, _)) in &self.counters {
+            let mut inside = std::collections::HashSet::from([h]);
+            let mut work: Vec<usize> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            while let Some(x) = work.pop() {
+                if inside.insert(x) {
+                    work.extend(p.blocks[x].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                }
+            }
+            if inside.contains(&b) && best.is_none_or(|(n, first, _)| (inside.len(), h) < (n, first)) {
+                best = Some((inside.len(), h, phi));
+            }
+        }
+        let (_, _, count) = best?;
+        let limit = self.s.m.i32(limit);
+        Some(self.s.m.cmp(self.cur, pred::IUGE, count, limit))
+    }
+
+    /// (`VICTORY_BVH_WALK=1`) This thread's node test counted in its dword of
+    /// the [`crate::emit::SLOT_WALK`] buffer: 1 for a box node, 0x10000 for a
+    /// triangle.
+    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) {
+        let c = self.cur;
+        let (entry, i32t) = (self.s.entry, self.s.t.i32);
+        let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
+        let x = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+        let y = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
+        let (k12, k2) = (self.s.m.i32(12), self.s.m.i32(2));
+        let mask = self.s.m.i32(crate::emit::WALK_SLOTS - 1);
+        let row = self.s.m.bin(c, Bin::Shl, y, k12);
+        let at = self.s.m.bin(c, Bin::Add, x, row);
+        let at = self.s.m.bin(c, Bin::And, at, mask);
+        let byte = self.s.m.bin(c, Bin::Shl, at, k2);
+        let (one, high) = (self.s.m.i32(1), self.s.m.i32(0x10000));
+        let leaf = self.s.m.select(c, is_triangle, high, k0);
+        let add = self.s.m.select(c, is_box, one, leaf);
+        let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

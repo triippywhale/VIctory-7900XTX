@@ -125,7 +125,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -196,6 +196,50 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
+/// A meter (`VICTORY_BVH_WALK=1`, after Op-lite/victory-scarlett c45b43e): each
+/// ray-tracing node test of a compute program also counts itself in its
+/// thread's dword of the [`SLOT_WALK`] buffer (box and triangle tests apart),
+/// so that the host can tell how many nodes each ray visits. Adds one atomic
+/// per test to a buffer of ours; what the program computes is unchanged. Part
+/// of the translation: the shader cache keys on it.
+pub fn bvh_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_BVH_WALK_LIMIT=<n>` (unset or 0: none): in a compute program a
+/// lane whose loop has gone round `n` times gets no more node tests: a box
+/// node answers with no child and anything else with a miss, without a load,
+/// so the walk runs out of nodes and the program ends as it does for a ray
+/// that hit nothing more. Without it such a lane goes on to the loop limit
+/// (4,096 rounds in compute) and is then killed, its result never written.
+///
+/// What it is for (7900 XT, run rtwalk-B, `VICTORY_BVH_WALK=1`): the title's
+/// rays test 130-370 nodes a thread, median under 256 and p90 under 512, but
+/// 0.2-5.6 % of the two big tracers' threads pass 1,024 and the most is
+/// 4,085-4,089: they go round in a structure that is not right until the
+/// loop limit ends them, and a wave waits for its longest lane. Part of the
+/// translation: the shader cache keys on it.
+pub fn bvh_walk_limit() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if let Some(n) = TEST_WALK_LIMIT.get() {
+        return Some(n);
+    }
+    *LIMIT.get_or_init(|| parse_walk_limit(std::env::var("VICTORY_BVH_WALK_LIMIT").ok().as_deref()))
+}
+
+/// `VICTORY_BVH_WALK_LIMIT`'s value. Pure, for testing.
+fn parse_walk_limit(value: Option<&str>) -> Option<u32> {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`bvh_walk_limit`], for its thread only.
+    pub(crate) static TEST_WALK_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// Whether the structure builder's accesses through its root views stay near
 /// them, and a size in a structure's header that cannot be one counts as none
 /// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
@@ -219,12 +263,23 @@ pub fn builder_bounds() -> bool {
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
 ///   (not on unless asked: `127` is every pass with it).
+/// - `VICTORY_HOIST_LOADS=1` adds `bitcode::opt::HOIST` (128) to whichever
+///   set that gives.
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+    *PASSES.get_or_init(|| {
+        let passes = parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref());
+        // `VICTORY_HOIST_LOADS=1` (after Op-lite/victory-scarlett): reads
+        // reused across blocks and loop-invariant work before the loop.
+        if std::env::var_os("VICTORY_HOIST_LOADS").is_some_and(|v| v == "1") {
+            passes | bitcode::opt::HOIST
+        } else {
+            passes
+        }
+    })
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -1171,7 +1226,7 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), all & !super::bitcode::opt::HOIST);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

@@ -144,6 +144,8 @@ pub(crate) fn line(frames: f64) {
     }
     #[cfg(feature = "diagnostics")]
     crate::host::rtstamps::line(frames);
+    #[cfg(feature = "diagnostics")]
+    crate::host::walk::line(frames);
 }
 
 #[cfg(test)]
