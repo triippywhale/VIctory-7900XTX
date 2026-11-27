@@ -1000,8 +1000,20 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
-/// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+/// memory is looked at again, each counted from the look before. With
+/// `VICTORY_RECHECK_LATE=1` two more looks, at 1,200 and 3,600 frames
+/// ([`recheck_frames`]): in a six-minute run at the source more changes
+/// turned up at the fifth look than at the fourth, so some textures change
+/// later still. Off unless asked: not measured here.
+const RECHECK_FRAMES: [u64; 7] = [4, 12, 40, 120, 400, 1200, 3600];
+
+/// The looks of [`RECHECK_FRAMES`] in use: the first five, or all seven
+/// with `VICTORY_RECHECK_LATE=1`.
+fn recheck_frames() -> &'static [u64] {
+    static LATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let late = *LATE.get_or_init(|| std::env::var_os("VICTORY_RECHECK_LATE").is_some_and(|v| v == "1"));
+    &RECHECK_FRAMES[..if late { 7 } else { 5 }]
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2734,7 +2746,7 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    match recheck_frames().get(usize::from(looks) + 1) {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
