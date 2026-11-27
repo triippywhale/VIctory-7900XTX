@@ -176,16 +176,20 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array_size),
-        mips: u32::from(desc.mip_levels),
-        format: desc.format,
-        samples: desc.sample_count.max(1),
-        swizzle,
-    })
+    texture::Texture::for_gpu(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array_size),
+            mips: u32::from(desc.mip_levels),
+            format: desc.format,
+            samples: desc.sample_count.max(1),
+            swizzle,
+        },
+        crate::console::current().pipes(),
+        0,
+    )
     .ok()
 }
 
