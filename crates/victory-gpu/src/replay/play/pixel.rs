@@ -84,7 +84,10 @@ fn same_shape(a: (f32, f32), b: (f32, f32)) -> bool {
 /// A float from a small one's bits (5 bits of exponent, `mantissa` of
 /// mantissa, no sign).
 fn small(bits: u32, mantissa: u32) -> f32 {
-    let (e, m) = (bits >> mantissa & 31, (bits & ((1 << mantissa) - 1)) as f32);
+    let (e, m) = (
+        bits >> mantissa & 31,
+        (bits & ((1 << mantissa) - 1)) as f32,
+    );
     let unit = (1u32 << mantissa) as f32;
     match e {
         0 => m / unit * 2f32.powi(-14),
@@ -159,9 +162,7 @@ fn texel_text(format: i32, b: &[u8]) -> String {
         _ => Vec::new(),
     };
     let all: Vec<String> = all.iter().map(|v| format!("{v:.5}")).collect();
-    format!("{} {:02x?}", all.join(" "), &b[..n])
-        .trim()
-        .to_owned()
+    format!("{} {:02x?}", all.join(" "), &b[..n]).trim().to_owned()
 }
 
 /// One draw of an indirect call that has many.
@@ -480,9 +481,9 @@ impl Player {
 
     /// Whether a texture is the one in use of those that share its memory.
     fn in_use(&self, states: &States, id: u32) -> bool {
-        self.objects
-            .get(&id)
-            .is_some_and(|o| !self.frame.resources[o.index].idle || states.used.contains_key(&id))
+        self.objects.get(&id).is_some_and(|o| {
+            !self.frame.resources[o.index].idle || states.used.contains_key(&id)
+        })
     }
 
     /// The commands that copy the texels of `spots` to [`PROBE`] from `first`
@@ -668,9 +669,8 @@ impl Player {
                     if looked && c.runs_shaders() {
                         let all = p.texels.iter().map(|t| t.0);
                         let some = p.written && (dispatches || !targets.is_empty());
-                        let all: HashSet<u32> = all
-                            .chain(t.shaped.iter().copied().filter(|_| some))
-                            .collect();
+                        let all: HashSet<u32> =
+                            all.chain(t.shaped.iter().copied().filter(|_| some)).collect();
                         for id in all {
                             let writable = states
                                 .get(id)
@@ -721,15 +721,7 @@ impl Player {
                     let runs = if c.runs_shaders() { pso } else { NONE };
                     let mut take = |before: bool, part: u32, spots: &[Spot], out: &mut Vec<Cmd>| {
                         let first = samples.len() as u64;
-                        self.take(
-                            spots,
-                            first,
-                            &states,
-                            &t,
-                            copied && !before,
-                            &mut scratch,
-                            out,
-                        );
+                        self.take(spots, first, &states, &t, copied && !before, &mut scratch, out);
                         samples.extend(spots.iter().map(|spot| Sample {
                             list: here,
                             command: n,
@@ -741,11 +733,8 @@ impl Player {
                         }));
                     };
                     // What was not seen before this command, as it is now.
-                    let new: Vec<Spot> = spots
-                        .iter()
-                        .filter(|s| known.insert(**s))
-                        .copied()
-                        .collect();
+                    let new: Vec<Spot> =
+                        spots.iter().filter(|s| known.insert(**s)).copied().collect();
                     if !new.is_empty() {
                         take(true, 0, &new, &mut out);
                     }

@@ -438,7 +438,8 @@ pub fn batch_clamps(
                     (source, offset + u64::from(constants[3]), constants[0]),
                 );
                 // What it was clamped for follows: a batch is open by then.
-                let full = |o: &Batch| !o.sources.contains(&source) && o.sources.len() == SOURCES;
+                let full =
+                    |o: &Batch| !o.sources.contains(&source) && o.sources.len() == SOURCES;
                 if dirty && (constants[0] != DISPATCH || careful) || open.as_ref().is_some_and(full)
                 {
                     open = None;
@@ -455,10 +456,7 @@ pub fn batch_clamps(
                             flags: 0,
                             res: NONE,
                         },
-                        moved(
-                            if readable { INDIRECT_ARGUMENT } else { 0 },
-                            UNORDERED_ACCESS,
-                        ),
+                        moved(if readable { INDIRECT_ARGUMENT } else { 0 }, UNORDERED_ACCESS),
                     ],
                 });
                 readable = true;
@@ -904,16 +902,9 @@ mod tests {
         for (careful, batches) in [(false, 3), (true, 4)] {
             let mut jobs = Vec::new();
             let (out, done) = batch_clamps(list.clone(), &clamps, &compute, 99, careful, &mut jobs);
-            assert_eq!(
-                (done.clamps, done.batches, done.jobs),
-                (5, batches, 6),
-                "careful {careful}"
-            );
+            assert_eq!((done.clamps, done.batches, done.jobs), (5, batches, 6), "careful {careful}");
             assert_eq!(jobs.len(), table * batches as usize);
-            let passes = out
-                .iter()
-                .filter(|c| matches!(c, Cmd::Pipeline { pso: BATCH }))
-                .count();
+            let passes = out.iter().filter(|c| matches!(c, Cmd::Pipeline { pso: BATCH })).count();
             assert_eq!(passes, batches as usize);
             // Nothing of the clamps is left; the title's wait is.
             assert!(!out.contains(&pso(9)) && out.contains(&barriers(&[uav(0)])));
@@ -947,11 +938,7 @@ mod tests {
             let sources: Vec<u32> = out
                 .iter()
                 .filter_map(|c| match c {
-                    Cmd::RootView {
-                        param: 1,
-                        va: Va::At { res, .. },
-                        ..
-                    } => Some(*res),
+                    Cmd::RootView { param: 1, va: Va::At { res, .. }, .. } => Some(*res),
                     _ => None,
                 })
                 .collect();
@@ -961,8 +948,7 @@ mod tests {
         }
         // A list without clamps is left as it is.
         let plain = vec![pso(1), go(), barriers(&[uav(0)])];
-        let (out, done) =
-            batch_clamps(plain.clone(), &clamps, &compute, 99, false, &mut Vec::new());
+        let (out, done) = batch_clamps(plain.clone(), &clamps, &compute, 99, false, &mut Vec::new());
         assert_eq!((out, done), (plain, Batched::default()));
     }
 }
