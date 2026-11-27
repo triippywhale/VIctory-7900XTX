@@ -46,7 +46,7 @@ indirect draws whose arguments sit in renderer patch 1's in-place memory being
 prepared before the title's culling had written them; they are now prepared one at
 a time right before they run (`VICTORY_PORT_CONSTANTS_ORDER`, on by default, about
 2-5 ms). Rooms lit only by bounced light are no longer black with ray tracing
-(`VICTORY_AMBIENT_RT=0.7,1.5`, which `Play-Watched.ps1 -RayTracing` sets).
+(`VICTORY_AMBIENT_RT=0.7,1.5`, the default whenever `VICTORY_BVH_BUILDER=1`; `scripts\play.ps1 -RayTracing` sets it too, `VICTORY_AMBIENT_RT=off` turns it off).
 
 Still open: models and textures stay at their lowest detail for a long time while
 the title streams (worst in the intro): the title paces its streaming by its own
@@ -90,6 +90,7 @@ Ports 1 and 5 are on by default (`=0` turns either off): in ray-traced A/B runs 
 | `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
+| `VICTORY_BLANK_RECHECK` | Textures uploaded while their memory still read all zeros (mapped, not yet streamed into: black surfaces such as the cell block's lockers) are looked at again (every 8 frames, growing to 64) until they fill (on by default; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
 
 What is known to be wrong:

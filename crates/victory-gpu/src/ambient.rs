@@ -102,7 +102,8 @@ fn set() -> Set {
 }
 
 /// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
-/// off, the title's own light whenever the builder runs): the diffuse light
+/// [`DEFAULT_BAND`] when the builder is asked for, `VICTORY_BVH_BUILDER=1`;
+/// `off`: the title's own light whenever the builder runs): the diffuse light
 /// the title's resolve leaves is kept between `least` and `most` times the
 /// estimate (level: the share of the estimate when `VICTORY_AMBIENT` is not
 /// set, 0.8). The title's traced light flickers and goes black indoors while
@@ -115,13 +116,31 @@ pub(crate) struct Band {
     level: f32,
 }
 
+/// The band with rays when `VICTORY_AMBIENT_RT` is not set. Without one,
+/// the title's traced light was left as it came: black interiors (the day
+/// room) and black blocks of the screen probes' tiles on shaded walls (run
+/// capture-port1, 2026-11-27: `scripts/play.ps1 -RayTracing` did not set
+/// the band the README said it did).
+const DEFAULT_BAND: Band = Band { least: 0.7, most: 1.5, level: 0.8 };
+
 pub(crate) fn rt_band() -> Option<Band> {
     static SET: OnceLock<Option<Band>> = OnceLock::new();
     *SET.get_or_init(|| {
-        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        let asked = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let band = band_from(std::env::var("VICTORY_AMBIENT_RT").ok().as_deref(), asked)?;
         tracing::info!(least = band.least, most = band.most, level = band.level, "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)");
         Some(band)
     })
+}
+
+/// The band for `VICTORY_AMBIENT_RT` (None: not set), with the builder
+/// asked for or not.
+fn band_from(set: Option<&str>, builder_asked: bool) -> Option<Band> {
+    match set.map(str::trim) {
+        None | Some("") => builder_asked.then_some(DEFAULT_BAND),
+        Some("0" | "off") => None,
+        Some(set) => parse_band(set),
+    }
 }
 
 fn parse_band(set: &str) -> Option<Band> {
@@ -697,6 +716,13 @@ mod tests {
         assert_eq!(parse_band("0.7"), Some(Band { least: 0.7, most: 4.0, level: 0.8 }));
         assert_eq!(parse_band(""), None);
         assert_eq!(parse_band("x,1"), None);
+        // Unset: the default band with the builder asked for, none without.
+        assert_eq!(band_from(None, true), Some(DEFAULT_BAND));
+        assert_eq!(band_from(Some(""), true), Some(DEFAULT_BAND));
+        assert_eq!(band_from(None, false), None);
+        assert_eq!(band_from(Some("off"), true), None);
+        assert_eq!(band_from(Some("0"), true), None);
+        assert_eq!(band_from(Some("0.5,4"), false), Some(Band { least: 0.5, most: 4.0, level: 0.8 }));
     }
 
     #[test]

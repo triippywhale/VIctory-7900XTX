@@ -1,7 +1,8 @@
 # Starts the title with the settings this fork is played with (README.md, "How to run it").
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
-# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower;
+#               kept in a band of the stand-in's estimate (VICTORY_AMBIENT_RT=0.7,1.5)
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
@@ -64,7 +65,7 @@ if ($Safe) {
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192' }
+if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192'; $settings.VICTORY_AMBIENT_RT = '0.7,1.5' }
 if ($CpuPorts) { $settings.VICTORY_AFFINITY = 'free'; $settings.VICTORY_TABLE_MEMO = '1' }
 if ($CardLists) { $settings.VICTORY_CARD_LISTS = '1' }
 if ($LateLists -gt 0) { $settings.VICTORY_LATE_WAIT_LISTS = "$LateLists" }

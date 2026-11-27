@@ -1062,6 +1062,9 @@ pub(crate) struct TextureRecheck {
     /// A look found this view's memory changed with nothing to tell of
     /// it: such a texture is looked at for as long as the view stays.
     pub(crate) changed_in_place: bool,
+    /// Every byte the fingerprint read was zero at the upload: memory the
+    /// title mapped and fills later. Looked at often until it changes.
+    pub(crate) blank: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -6313,6 +6316,7 @@ mod tests {
             unchanged_looks: 4,
             uploaded: 1,
             changed_in_place: true,
+            blank: false,
         };
         queue.recheck(1, write, 401, checked);
         assert!(queue.due(400, 1).is_empty());
