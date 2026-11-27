@@ -1025,6 +1025,12 @@ pub(crate) fn library_removal_note() -> String {
     library::removal_note()
 }
 
+/// The folder the pipeline library is kept in, if a cache folder is set.
+#[cfg(windows)]
+pub(crate) fn cache_folder() -> Option<std::path::PathBuf> {
+    library::folder()
+}
+
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]

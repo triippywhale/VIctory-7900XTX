@@ -105,6 +105,15 @@ fn pass(host: &Host) -> Option<&'static Pass> {
     .as_ref()
 }
 
+impl Host {
+    /// The pass made ahead of the first submission (`crate::helpers`).
+    pub(crate) fn send_ahead(&self) {
+        if own() {
+            let _ = pass(self);
+        }
+    }
+}
+
 /// Memory a submission's sends come from, mapped.
 pub(super) struct Memory {
     buffer: ID3D12Resource,
