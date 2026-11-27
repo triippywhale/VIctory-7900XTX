@@ -1138,6 +1138,10 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A raw buffer SRV over these dwords from dword `first` on (as the
+    /// host makes the raw twin of a constant buffer's slot with renderer
+    /// port 5, at the constant buffer's own byte offset in a bigger buffer).
+    RawAt { data: &'a [u32], first: u32 },
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1453,6 +1457,24 @@ impl Host {
                             }),
                             at,
                         );
+                        keep.push(b);
+                    }
+                    View::RawAt { data, first } => {
+                        let b = upload(data)?;
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_TYPELESS,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    FirstElement: u64::from(first),
+                                    NumElements: data.len() as u32 - first,
+                                    StructureByteStride: 0,
+                                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
                     View::Buffer { data, stride } => {
