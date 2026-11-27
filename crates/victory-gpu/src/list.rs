@@ -1614,6 +1614,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            with_state(this, |_, state| state.waited());
             #[cfg(feature = "diagnostics")]
             {
                 // The shapes of the title's calls, each once.
@@ -2222,7 +2223,10 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        with_state(this, |_, state| {
+            state.synced();
+            state.waited();
+        });
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
