@@ -65,6 +65,12 @@ impl DynamicSlots {
         Some(first)
     }
 
+    /// How many slots are free (tests).
+    #[cfg(test)]
+    pub(super) fn available(&self) -> u32 {
+        self.available
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(super) fn is_taken(&self, slot: u32) -> Option<bool> {
         (slot < self.limit).then(|| {

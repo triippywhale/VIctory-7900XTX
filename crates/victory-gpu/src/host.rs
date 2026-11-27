@@ -2759,6 +2759,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+    /// By host texture (a view placed in the memory of a texture the card
+    /// writes): the last card-written source the list copied into it.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -7437,7 +7440,7 @@ impl HostList {
         let wrote = std::mem::take(&mut *self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner()));
         for source in wrote {
             for (placed, shown) in crate::resource::picked_aliases_of(source as crate::object::This) {
-                if crate::texture::alias(self, placed, shown) {
+                if crate::texture::alias(self, placed, shown.get()) {
                     crate::texture::PICKED_ALIAS_COPIES.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -8188,6 +8191,14 @@ impl HostList {
     /// reset.
     pub(crate) fn used(&self, key: usize) -> bool {
         self.deferred().textures.contains(&key)
+    }
+
+    /// Whether `source` is not the last card-written texture the list
+    /// copied into `view` (and records it as that from now on).
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

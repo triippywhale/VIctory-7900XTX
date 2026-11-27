@@ -57,6 +57,10 @@ pub(crate) struct Heap {
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
     host: std::sync::OnceLock<Option<host::HostHeap>>,
+    /// Which heap this is of all made in the run ([`Heap::serial`]): a heap
+    /// made later at the same address has another.
+    #[cfg(windows)]
+    serial: u64,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -74,6 +78,13 @@ impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
+    }
+
+    /// Which heap this is of all made in the run: unlike its address, never
+    /// that of a later heap.
+    #[cfg(windows)]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The host heap, made on first use from what the title wrote so far.
@@ -860,15 +871,22 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// `heap`, if that heap still exists and is the one they were taken from
+/// (`serial`, [`Heap::serial`]). A list holds its slots until it has run,
+/// is reset or released; a heap dropped meanwhile and another made at its
+/// address was given slots back that it never handed out, which another
+/// list may have taken since (two tables in one slot).
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(heap: usize, serial: u64, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
+    if heaps.iter().any(|&(_, _, h)| h == heap) {
         // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+        let heap = unsafe { &*(heap as *const Heap) };
+        if heap.serial == serial
+            && let Some(Some(host)) = heap.host.get()
+        {
+            host.release(first, n);
+        }
     }
 }
 
@@ -1751,6 +1769,11 @@ pub(crate) extern "system" fn create_heap(
         #[cfg(windows)]
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
+        serial: {
+            static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        },
+        #[cfg(windows)]
         pending: Default::default(),
         #[cfg(windows)]
         written: (placed && visible)
@@ -1874,6 +1897,32 @@ mod tests {
 
         create_cbv(std::ptr::null(), std::ptr::null(), handle);
         assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
+    /// Dynamic slots go back only to the heap they were taken from, not to
+    /// another heap that has its address now (a list reset after its heap
+    /// was released and another made in its place).
+    #[cfg(windows)]
+    #[test]
+    fn dynamic_slots_go_back_only_to_their_own_heap() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        with_test_view_heap(|title| {
+            let at = std::ptr::from_ref(title) as usize;
+            let host_heap = title.host().expect("a host view heap");
+            let first = host_heap.dynamic(1).expect("a dynamic slot");
+            let free = host_heap.dynamic_free();
+            // Taken while another heap was at this address.
+            release_dynamic(at, title.serial() + 1, first, 1);
+            assert_eq!(
+                host_heap.dynamic_free(),
+                free,
+                "a slot went back to a heap that never gave it out"
+            );
+            release_dynamic(at, title.serial(), first, 1);
+            assert_eq!(host_heap.dynamic_free(), free + 1);
+        });
     }
 
     #[test]

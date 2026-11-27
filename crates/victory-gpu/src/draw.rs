@@ -537,9 +537,10 @@ pub(crate) struct State {
     /// (`VICTORY_TABLE_MEMO`) Root views brought up to date in this list:
     /// (address, kind) -> (epoch after, host address).
     view_memo: std::collections::HashMap<(u64, u8), (u64, Option<u64>), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// The dynamic slots the list holds: title heap (address and
+    /// [`crate::descriptor::Heap::serial`]), first, count; given back when
+    /// the list has run, is reset or released, to that heap only.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -568,14 +569,14 @@ impl State {
         count: u32,
     ) -> Option<u32> {
         let first = host.dynamic(count)?;
-        self.dynamic.push((std::ptr::from_ref(heap) as usize, first, count));
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, heap.serial(), first, count));
         Some(first)
     }
 
     /// Release the GPU's descriptor slots while keeping the list's other state alive.
     pub(crate) fn release_dynamic_slots(&mut self) {
-        for (heap, first, count) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, count);
+        for (heap, serial, first, count) in self.dynamic.drain(..) {
+            crate::descriptor::release_dynamic(heap, serial, first, count);
         }
     }
 
@@ -643,7 +644,7 @@ fn memo_copy(view: &crate::descriptor::View) -> Option<Seen> {
     // A view in another format over a texture the card writes: its texels
     // are copied in when the source was written since the last copy
     // (`crate::texture::alias`), which no change of the list's says.
-    let aliased = |r: usize| crate::resource::alias_of(r as This).is_some();
+    let aliased = |r: usize| crate::resource::is_alias(r as This);
     if let View::Shader(r, _) | View::Unordered(r, _, _) = view
         && aliased(*r)
     {
@@ -2951,6 +2952,8 @@ impl State {
                 && crate::resource::alias_picked()
                 && let Some(source) = crate::resource::alias_of(resource)
             {
+                // (Held until the copy is recorded.)
+                let source = source.get();
                 crate::resource::picked_alias(resource, source);
                 let copied = crate::texture::alias(list, resource, source);
                 #[cfg(feature = "diagnostics")]
@@ -5060,7 +5063,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             #[cfg(feature = "diagnostics")]
             if !aliased && placed.is_some() {
                 crate::resource::alias_watch(*resource as This);
