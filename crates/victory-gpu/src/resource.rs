@@ -4216,6 +4216,100 @@ mod tests {
         }
     }
 
+    /// An upload of a view from title memory earlier in a list does not
+    /// keep a later alias copy from the card-written texture under it out
+    /// of the list: the view reads the card's texels (after PalmVI
+    /// 36f32693f).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_card_texture() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let pattern = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(pattern);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy holds at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, pattern, "the view kept the upload from title memory, not the card's texels");
+    }
+
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin
