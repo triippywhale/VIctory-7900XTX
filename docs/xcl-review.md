@@ -63,4 +63,43 @@ cached translations are made again (`victory shaders`).
 - BCPack lookup tables (558d10a5): `docs/README-fxceless.md` measured loading
   as limited by writes into title memory, not by unpacking.
 
+## Porting rather than watching (asked 2026-11-27)
+
+xcl patches none of the title's code: everything it does is at the console
+library boundary (its own `d3d12_xs`, `kernelx`) plus hooks on Windows
+functions (`hooks.rs`, `retour`). What it has that is closest to porting:
+
+- **All graphics memory in place.** The title's graphics allocations live in
+  4 GiB windows that are opened as heaps (`gpu/uma.rs`,
+  `OpenExistingHeapFromAddress`); shaders reach them by address. Our renderer
+  port 1 does the same for the 32-bit graphics heap only.
+- **The cost they found.** On an RTX 5090 a shader's dependent reads from such
+  memory are about 30x slower than from video memory, and stores whose lanes
+  leave gaps run at ~0.1 GB/s (4c14c537). The retail title's world passes took
+  0.4-2.7 s each with its 4.4 GB of heaps there, so `XCL_COHERENT_HEAPS=sparse`
+  moves big heaps back to video memory with uploads before each submission (a
+  watched copy again). Lesson for us: in-place is cheap for memory the CPU
+  writes and the GPU reads once (constants), not for memory shaders work on.
+- **A driver heap at the title's address** (f2248f06, `uma_driver.rs`). On an
+  RTX 5070 Ti, GPU loads from imported pages ran 8-24x and atomics 13-22x
+  slower than from a driver-made `CUSTOM` write-back L0 heap with the same
+  caching; a replayed frame took 1,427 ms of GPU time imported, 172 ms in the
+  driver heap. xcl copies the window's pages out, releases the window,
+  reserves every other large free stretch for a moment so the driver's CPU
+  mapping of a new heap can only land in the hole, and copies the pages back:
+  the title keeps its pointers. On for NVIDIA only; never measured on AMD.
+  Port 1 opens the title's pages by import (`OpenExistingHeapFromAddress1`),
+  so the same gap may cost us card time. `VICTORY_INPLACE_PROBE` already
+  times the card copying imported memory against a driver `CUSTOM` L0 buffer;
+  a copy measures bandwidth, not the dependent loads xcl found slow, so the
+  probe would need a dependent-load pass to answer it on the 7900. Port 1's
+  pages are a view of a section the title also maps itself, so xcl's trick
+  does not drop in: the section would have to be the driver's heap.
+- **Command lists that never have room** (`title_list`): the title's inlined
+  writers call list methods instead of writing packets. Ours does the same
+  (`victory-gpu/src/lib.rs`).
+- **Console `CreateCommittedResource`**: buffers made by console code go to
+  unified memory and textures get console-sized memory at a title address,
+  so `GetGPUVirtualAddress` is a CPU address the title can memset.
+
 None of this was run in the game here.
