@@ -118,7 +118,7 @@ pub const HUGE: f32 = 1e7;
 
 /// A box with a coordinate past [`HUGE`] or not finite.
 pub fn huge(b: &Aabb) -> bool {
-    b.iter().any(|x| !(x.abs() <= HUGE))
+    b.iter().any(|x| x.is_nan() || x.abs() > HUGE)
 }
 
 fn valid(b: &Aabb) -> bool {
