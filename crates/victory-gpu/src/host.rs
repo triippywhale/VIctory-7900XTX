@@ -3156,7 +3156,7 @@ fn late_most() -> usize {
 }
 
 /// Whether the flights get more room before they are settled
-/// (`VICTORY_SETTLE_ROOM=1`, read once here; off by default): twice the
+/// (`VICTORY_SETTLE_ROOM`, read once here; on unless `=0`): twice the
 /// lists in the air ([`late_most`]) and eight times the changed runs the
 /// merge under the flights' writes takes ([`merge_runs`], up to its bound).
 /// The source measured 11.5 ms less of the preparing thread's work at
@@ -3168,7 +3168,7 @@ fn late_most() -> usize {
 /// (After fxceless 06702fe, PalmVI b7bbf59f4.)
 fn settle_room() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_SETTLE_ROOM").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_SETTLE_ROOM").map_or(true, |v| v.trim() != "0"))
 }
 
 fn lists_with_room(most: usize, room: bool) -> usize {

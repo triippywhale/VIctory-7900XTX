@@ -768,8 +768,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 const PORT_WHOLE: usize = 512 << 20;
 
 /// The most 64 KiB pages one section of an allocation holds
-/// (`VICTORY_XMEM_SECTION_MB=<MB>`, read once here; the source measured
-/// 2); `None` (unset, 0 or not a number: the default): one section for the
+/// (`VICTORY_XMEM_SECTION_MB=<MB>`, read once here; 2 when unset, as the
+/// source measured); `None` (0 or not a number): one section for the
 /// whole allocation, as before. With renderer port 1 on, allocations of up
 /// to [`PORT_WHOLE`] stay whole ([`pieces`]).
 ///
@@ -791,7 +791,11 @@ const PORT_WHOLE: usize = 512 << 20;
 fn section_pages() -> Option<usize> {
     static PAGES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *PAGES.get_or_init(|| {
-        let mb: usize = std::env::var("VICTORY_XMEM_SECTION_MB").ok()?.trim().parse().ok()?;
+        // 2 MB unless given; `=0` keeps each allocation one section.
+        let mb: usize = match std::env::var("VICTORY_XMEM_SECTION_MB") {
+            Ok(v) => v.trim().parse().ok()?,
+            Err(_) => 2,
+        };
         (mb > 0).then(|| mb.saturating_mul(1 << 20).div_ceil(PAGE).max(1))
     })
 }
@@ -2251,7 +2255,7 @@ mod tests {
     #[test]
     fn an_allocation_is_cut_into_sections_unless_the_port_could_open_it() {
         let cut = |n, most, port| pieces(n, most, port).collect::<Vec<usize>>();
-        // Unset: one section, as before, whatever the port.
+        // `=0`: one section, as before, whatever the port.
         assert_eq!(cut(100_000, None, false), [100_000]);
         assert_eq!(cut(100_000, None, true), [100_000]);
         // 2 MB pieces of 64 KiB pages: 32 pages each, the rest in the last.

@@ -1169,8 +1169,8 @@ fn ask_rest(ranges: &[(usize, usize)], held: bool) {
 
 /// Whether [`ask_once`] has the guards look at the view memory a
 /// submission refreshes once, before its first refresh, as the kernel is
-/// asked about the rest (`VICTORY_VIEW_ONCE=1`, read once here; off by
-/// default; only with [`once`]).
+/// asked about the rest (`VICTORY_VIEW_ONCE`, read once here; on unless
+/// `=0`; only with [`once`]).
 ///
 /// A refresh of view memory that is not known clean by its bits goes to
 /// the guards ([`writes`], [`guard`]): blocks the title wrote since, and
@@ -1193,7 +1193,7 @@ fn view_once() -> bool {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_VIEW_ONCE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_VIEW_ONCE").map_or(true, |v| v.trim() != "0"))
 }
 
 #[cfg(test)]
@@ -1214,7 +1214,7 @@ pub(crate) fn view_once_line(frames: f64) {
     }
     let n: Vec<f64> = VIEW_ONCE.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "view memory looked at once per submission (VICTORY_VIEW_ONCE=1) per frame: {:.1} ranges looked at by the guards ahead of the \
+        "view memory looked at once per submission (VICTORY_VIEW_ONCE) per frame: {:.1} ranges looked at by the guards ahead of the \
          refreshes, {:.1} pages of 64 KiB found written",
         n[0],
         n[1],
