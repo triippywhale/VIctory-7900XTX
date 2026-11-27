@@ -32,7 +32,10 @@
 #               (<cache>\pipelines\host-pipelines.*, prebuilt-pipelines.txt, warm-done.txt and
 #               <cache>\shaders), so that everything is made again from this build. Keeps what
 #               only runs can find out: known-*.bin, early-, slow-, crashed-pipelines.txt and
-#               warm-bad.txt. For artifacts that look like a stale cache, not for every run: the
+#               warm-bad.txt (the pipelines the driver's compiler crashed on: each line says
+#               under which translator and driver, and a new build or driver tries them again
+#               by itself; VICTORY_WARM_BAD=0 tries them in one run all the same).
+#               For artifacts that look like a stale cache, not for every run: the
 #               pre-build after it is a cold one (minutes; far longer with VICTORY_LIBRARY_LOCK=1).
 #               The driver's own shader cache is not touched (AMD Software: Reset Shader Cache).
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.

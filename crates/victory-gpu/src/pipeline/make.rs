@@ -158,12 +158,37 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
 /// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
-/// leaves the file unread.
+/// (`warm-bad.txt` beside the pipeline library; a line is the translator
+/// and driver it crashed under ([`bad_under`]), the key, then anything; `#`
+/// begins a comment), loaded on first use. A line of another translator or
+/// driver, or of before the lines said which, is not honoured: a pipeline
+/// the compiler crashed on once was left out for good, though a fix to the
+/// translation or a new driver may make it. `VICTORY_WARM_BAD=0` leaves the
+/// file unread.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
+/// The translator with its settings and the driver that this run's crashes
+/// are noted under, as `victory warm` notes its own.
+fn bad_under() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(super::known::fingerprint)
+}
+
+/// The keys `listed` names as bad under `fingerprint`.
+fn bad_listed(listed: &str, fingerprint: &str) -> std::collections::HashSet<String> {
+    listed
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next()? == fingerprint).then(|| words.next().map(str::to_owned))?
+        })
+        .collect()
+}
+
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    // (Before the lock: the fingerprint asks the host.)
+    let fingerprint = bad_under();
     let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let keys = keys.get_or_insert_with(|| {
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
@@ -172,12 +197,7 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+        bad_listed(&listed, fingerprint)
     });
     f(keys)
 }
@@ -352,7 +372,7 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let _ = writeln!(f, "{} {} ended the compiler in a run: {:?}", bad_under(), p.key, p.shaders);
         }
     }
     let _ = p.made.set(None);
@@ -466,11 +486,62 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
                     "ray-tracing resolves dropped while their pipeline is being made, not waited for (VICTORY_PIPELINE_RESOLVE_WAIT=1: waited for)"
                 );
             }
+        } else if p.graphics.is_none() && compute_waits() {
+            wait_until_made(p);
         } else {
             wait(p, crate::frame::current());
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there
+/// (`VICTORY_PIPELINE_COMPUTE_WAIT=1`; fxceless/victory-fork #1312).
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: a title can run some compute passes once, when a scene changes,
+/// and what they leave is read for as long as the scene lasts. A compute
+/// program met for the first time that takes seconds to make lost its one
+/// dispatch after the budget, and the picture stayed wrong until the scene
+/// ended (4.4 s to make at the source, against half a second of budget). A
+/// wait of seconds once against a picture wrong until the scene ends.
+/// Off unless asked: the stall is not measured here, and the pre-build has
+/// most pipelines made before a run. Unset, a dispatch waits within the
+/// budget, as before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Waits for `p` until a worker has made it or it is given up (refused, on
+/// the list of bad ones, or the compiler crashed under its worker: `lost`
+/// says so here too). Not made on this thread, as at the source: a compile
+/// of ours is not kept to one thread by a `OnceLock`, and a compiler crash
+/// is caught on a worker alone.
+fn wait_until_made(p: &Pending) {
+    let waiting = crate::timeline::span("pipeline: a dispatch waits for its compute pipeline");
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        // (timed: a notification may come between the test and the wait)
+        held = done.wait_timeout(held, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    waiting.end();
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(500) {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            made = p.made.get().is_some_and(Option::is_some),
+            shaders = ?p.shaders,
+            "a dispatch waited for its compute pipeline past the frame's budget (VICTORY_PIPELINE_COMPUTE_WAIT=1)"
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
@@ -1160,6 +1231,24 @@ mod low_memory_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline the compiler crashed on is left out only under the
+    /// translator and driver it crashed under; lines of another, and lines
+    /// of before they said which (a key first), are tried again.
+    #[test]
+    fn a_bad_pipeline_is_tried_again_by_another_translator_or_driver() {
+        let listed = "1111 aaaa ended the compiler in a run: [compute x]\n\
+                      2222 bbbb exit code: 101\n\
+                      cccc ended the compiler in a run: [compute z]\n\
+                      \n\
+                      # 1111 eeee\n\
+                      1111 dddd\n\
+                      1111\n";
+        let keys = |of| bad_listed(listed, of);
+        assert_eq!(keys("1111"), std::collections::HashSet::from(["aaaa".to_owned(), "dddd".to_owned()]));
+        assert_eq!(keys("2222"), std::collections::HashSet::from(["bbbb".to_owned()]));
+        assert!(keys("3333").is_empty());
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

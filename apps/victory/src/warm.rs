@@ -38,16 +38,12 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
+    let done = recorded_keys(&listed, &fingerprint);
+    // The bad ones too are those of this translator and driver: a pipeline
+    // the compiler crashed or hung on once was left out for good, though a
+    // fix to the translation or a new driver may make it.
     let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
+    let bad = recorded_keys(&bad, &fingerprint);
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
     // Those earlier runs drew with first, the others in no order (by key).
@@ -93,7 +89,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         },
         |n, why| {
             println!("pipeline {n} {}: {why}", keys[n]);
-            let _ = writeln!(lock(&bad_out), "{} {why}", keys[n]);
+            let _ = writeln!(lock(&bad_out), "{fingerprint} {} {why}", keys[n]);
             lock(&state).2 += 1;
         },
     )?;
@@ -135,7 +131,7 @@ fn run_batches(
                         }
                         let outcome = start(rest)
                             .context("could not start warm worker")
-                            .and_then(|process| child(process, &each));
+                            .and_then(|process| child(process, rest, &each));
                         match outcome {
                             Ok(Some((made, why))) => {
                                 let remaining = &rest[made.min(rest.len())..];
@@ -159,8 +155,87 @@ fn run_batches(
     failure.into_inner().map_or(Ok(()), Err)
 }
 
+/// The keys `records` notes under `fingerprint` (the translator with its
+/// settings, and the driver): a line is the fingerprint, the key, then
+/// anything. Those of another fingerprint, and those of before the lines
+/// had one, are made again.
+fn recorded_keys<'a>(records: &'a str, fingerprint: &str) -> HashSet<&'a str> {
+    records
+        .lines()
+        .filter_map(|line| {
+            let (of, rest) = line.split_once(' ')?;
+            if of != fingerprint {
+                return None;
+            }
+            rest.split_ascii_whitespace().next()
+        })
+        .collect()
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a worker has said so far of the pipelines it was handed: how many
+/// it made, and whether it is at one now.
+#[derive(Default)]
+struct Progress {
+    made: usize,
+    active: bool,
+}
+
+impl Progress {
+    /// A line of the worker's (`at <n>`, `made <n> <ms> <0|1>`; anything
+    /// else is passed over): what it made, if it says so. A line out of
+    /// turn is an error: nothing can be said of the pipelines after it.
+    fn record(&mut self, these: &[usize], line: &str) -> Result<Option<(usize, f64, bool)>> {
+        let mut words = line.split_ascii_whitespace();
+        let kind = match words.next() {
+            Some(kind @ ("at" | "made")) => kind,
+            _ => return Ok(None),
+        };
+        let n: usize = words.next().context("missing warm worker index")?.parse()?;
+        anyhow::ensure!(these.get(self.made) == Some(&n), "unexpected warm worker index {n}");
+        if kind == "at" {
+            anyhow::ensure!(!self.active && words.next().is_none(), "invalid warm worker start for {n}");
+            self.active = true;
+            return Ok(None);
+        }
+        let ms: f64 = words.next().context("missing warm worker duration")?.parse()?;
+        let there = match words.next() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => anyhow::bail!("invalid warm worker result for {n}"),
+        };
+        anyhow::ensure!(
+            self.active && ms.is_finite() && ms >= 0.0 && words.next().is_none(),
+            "invalid warm worker completion for {n}"
+        );
+        self.active = false;
+        self.made += 1;
+        Ok(Some((n, ms, there)))
+    }
+
+    /// The worker ended, badly with `failure`: none if it made all `count`,
+    /// or how many it made and why it ended at the next. One that ended
+    /// between two pipelines, or well without making them all, is an error:
+    /// the pipeline after the last one made had not been started, and was
+    /// written down as bad all the same.
+    fn finish(self, count: usize, failure: Option<String>) -> Result<Option<(usize, String)>> {
+        if let Some(reason) = failure {
+            if self.active {
+                // It said which pipeline it was making.
+                return Ok(Some((self.made, reason)));
+            }
+            anyhow::bail!("warm worker ended between pipelines after {} of {count}: {reason}", self.made);
+        }
+        anyhow::ensure!(
+            self.made == count,
+            "warm worker exited successfully after reporting {} of {count} pipelines",
+            self.made
+        );
+        Ok(None)
+    }
 }
 
 fn start_worker(these: &[usize]) -> Result<Child> {
@@ -178,8 +253,9 @@ fn start_worker(these: &[usize]) -> Result<Child> {
         .with_context(|| format!("could not spawn {}", exe.display()))
 }
 
-/// On abnormal exit, return the number of reports before the failure and the exit reason.
-fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
+/// Follows a worker making `these`. On abnormal exit, return the number of
+/// reports before the failure and the exit reason ([`Progress::finish`]).
+fn child(mut process: Child, these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
         process.wait().context("warm worker stdout unavailable, failed to reap worker")?;
@@ -188,8 +264,8 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
     let process = Mutex::new(process);
     let (heard, over) = (Mutex::new(Instant::now()), AtomicBool::new(false));
     let hung = AtomicBool::new(false);
-    let mut made = 0;
-    std::thread::scope(|s| {
+    let mut progress = Progress::default();
+    let read = std::thread::scope(|s| {
         s.spawn(|| {
             while !over.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
@@ -200,30 +276,29 @@ fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<O
                 }
             }
         });
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            *lock(&heard) = Instant::now();
-            let mut words = line.split(' ');
-            if words.next() == Some("made")
-                && let (Some(n), Some(ms), Some(there)) = (words.next(), words.next(), words.next())
-                && let (Ok(n), Ok(ms)) = (n.parse(), ms.parse())
-            {
-                made += 1;
-                each(n, ms, there == "1");
+        let read = (|| -> Result<()> {
+            for line in BufReader::new(out).lines() {
+                let line = line.context("reading warm worker output")?;
+                *lock(&heard) = Instant::now();
+                if let Some((n, ms, there)) = progress.record(these, &line)? {
+                    each(n, ms, there);
+                }
             }
+            Ok(())
+        })();
+        if read.is_err() {
+            let _ = lock(&process).kill();
         }
         over.store(true, Ordering::Relaxed);
+        read
     });
-    let status = lock(&process).wait();
-    let well = status.as_ref().is_ok_and(|s| s.success());
-    if well {
-        return Ok(None);
+    let status = lock(&process).wait().context("waiting for the pipeline warm worker")?;
+    read?;
+    if status.success() {
+        return progress.finish(these.len(), None);
     }
-    let why = if hung.load(Ordering::Relaxed) {
-        format!("hung for {} s", LONGEST.as_secs())
-    } else {
-        status.map_or_else(|e| e.to_string(), |s| format!("{s}"))
-    };
-    Ok(Some((made, why)))
+    let why = if hung.load(Ordering::Relaxed) { format!("hung for {} s", LONGEST.as_secs()) } else { status.to_string() };
+    progress.finish(these.len(), Some(why))
 }
 
 /// What such a process does.
@@ -261,6 +336,71 @@ mod tests {
             .stdout(stdout)
             .stderr(Stdio::null())
             .spawn()?)
+    }
+
+    #[test]
+    fn warm_results_follow_the_translator_and_driver() {
+        let records = "current crashed exit code: 101\n\
+                       current finished\n\
+                       previous slow timed out\n\
+                       legacy-key exit code: 101\n\
+                       current\n";
+        assert_eq!(recorded_keys(records, "current"), HashSet::from(["crashed", "finished"]));
+        assert_eq!(recorded_keys(records, "previous"), HashSet::from(["slow"]));
+        assert!(recorded_keys(records, "new").is_empty());
+    }
+
+    #[test]
+    fn only_a_failed_worker_with_a_current_pipeline_marks_it_bad() {
+        let chunk = [9, 2, 7];
+        let mut p = Progress::default();
+        p.record(&chunk, "at 9").unwrap();
+        assert_eq!(p.record(&chunk, "made 9 3.00 0").unwrap(), Some((9, 3.0, false)));
+        assert!(p.finish(3, Some("exit 101".into())).is_err());
+
+        let mut p = Progress::default();
+        p.record(&chunk, "at 9").unwrap();
+        p.record(&chunk, "made 9 1.00 1").unwrap();
+        p.record(&chunk, "at 2").unwrap();
+        assert_eq!(p.finish(3, Some("exit 101".into())).unwrap(), Some((1, "exit 101".into())));
+    }
+
+    #[test]
+    fn incomplete_or_out_of_order_results_leave_the_rest_retryable() {
+        let chunk = [7, 3];
+        assert!(Progress::default().finish(2, None).is_err());
+        assert!(Progress::default().finish(2, Some("exit 1".into())).is_err());
+        let mut p = Progress::default();
+        assert!(p.record(&chunk, "made 7 0.1 1").is_err());
+        assert!(p.record(&chunk, "at 3").is_err());
+        assert!(p.record(&chunk, "diagnostic output").unwrap().is_none());
+        p.record(&chunk, "at 7").unwrap();
+        assert!(p.record(&chunk, "made 3 0.0 0").is_err());
+        assert!(p.record(&chunk, "made 7 0.0 ?").is_err());
+        assert!(p.finish(2, None).is_err());
+        let mut p = Progress::default();
+        for n in chunk {
+            p.record(&chunk, &format!("at {n}")).unwrap();
+            p.record(&chunk, &format!("made {n} 0.00 0")).unwrap();
+        }
+        assert_eq!(p.finish(2, None).unwrap(), None);
+    }
+
+    /// A worker that ends badly between two pipelines stops the warm-up and
+    /// names no pipeline bad: the next one had not been started.
+    #[test]
+    fn a_worker_ending_between_pipelines_marks_none_bad() {
+        let done = Mutex::new(Vec::new());
+        let error = run_batches(
+            &[7, 8],
+            1,
+            |_| fake_child("echo at 7&echo made 7 1.0 1&exit /b 7", Stdio::piped()),
+            |n, _, _| lock(&done).push(n),
+            |_, _| panic!("unexpected bad pipeline"),
+        )
+        .unwrap_err();
+        assert_eq!(*lock(&done), [7]);
+        assert!(format!("{error:#}").contains("between pipelines"));
     }
 
     #[test]
@@ -309,8 +449,8 @@ mod tests {
             &[7, 8, 9],
             1,
             |rest| match rest {
-                [7, 8, 9] => fake_child("echo made 7 3.5 1&exit /b 7", Stdio::piped()),
-                [9] => fake_child("echo made 9 2.0 0", Stdio::piped()),
+                [7, 8, 9] => fake_child("echo at 7&echo made 7 3.5 1&echo at 8&exit /b 7", Stdio::piped()),
+                [9] => fake_child("echo at 9&echo made 9 2.0 0", Stdio::piped()),
                 _ => panic!("unexpected batch {rest:?}"),
             },
             |n, ms, there| lock(&done).push((n, ms, there)),
@@ -338,7 +478,7 @@ mod tests {
                     assert_eq!(lock(&received).recv_timeout(Duration::from_secs(5)).unwrap(), AT_ONCE);
                     anyhow::bail!("worker unavailable")
                 }
-                fake_child(&format!("echo made {AT_ONCE} 1 1"), Stdio::piped())
+                fake_child(&format!("echo at {AT_ONCE}&echo made {AT_ONCE} 1 1"), Stdio::piped())
             },
             |n, _, _| confirmed.send(n).unwrap(),
             |_, _| panic!("unexpected bad pipeline"),
