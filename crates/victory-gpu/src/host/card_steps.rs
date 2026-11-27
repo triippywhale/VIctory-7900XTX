@@ -100,6 +100,10 @@ pub(super) fn stage() -> u32 {
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
+    // Renderer port RT: this order is its part 1.
+    if crate::port_rt::on() {
+        return true;
+    }
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
         return on;
@@ -500,7 +504,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     let (placed, reader) = behind?;
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let apart = place(reader)? >= cut;
+    crate::port_rt::count(if apart { crate::port_rt::CUT } else { crate::port_rt::SAME_LIST });
+    apart.then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -708,12 +714,22 @@ impl Host {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
         let mut behind = None;
-        let chosen = plan(&does, stage(), placed_order(), &mut behind);
+        let by_order = placed_order();
+        let chosen = plan(&does, stage(), by_order, &mut behind);
         #[cfg(feature = "diagnostics")]
         if chosen == Err(BEHIND_PLACED)
             && let Some((p, i)) = behind
         {
             note_behind(runs, steps[p], steps[i]);
+        }
+        if does.iter().any(|d| matches!(d, Does::Placed { .. })) {
+            match (&chosen, by_order) {
+                (Err(BEHIND_PLACED), false) => crate::port_rt::count(crate::port_rt::REFUSED_OFF),
+                (Ok(_), true) if plan(&does, stage(), false, &mut None) == Err(BEHIND_PLACED) => {
+                    crate::port_rt::count(crate::port_rt::BY_ORDER)
+                }
+                _ => {}
+            }
         }
         let chosen = chosen?;
         if chosen.is_empty() {
@@ -1088,6 +1104,21 @@ mod tests {
 
     /// A copy at its place in a list is in the way of what reads or writes its
     /// bytes behind it, not of what did ahead of it.
+    /// Renderer port RT is the order's switch too: with it a fill ahead of
+    /// a copy at its place is let through, one behind it still refused.
+    #[test]
+    fn the_port_takes_the_order() {
+        crate::port_rt::PORT_RT_IN_TEST.set(true);
+        assert!(placed_order());
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let by_order = placed_order();
+        assert!(plan(&[fill(2032, 64, true), placed], 2, by_order, &mut None).is_ok());
+        assert_eq!(plan(&[placed, fill(2032, 64, true)], 2, by_order, &mut None), Err(BEHIND_PLACED));
+        crate::port_rt::PORT_RT_IN_TEST.set(false);
+        // Without it (and without VICTORY_PLACED_ORDER) both were refused.
+        assert_eq!(plan(&[fill(2032, 64, true), placed], 2, false, &mut None), Err(BEHIND_PLACED));
+    }
+
     #[test]
     fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
         let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
