@@ -126,6 +126,20 @@ functions (`hooks.rs`, `retour`). What it has that is closest to porting:
   buffers, 418 MB, in place) cannot be told from them. Two dispatches are 40%
   of the frame: `CS_ScreenProbes_ActivateRays` 54.8 ms and
   `CS_GatherRaymarchedLocalLightsClassified16` 20.4 ms.
+  **Port 1's memory in place against on the card (same frame, 7 loops each,
+  08df9db).** `--buffers vram --only-buffers opened` moves only the 3,898
+  heaps port 1 opened (429 MB) to card memory: 170.0 ms against 197.3 ms in
+  place (run-to-run noise about 0.3 ms), both slightly over the memory
+  budget. Of the 27 ms, about 10 ms is the replay's own copies of what the
+  CPU wrote into that memory (11.6 ms in place, 1.2 ms on the card), which
+  the game does not make in place: the CPU writes there itself. The rest,
+  about 13-17 ms, is shaders reading PC memory over the bus (submissions 14
+  and 25). So port 1 costs the card roughly 15 ms a frame in exchange for
+  the CPU time it saves (prep 34 ms against 45-61 ms in the A/B runs of
+  PR #23); with the card about 90% busy, that card time now matters.
+  `--no-restore` removes the device on this capture (a page fault in a
+  dispatch near the frame's end), so these runs had to keep the restore
+  copies.
 - **Command lists that never have room** (`title_list`): the title's inlined
   writers call list methods instead of writing packets. Ours does the same
   (`victory-gpu/src/lib.rs`).
