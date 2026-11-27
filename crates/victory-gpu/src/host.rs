@@ -1383,6 +1383,24 @@ mod tests {
 
     use super::*;
 
+    /// `VICTORY_MERGE_RUNS` and `VICTORY_SETTLE_ROOM`: the caps are as
+    /// before unless given, and more room raises both within the bound.
+    #[test]
+    fn the_flights_caps_are_as_before_unless_given_or_given_room() {
+        assert_eq!(merge_runs_with(None, false, false), 512);
+        assert_eq!(merge_runs_with(None, true, false), 4096);
+        assert_eq!(merge_runs_with(Some(32_768), false, false), 32_768);
+        assert_eq!(merge_runs_with(Some(32_768), true, false), 32_768);
+        assert_eq!(merge_runs_with(Some(0), false, false), 1);
+        assert_eq!(merge_runs_with(Some(usize::MAX), false, false), MERGE_RUNS_MOST);
+        assert_eq!(merge_runs_with(None, false, true), 4096);
+        assert_eq!(merge_runs_with(None, true, true), 32_768);
+        assert_eq!(merge_runs_with(Some(200_000), false, true), MERGE_RUNS_MOST);
+        assert_eq!(lists_with_room(256, false), 256);
+        assert_eq!(lists_with_room(256, true), 512);
+        assert_eq!(lists_with_room(usize::MAX, true), usize::MAX);
+    }
+
     /// Views made on one recording thread stay its own until it records the
     /// call that reads them, however many views another thread makes in
     /// between (a whole ring's worth here). (After PalmVI 82998eb25, after
@@ -3127,12 +3145,57 @@ mod relay_tests {
 /// asked and none refused; watch "tables asked, N refused"): their dynamic
 /// descriptor slots, upload
 /// memory and scratch chunks are held until then, and a frame's lists held
-/// all at once ran the slots out before (run 45).
+/// all at once ran the slots out before (run 45). Twice that with
+/// [`settle_room`].
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
+        let most = std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1);
+        lists_with_room(most, settle_room())
     })
+}
+
+/// Whether the flights get more room before they are settled
+/// (`VICTORY_SETTLE_ROOM=1`, read once here; off by default): twice the
+/// lists in the air ([`late_most`]) and eight times the changed runs the
+/// merge under the flights' writes takes ([`merge_runs`], up to its bound).
+/// The source measured 11.5 ms less of the preparing thread's work at
+/// equal draws, from 256 lists and 4,096 runs; what to watch here is how
+/// often the frame line still settles for the lists in the air or for more
+/// changed runs than the cap, and "tables asked, N refused" (dynamic slots
+/// are held while lists fly). The source's `alt` (in turn every twenty
+/// seconds) is not taken: both values are read once here.
+/// (After fxceless 06702fe, PalmVI b7bbf59f4.)
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SETTLE_ROOM").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn lists_with_room(most: usize, room: bool) -> usize {
+    if room { most.saturating_mul(2) } else { most }
+}
+
+/// The most changed runs [`stale_under_flights`] merges under the flights'
+/// writes before it gives up and the flights are settled
+/// (`VICTORY_MERGE_RUNS=<n>`, 1 to 2^20, read once here; unset: 512, or
+/// 4,096 with [`card_steps`], as before), eight times that with
+/// [`settle_room`]. Each run is a copy of its own to a copy in the card's
+/// memory, at about 1.5 us a run. Another tree's run 218 had 500 to 5,400
+/// changed runs a frame of a few bytes each, and the cap of 512 settled the
+/// flights twice a frame, 50 ms of the submitting thread.
+/// (The name and the bound after PalmVI b7bbf59f4 / fxceless 06702fe.)
+fn merge_runs() -> usize {
+    static GIVEN: OnceLock<Option<usize>> = OnceLock::new();
+    let given = *GIVEN.get_or_init(|| std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse().ok()));
+    merge_runs_with(given, card_steps::stage() > 0, settle_room())
+}
+
+/// The bound of [`merge_runs`], with [`settle_room`] or without.
+const MERGE_RUNS_MOST: usize = 1 << 20;
+
+fn merge_runs_with(given: Option<usize>, card_steps: bool, room: bool) -> usize {
+    let cap = given.map_or(if card_steps { 4096 } else { 512 }, |n| n.clamp(1, MERGE_RUNS_MOST));
+    if room { cap.saturating_mul(8).min(MERGE_RUNS_MOST) } else { cap }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3626,7 +3689,8 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // copy of its own there. With [`card_steps`] the pages of the
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
-        let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        // ([`merge_runs`]: `VICTORY_MERGE_RUNS`, `VICTORY_SETTLE_ROOM`.)
+        let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
