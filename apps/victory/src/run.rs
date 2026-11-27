@@ -69,10 +69,7 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = if let Some(preset) = fsr {
-        anyhow::ensure!(
-            matches!(console, Console::SeriesX),
-            "FSR 4K requires Series X mode"
-        );
+        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
         let dir = cfg.fidelityfx_dir.as_deref().context(
             "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
@@ -201,19 +198,9 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, nothing of it has run yet, and the
         // marks are a static.
-        let done = unsafe {
-            apply(
-                image.base(),
-                size,
-                victory_hle::port_descriptors::marks_address(),
-                &SITES,
-            )
-        };
+        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
-        println!(
-            "renderer port 2: {patched} of {} descriptor record stores of the title patched",
-            SITES.len()
-        );
+        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
         // VICTORY_PORT_COPIES=1: the frame allocator's table copies the six
         // stores miss (its own memcpy, a 128-byte copy) mark their slots too.
@@ -223,19 +210,9 @@ pub fn run(
             use victory_loader::descriptor_sites::{TITLE_MEMCPY, apply_copies};
             let hook = victory_hle::port_descriptors::title_copy_hook(image.base() + TITLE_MEMCPY);
             // SAFETY: as above; the hook is a function of ours.
-            let done = unsafe {
-                apply_copies(
-                    image.base(),
-                    size,
-                    victory_hle::port_descriptors::marks_address(),
-                    hook,
-                )
-            };
+            let done = unsafe { apply_copies(image.base(), size, victory_hle::port_descriptors::marks_address(), hook) };
             let copies = done.iter().filter(|d| **d == Hooked::Done).count();
-            println!(
-                "renderer port 2: {copies} of {} table copies of the title patched",
-                done.len()
-            );
+            println!("renderer port 2: {copies} of {} table copies of the title patched", done.len());
         }
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
@@ -258,9 +235,7 @@ pub fn run(
                     title_interval_us(rate, false)
                 );
             }
-            None => {
-                println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is")
-            }
+            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
@@ -396,11 +371,7 @@ fn timers(base: usize, size: usize) {
     if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
         return;
     }
-    if TIMERS
-        .iter()
-        .chain([&FRAME_US, &LIMITER_ON])
-        .any(|&rva| rva + 0x14 > size)
-    {
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
         return;
     }
     std::thread::spawn(move || {
@@ -415,12 +386,7 @@ fn timers(base: usize, size: usize) {
                 .iter()
                 .map(|&t| {
                     let step = f32::from_bits(u32_at(t + 0xc));
-                    format!(
-                        "{} {} {step:.4} {}",
-                        u32_at(t),
-                        u32_at(t + 4),
-                        u32_at(t + 0x10)
-                    )
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
                 })
                 .collect();
             eprintln!(

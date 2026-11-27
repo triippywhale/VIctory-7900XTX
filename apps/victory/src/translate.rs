@@ -158,12 +158,7 @@ struct Checks {
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
-pub fn warm(
-    paths: Vec<PathBuf>,
-    file: &Path,
-    jobs: Option<usize>,
-    wave: Option<u32>,
-) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>, wave: Option<u32>) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
     let mut wanted: HashSet<String> = HashSet::new();
@@ -176,17 +171,11 @@ pub fn warm(
                 }
             }
         }
-        anyhow::ensure!(
-            !wanted.is_empty(),
-            "no 16-digit shader hash in {}",
-            file.display()
-        );
+        anyhow::ensure!(!wanted.is_empty(), "no 16-digit shader hash in {}", file.display());
     }
     // `VICTORY_WARM_SECONDS=<n>`: stop taking new shaders after n seconds
     // (what is done stays in the cache; the next warm-up goes on from there).
-    let limit = std::env::var("VICTORY_WARM_SECONDS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
+    let limit = std::env::var("VICTORY_WARM_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok());
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
@@ -195,10 +184,7 @@ pub fn warm(
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -224,10 +210,7 @@ pub fn warm(
                             }
                             let n = counts[4].fetch_add(1, Ordering::Relaxed) + 1;
                             if n.is_multiple_of(1000) {
-                                println!(
-                                    "warm-up      {n} shaders so far, {:.0} s",
-                                    began.elapsed().as_secs_f64()
-                                );
+                                println!("warm-up      {n} shaders so far, {:.0} s", began.elapsed().as_secs_f64());
                             }
                             let which = match victory_hle::modules::d3d12x::warm_shader(&bytes) {
                                 Ok(true) => 0,
@@ -242,16 +225,8 @@ pub fn warm(
         }
     }
     let [translated, there, failed] = [0, 1, 2].map(|i| counts[i].load(Ordering::Relaxed));
-    let asked = if all {
-        "all".to_owned()
-    } else {
-        wanted.len().to_string()
-    };
-    let stopped = if counts[3].load(Ordering::Relaxed) > 0 {
-        " (stopped at the time limit)"
-    } else {
-        ""
-    };
+    let asked = if all { "all".to_owned() } else { wanted.len().to_string() };
+    let stopped = if counts[3].load(Ordering::Relaxed) > 0 { " (stopped at the time limit)" } else { "" };
     println!(
         "warm-up      {asked} hashes asked, {} found: {translated} translated now, {there} in the cache already, {failed} do not translate; {:.1} s on {threads} threads{stopped}",
         translated + there + failed,
@@ -275,9 +250,7 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
     // sets them (`d3d12x::use_shader_cache`).
     let shaders = cfg.cache_subdir("shaders")?;
     victory_hle::modules::d3d12x::use_shader_cache(shaders.clone());
-    let threads = jobs
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
-        .max(1);
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())).max(1);
     if pipelines {
         if std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
             // The key listing (diagnostics) translates nothing.
@@ -306,10 +279,7 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
     }
     let refused_lines = Mutex::new(Vec::new());
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -328,9 +298,9 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
                             let Some(bytes) = job.bytes() else { continue };
                             // As the title passes it: the container's own size
                             // (a raw source runs on to the end of the file).
-                            let size = bytes.get(0x18..0x1c).map_or(0, |b| {
-                                u32::from_le_bytes(b.try_into().expect("4")) as usize
-                            });
+                            let size = bytes
+                                .get(0x18..0x1c)
+                                .map_or(0, |b| u32::from_le_bytes(b.try_into().expect("4")) as usize);
                             let container = &bytes[..size.min(bytes.len())];
                             if !lock(&seen).insert(blake3::hash(container)) {
                                 continue;
@@ -351,20 +321,14 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
                                     {
                                         let stem: String = why
                                             .chars()
-                                            .map(
-                                                |c| if c.is_ascii_alphanumeric() { c } else { '_' },
-                                            )
+                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
                                             .take(60)
                                             .collect();
                                         let _ = std::fs::create_dir_all(dir);
-                                        let _ = std::fs::write(
-                                            dir.join(format!("{stem}_{was}.{hash}.cdxil")),
-                                            container,
-                                        );
+                                        let _ = std::fs::write(dir.join(format!("{stem}_{was}.{hash}.cdxil")), container);
                                     }
                                     if refused_list.is_some() {
-                                        lock(&refused_lines)
-                                            .push(format!("{hash}  {}  {why}", job.label()));
+                                        lock(&refused_lines).push(format!("{hash}  {}  {why}", job.label()));
                                     }
                                     2
                                 }
@@ -400,9 +364,7 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
         println!("  {n:>5}  {why}  (e.g. {hash})");
     }
     if let Some(list) = &refused_list {
-        let mut lines = refused_lines
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut lines = refused_lines.into_inner().unwrap_or_else(|e| e.into_inner());
         lines.sort();
         std::fs::write(list, lines.join("\n") + "\n")?;
         println!("refused      listed in {}", list.display());
@@ -443,10 +405,10 @@ pub fn run(
         victory_shader::emit::set_host_max_wave(lanes);
     }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
-    victory_shader::emit::set_host_rdna(
-        std::env::var_os("VICTORY_HOST_RDNA")
-            .map_or_else(|| host_caps.is_some_and(|(_, rdna)| rdna), |v| v == "1"),
-    );
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").map_or_else(
+        || host_caps.is_some_and(|(_, rdna)| rdna),
+        |v| v == "1",
+    ));
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -615,20 +577,13 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                                     if n.is_multiple_of(1000) {
-                                        println!(
-                                            "{n} shaders in the cache, {:.0} s",
-                                            started.elapsed().as_secs_f64()
-                                        );
+                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                                     }
                                 }
                                 Err(why) => {
                                     let hex = hash.to_hex()[..16].to_owned();
                                     if list.is_some() {
-                                        let line = format!(
-                                            "{hex}	{}{}	{why}",
-                                            path.display(),
-                                            job.label()
-                                        );
+                                        let line = format!("{hex}	{}{}	{why}", path.display(), job.label());
                                         lock(&lines).push(line);
                                     }
                                     let mut failed = lock(&failed);
@@ -645,14 +600,9 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
     if let Some(list) = &list {
         let mut lines = lines.into_inner().unwrap_or_else(|e| e.into_inner());
         lines.sort();
-        std::fs::write(
-            list,
-            lines.join(
-                "
-",
-            ) + "
-",
-        )?;
+        std::fs::write(list, lines.join("
+") + "
+")?;
     }
     println!(
         "{} shaders in the cache, {} do not translate, {:.0} s",
@@ -711,11 +661,7 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container
-        .part(FourCC::DXIL)
-        .or(container.part(FourCC::ACCC))
-        .map(|p| p.data)
-    else {
+    let Some(dxil) = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC)).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     // `~`: the hash of the code alone; containers that differ only around
@@ -729,10 +675,7 @@ fn translate(
         && let Some((dir, texts)) = spec.split_once(';')
     {
         let line = example();
-        if texts
-            .split('|')
-            .any(|text| !text.is_empty() && line.contains(text))
-        {
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
             let name: String = source
                 .label()
                 .chars()
@@ -741,10 +684,7 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(
-                std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")),
-                &bytes[..],
-            );
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
         }
     }
     if !lock(seen).insert(code) {
@@ -761,36 +701,21 @@ fn translate(
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");
-    let before: Option<BTreeMap<String, usize>> = dump
-        .as_ref()
-        .map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     translate_programs(&container, programs, &example, t, checks);
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
             if *n > was && was < 3 {
-                let stem: String = reason
-                    .chars()
-                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                    .take(60)
-                    .collect();
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(
-                    std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")),
-                    &bytes[..],
-                );
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
             }
         }
     }
 }
 
-fn translate_programs(
-    container: &Container,
-    programs: Vec<NativeProgram>,
-    example: &dyn Fn() -> String,
-    t: &mut Tally,
-    checks: &mut Checks,
-) {
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
         match victory_shader::spill::build(&p) {
@@ -889,11 +814,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
     static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let Some(out) = OUT.get_or_init(|| {
         let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .ok()?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
         Some(Mutex::new(file))
     }) else {
         return;
@@ -918,12 +839,7 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
-    for (name, n) in [
-        "c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other",
-    ]
-    .iter()
-    .zip(console)
-    {
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }
     for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
@@ -947,8 +863,7 @@ fn check(
     // to show which shaders a change to the translator touches.
     if t.list {
         let hash = blake3::hash(format!("{shader:?}").as_bytes()).to_hex();
-        t.lines
-            .push(format!("{}  emitted {}", label(), &hash[..16]));
+        t.lines.push(format!("{}  emitted {}", label(), &hash[..16]));
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list

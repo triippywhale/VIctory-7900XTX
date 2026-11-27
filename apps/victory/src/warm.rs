@@ -5,8 +5,8 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,13 +26,7 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(
-    jobs: Option<usize>,
-    limit: Option<usize>,
-    again: bool,
-    used: bool,
-    these: Option<String>,
-) -> Result<()> {
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these);
@@ -75,25 +69,10 @@ pub fn run(
         all.len()
     );
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
-    let done_out = Mutex::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&done_file)?,
-    );
+    let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
     // (Read back by the runs: these are made beside the others, not before.)
-    let slow_out = Mutex::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("slow-pipelines.txt"))?,
-    );
-    let bad_out = Mutex::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&bad_file)?,
-    );
+    let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
+    let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
     run_batches(
         &all,
         jobs,
@@ -107,11 +86,7 @@ pub fn run(
             state.1 += usize::from(!there);
             let count = state.0.len();
             if count.is_multiple_of(1000) {
-                println!(
-                    "{count} of {}, {:.0} s",
-                    all.len(),
-                    began.elapsed().as_secs_f64()
-                );
+                println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
             }
             drop(state);
             let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
@@ -124,12 +99,7 @@ pub fn run(
     )?;
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
     times.sort_by(f64::total_cmp);
-    let at = |q: f64| {
-        times
-            .get((times.len() as f64 * q) as usize)
-            .copied()
-            .unwrap_or(0.0)
-    };
+    let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
         "{} made in {:.0} s ({refused} have no host pipeline, {crashed} ended their process); ms each: median {:.1}, p90 {:.1}, p99 {:.1}, most {:.0}, sum {:.0} s",
         times.len(),
@@ -209,15 +179,10 @@ fn start_worker(these: &[usize]) -> Result<Child> {
 }
 
 /// On abnormal exit, return the number of reports before the failure and the exit reason.
-fn child(
-    mut process: Child,
-    mut each: impl FnMut(usize, f64, bool),
-) -> Result<Option<(usize, String)>> {
+fn child(mut process: Child, mut each: impl FnMut(usize, f64, bool)) -> Result<Option<(usize, String)>> {
     let Some(out) = process.stdout.take() else {
         let _ = process.kill();
-        process
-            .wait()
-            .context("warm worker stdout unavailable, failed to reap worker")?;
+        process.wait().context("warm worker stdout unavailable, failed to reap worker")?;
         anyhow::bail!("warm worker stdout unavailable");
     };
     let process = Mutex::new(process);
@@ -263,10 +228,7 @@ fn child(
 
 /// What such a process does.
 fn make(dir: &Path, these: &str) -> Result<()> {
-    let these: Vec<usize> = these
-        .split(',')
-        .map(|n| n.parse().context("--these"))
-        .collect::<Result<_>>()?;
+    let these: Vec<usize> = these.split(',').map(|n| n.parse().context("--these")).collect::<Result<_>>()?;
     let cfg = victory_core::Config::load()?;
     victory_hle::known_pipelines::use_translations(cfg.cache_subdir("shaders")?);
     let mut out = std::io::stdout();
@@ -303,8 +265,7 @@ mod tests {
 
     #[test]
     fn missing_executable_leaves_the_batch_pending() {
-        let missing =
-            std::env::temp_dir().join(format!("victory-missing-worker-{}.exe", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("victory-missing-worker-{}.exe", std::process::id()));
         assert!(!missing.try_exists().unwrap());
         let starts = AtomicUsize::new(0);
         let done = Mutex::new(Vec::new());
@@ -324,10 +285,7 @@ mod tests {
         assert!(lock(&bad).is_empty());
         let error = result.unwrap_err();
         assert!(error.to_string().contains("start warm worker"));
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::NotFound
-        );
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -377,12 +335,7 @@ mod tests {
             2,
             |chunk| {
                 if chunk[0] == 0 {
-                    assert_eq!(
-                        lock(&received)
-                            .recv_timeout(Duration::from_secs(5))
-                            .unwrap(),
-                        AT_ONCE
-                    );
+                    assert_eq!(lock(&received).recv_timeout(Duration::from_secs(5)).unwrap(), AT_ONCE);
                     anyhow::bail!("worker unavailable")
                 }
                 fake_child(&format!("echo made {AT_ONCE} 1 1"), Stdio::piped())
