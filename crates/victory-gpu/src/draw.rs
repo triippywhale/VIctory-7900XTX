@@ -642,7 +642,7 @@ fn memo_copy(view: &crate::descriptor::View) -> Option<Seen> {
     // A view in another format over a texture the card writes: its texels
     // are copied in when the source was written since the last copy
     // (`crate::texture::alias`), which no change of the list's says.
-    let aliased = |r: usize| crate::resource::alias_of(r as This).is_some();
+    let aliased = |r: usize| crate::resource::is_alias(r as This);
     if let View::Shader(r, _) | View::Unordered(r, _, _) = view
         && aliased(*r)
     {
@@ -2893,6 +2893,8 @@ impl State {
                 && crate::resource::alias_picked()
                 && let Some(source) = crate::resource::alias_of(resource)
             {
+                // (Held until the copy is recorded.)
+                let source = source.get();
                 crate::resource::picked_alias(resource, source);
                 let copied = crate::texture::alias(list, resource, source);
                 #[cfg(feature = "diagnostics")]
@@ -5008,7 +5010,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             #[cfg(feature = "diagnostics")]
             if !aliased && placed.is_some() {
                 crate::resource::alias_watch(*resource as This);

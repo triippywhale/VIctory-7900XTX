@@ -7140,7 +7140,7 @@ impl HostList {
         let wrote = std::mem::take(&mut *self.wrote_shown.lock().unwrap_or_else(|e| e.into_inner()));
         for source in wrote {
             for (placed, shown) in crate::resource::picked_aliases_of(source as crate::object::This) {
-                if crate::texture::alias(self, placed, shown) {
+                if crate::texture::alias(self, placed, shown.get()) {
                     crate::texture::PICKED_ALIAS_COPIES.fetch_add(1, Ordering::Relaxed);
                 }
             }
