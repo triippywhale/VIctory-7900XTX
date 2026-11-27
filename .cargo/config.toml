@@ -1,2 +1,4 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+# The diagnostics build for a Zen 4 processor (Cargo.toml, `[profile.x3d]`).
+x3d = ["build", "--locked", "--profile", "x3d", "-p", "victory", "--features", "diagnostics", "--config", "build.rustflags=[\"-C\", \"target-cpu=znver4\"]"]
