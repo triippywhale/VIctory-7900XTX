@@ -1409,6 +1409,10 @@ pub(crate) struct HostList {
     /// What its indirect executions ran, for the report of a removed device.
     #[cfg(feature = "diagnostics")]
     indirects: indirects::Shared,
+    /// With `VICTORY_BVH_WALK=1`: the node-test counts its dispatches copied
+    /// ([`walk`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) walks: walk::Taken,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -4075,6 +4079,8 @@ mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod rtstamps;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod walk;
 #[cfg(test)]
 mod rtbench;
 #[cfg(feature = "diagnostics")]
@@ -4546,6 +4552,8 @@ impl Host {
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
+                #[cfg(feature = "diagnostics")]
+                walks: Mutex::new(Vec::new()),
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -6833,6 +6841,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if walk::on() {
+            walk::reset(&self.walks);
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {

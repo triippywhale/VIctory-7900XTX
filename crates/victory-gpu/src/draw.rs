@@ -2035,6 +2035,21 @@ impl State {
                     }
                     continue;
                 }
+                if slot == victory_shader::emit::SLOT_WALK {
+                    // Ours (`VICTORY_BVH_WALK`): where node tests are counted.
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(at) = crate::host::walk::address() {
+                        // SAFETY: an open list; the buffer lives as long as the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, at);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, at);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
@@ -3081,6 +3096,18 @@ impl State {
         });
     }
 
+    /// (`VICTORY_BVH_WALK`) After a dispatch of `p`: its node-test counts are
+    /// taken, if it has them. The copies move our buffer only; the title's
+    /// bindings stand.
+    #[cfg(feature = "diagnostics")]
+    fn walked(&self, list: &HostList, p: &HostPipeline) {
+        if crate::host::walk::on()
+            && p.stages.first().is_some_and(|s| s.translated().host.root_uavs.contains(&victory_shader::emit::SLOT_WALK))
+        {
+            crate::host::walk::after(&list.walks, &list.list, &p.name);
+        }
+    }
+
     /// Diagnostics: what kind of dispatch `p` is, for the stamps around it.
     #[cfg(feature = "diagnostics")]
     fn stamp_kind(&self, p: &HostPipeline) -> crate::host::rtstamps::Kind {
@@ -3172,6 +3199,8 @@ impl State {
         if stamp.is_some() {
             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
         }
+        #[cfg(feature = "diagnostics")]
+        self.walked(list, p);
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -4672,6 +4701,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if stamp.is_some() {
             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.walked(list, p);
         }
         if kind == DISPATCH {
             self.buffers_written();

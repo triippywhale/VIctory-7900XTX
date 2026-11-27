@@ -182,6 +182,9 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
+        if crate::emit::bvh_walk() && self.s.threads.is_some() {
+            self.bvh_walk_count(is_box, is_triangle);
+        }
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -221,6 +224,29 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(dst + k as u8), r, guard);
         }
         Ok(())
+    }
+
+    /// (`VICTORY_BVH_WALK=1`) This thread's node test counted in its dword of
+    /// the [`crate::emit::SLOT_WALK`] buffer: 1 for a box node, 0x10000 for a
+    /// triangle.
+    fn bvh_walk_count(&mut self, is_box: V, is_triangle: V) {
+        let c = self.cur;
+        let (entry, i32t) = (self.s.entry, self.s.t.i32);
+        let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
+        let x = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+        let y = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
+        let (k12, k2) = (self.s.m.i32(12), self.s.m.i32(2));
+        let mask = self.s.m.i32(crate::emit::WALK_SLOTS - 1);
+        let row = self.s.m.bin(c, Bin::Shl, y, k12);
+        let at = self.s.m.bin(c, Bin::Add, x, row);
+        let at = self.s.m.bin(c, Bin::And, at, mask);
+        let byte = self.s.m.bin(c, Bin::Shl, at, k2);
+        let (one, high) = (self.s.m.i32(1), self.s.m.i32(0x10000));
+        let leaf = self.s.m.select(c, is_triangle, high, k0);
+        let add = self.s.m.select(c, is_box, one, leaf);
+        let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
+        let iu = self.s.m.undef(i32t);
+        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

@@ -123,7 +123,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
     SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -192,6 +192,17 @@ pub fn group_sync() -> u8 {
 pub fn builder_fences() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// A meter (`VICTORY_BVH_WALK=1`, after Op-lite/victory-scarlett c45b43e): each
+/// ray-tracing node test of a compute program also counts itself in its
+/// thread's dword of the [`SLOT_WALK`] buffer (box and triangle tests apart),
+/// so that the host can tell how many nodes each ray visits. Adds one atomic
+/// per test to a buffer of ours; what the program computes is unchanged. Part
+/// of the translation: the shader cache keys on it.
+pub fn bvh_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_WALK").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near
