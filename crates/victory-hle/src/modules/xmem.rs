@@ -180,6 +180,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // What the title asked its reservations to be, for copy-back of
+    // write-combining memory (`VICTORY_SKIP_WC_BACK`).
+    if !at.is_null() && base.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, asked);
+    }
     // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)

@@ -476,6 +476,8 @@ fn through_copy() -> bool {
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    // Pieces of buffer copies left on the card there first (`crate::left`).
+    crate::left::before_take(memory as usize, memory as usize + size, 0);
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
         f(read)
@@ -1235,6 +1237,9 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Pieces of buffer copies left on the card there first
+        // (`crate::left`).
+        crate::left::before_take(self.memory as usize, self.memory as usize + self.read, 0);
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
@@ -1595,6 +1600,8 @@ pub(crate) fn fingerprint_blank(at: u64, len: u64) -> (u64, bool) {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
     let len = len as usize;
+    // Pieces of buffer copies left on the card there first (`crate::left`).
+    crate::left::before_take(at as usize, at as usize + len, 0);
     let mut print = 0u128;
     let mut blank = true;
     READ.with(|read| {
@@ -1672,6 +1679,8 @@ pub(crate) fn unchanged(resource: This, first: u32) -> bool {
         return false;
     }
     let size = layout.bytes_from(from) as usize;
+    // Pieces of buffer copies left on the card there first (`crate::left`).
+    crate::left::before_take(memory as usize, memory as usize + size, 0);
     with_read(size, |read| {
         if crate::host::read_there(memory, read) == 0 {
             return false;
