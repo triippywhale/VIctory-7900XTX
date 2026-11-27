@@ -223,7 +223,10 @@ fn main() -> Result<()> {
             cache,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             let wave = translate::host_wave::select(
@@ -245,7 +248,13 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            these,
+        } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,

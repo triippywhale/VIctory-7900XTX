@@ -53,7 +53,11 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     // The files that hold shaders (or the pack itself).
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
-        .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
+        .flat_map(|root| {
+            walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(Result::ok)
+        })
         .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
         .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
@@ -94,7 +98,8 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         });
     }
     let programs = programs.into_inner().unwrap_or_else(|e| e.into_inner());
-    let databases: Vec<sgd5::Database> = files.iter().flat_map(|(_, d)| sgd5::databases(d)).collect();
+    let databases: Vec<sgd5::Database> =
+        files.iter().flat_map(|(_, d)| sgd5::databases(d)).collect();
     let named = Named::find(&pack, &databases);
     eprintln!(
         "{}: shader pack, {} graphics and {} compute pipelines; states named: {} depth-stencil, {} rasteriser, {} blend",
@@ -126,7 +131,10 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         if g.stages[3..].iter().any(Option::is_some) {
             return Err("stages other than vertex, mesh and pixel".into());
         }
-        let (first, stage) = vs.or(gs).and_then(|s| container(s.program)).ok_or("shader not found")?;
+        let (first, stage) = vs
+            .or(gs)
+            .and_then(|s| container(s.program))
+            .ok_or("shader not found")?;
         let pixel = match ps {
             Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
             None => None,
@@ -165,7 +173,9 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
     let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
     let listed = AtomicUsize::new(0);
     each(&jobs, threads, |job| match prepare(job) {
-        Ok(p) if keys_only.is_some() => lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe())),
+        Ok(p) if keys_only.is_some() => {
+            lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
+        }
         Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
         Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
         Err(why) => {

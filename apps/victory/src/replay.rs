@@ -246,7 +246,9 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     }
     if let Some(text) = &r.flow {
         let lists = range(text).with_context(|| format!("--flow {text}"))?;
-        return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| println!("{line}"));
+        return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| {
+            println!("{line}")
+        });
     }
     if let Some(into) = &r.retranslate {
         return retranslate(&r.folder, into, r.view_limit, r.raw_views);
@@ -311,7 +313,10 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         for text in &r.texture {
             let (id, sub) = text.split_once('.').unwrap_or((text, "0"));
             let bad = || format!("--texture {text}");
-            which.push((id.parse().with_context(bad)?, sub.parse().with_context(bad)?));
+            which.push((
+                id.parse().with_context(bad)?,
+                sub.parse().with_context(bad)?,
+            ));
         }
         let images = play::look::Images {
             which,
@@ -434,7 +439,12 @@ pub(crate) fn run(r: Replay) -> Result<()> {
 }
 
 /// Translates the capture's shaders into `into`.
-fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32) -> Result<()> {
+fn retranslate(
+    folder: &std::path::Path,
+    into: &std::path::Path,
+    view_limit: u32,
+    raw_views: u32,
+) -> Result<()> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let wanted = play::title_shaders(folder)?;
     let kept = play::find(folder)?.with_file_name("containers");
@@ -446,16 +456,30 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         .filter(|h| !kept.join(format!("{h}.cdxil")).exists())
         .collect();
     if !missing.is_empty() {
-        println!("{} of {} containers are looked for in the title's files", missing.len(), wanted.len());
+        println!(
+            "{} of {} containers are looked for in the title's files",
+            missing.len(),
+            wanted.len()
+        );
         for root in crate::default_paths(Vec::new())? {
-            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(std::result::Result::ok) {
+            for entry in walkdir::WalkDir::new(root)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
                 let size = entry.metadata().map_or(0, |m| m.len());
-                if missing.is_empty() || !entry.file_type().is_file() || size > crate::shader::MAX_FILE {
+                if missing.is_empty()
+                    || !entry.file_type().is_file()
+                    || size > crate::shader::MAX_FILE
+                {
                     continue;
                 }
-                let Ok(data) = std::fs::read(entry.path()) else { continue };
+                let Ok(data) = std::fs::read(entry.path()) else {
+                    continue;
+                };
                 for source in crate::shader::sources(&data) {
-                    let Some(bytes) = source.bytes() else { continue };
+                    let Some(bytes) = source.bytes() else {
+                        continue;
+                    };
                     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
                     if missing.remove(hash.as_str()) {
                         std::fs::write(kept.join(format!("{hash}.cdxil")), &bytes[..])?;
@@ -476,7 +500,9 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
             s.spawn(|| {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
+                    let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else {
+                        continue;
+                    };
                     match victory_shader::emit::translate(&bytes) {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
@@ -489,7 +515,12 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
             });
         }
     });
-    println!("{} of {} shaders translated, {:.1} s", done.into_inner(), all.len(), started.elapsed().as_secs_f64());
+    println!(
+        "{} of {} shaders translated, {:.1} s",
+        done.into_inner(),
+        all.len(),
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 

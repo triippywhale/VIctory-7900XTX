@@ -54,13 +54,19 @@ impl FileScan {
             Ok(metadata) => metadata.len(),
             Err(error) => {
                 self.metadata_errors += 1;
-                self.detail(format_args!("reading metadata for {}: {error}", path.display()));
+                self.detail(format_args!(
+                    "reading metadata for {}: {error}",
+                    path.display()
+                ));
                 return None;
             }
         };
         if size > self.limit {
             self.over_limit += 1;
-            self.detail(format_args!("skipping large file {} ({size} bytes)", path.display()));
+            self.detail(format_args!(
+                "skipping large file {} ({size} bytes)",
+                path.display()
+            ));
             return None;
         }
         match fs::read(path) {
@@ -98,8 +104,13 @@ impl fmt::Display for FileScan {
             f,
             "file scan {status}: files read {}, skipped {} (walk errors {}, metadata errors {}, \
              read errors {}, over {} bytes: {})",
-            self.files_read, errors + self.over_limit, self.walk_errors, self.metadata_errors,
-            self.read_errors, self.limit, self.over_limit,
+            self.files_read,
+            errors + self.over_limit,
+            self.walk_errors,
+            self.metadata_errors,
+            self.read_errors,
+            self.limit,
+            self.over_limit,
         )
     }
 }

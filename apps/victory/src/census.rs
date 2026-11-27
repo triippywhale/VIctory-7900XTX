@@ -291,7 +291,10 @@ mod tests {
             missing.len()
         );
         let user_count = |symbol| missing[&("xgameruntime.dll".into(), symbol)].len();
-        assert_eq!(user_count(FunctionKey::Name("SyntheticMissingApi".into())), 2);
+        assert_eq!(
+            user_count(FunctionKey::Name("SyntheticMissingApi".into())),
+            2
+        );
         assert_eq!(user_count(FunctionKey::Ordinal(42)), 2);
     }
 
