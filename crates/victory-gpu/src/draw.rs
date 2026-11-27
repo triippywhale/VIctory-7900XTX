@@ -1397,7 +1397,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
-        for &h in handles {
+        // (The host takes at most eight targets; more is an invalid call.)
+        for &h in handles.iter().take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
