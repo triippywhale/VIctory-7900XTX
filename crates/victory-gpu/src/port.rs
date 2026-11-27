@@ -70,11 +70,11 @@ const LOW: u64 = 1 << 32;
 const MOST: u64 = 512 << 20;
 
 /// `VICTORY_PORT_CONSTANTS`, read once here: the level of renderer port #1.
-/// - 1 (the default, and any value but 0 and 3): title buffers and windows
-///   of title memory in the title's 32-bit graphics memory (view memory
-///   that is one stretch of a section) are used in place, all of them.
-/// - 3: constants in place ([`constants_only`], an A/B level, off by
-///   default): no title buffer or window is put in place (they stay host
+/// - 1: title buffers and windows of title memory in the title's 32-bit
+///   graphics memory (view memory that is one stretch of a section) are
+///   used in place, all of them.
+/// - 3 (the default, and any value but 0 and 1): constants in place
+///   ([`constants_only`]): no title buffer or window is put in place (they stay host
 ///   copies, tracked, sent up and fetched back exactly as without the
 ///   port); the heap is arranged and opened all the same, with one buffer
 ///   placed over all of it ([`Whole`]), and only constant buffers whose
@@ -94,8 +94,8 @@ pub(crate) fn level() -> u8 {
     *LEVEL.get_or_init(|| {
         let level = match std::env::var("VICTORY_PORT_CONSTANTS").ok().as_deref().map(str::trim) {
             Some("0") => 0,
-            Some("3") => 3,
-            _ => 1,
+            Some("1") => 1,
+            _ => 3,
         };
         if level == 3 {
             tracing::info!(
