@@ -7895,9 +7895,18 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        // With `VICTORY_COPY_RUNS=1`: the title copies of a run in a row,
+        // told to the journal together before the next other step
+        // ([`crate::watch::wrote_all`]).
+        let runs = crate::watch::copy_runs();
+        let mut wrote: Vec<(usize, usize)> = Vec::new();
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
+            }
+            if !wrote.is_empty() && !matches!(step, Step::Copy(..)) {
+                crate::watch::wrote_all(&wrote);
+                wrote.clear();
             }
             let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
@@ -7907,10 +7916,14 @@ impl HostList {
                         copies += 1;
                     }
                     batch.fill();
-                    if !batch.due.is_empty() {
-                        batch.refresh_textures();
+                    // In a run the batch was emptied by its first copy, and
+                    // nothing came into it since.
+                    if wrote.is_empty() {
+                        if !batch.due.is_empty() {
+                            batch.refresh_textures();
+                        }
+                        batch.title_written();
                     }
-                    batch.title_written();
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
@@ -7919,7 +7932,11 @@ impl HostList {
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
+                    if runs {
+                        wrote.push((dst, len));
+                    } else {
+                        crate::watch::wrote(dst, len);
+                    }
                     // What the card holds there may be another value although
                     // ours did not change.
                     if send::own() {
@@ -8023,6 +8040,7 @@ impl HostList {
             us += started.elapsed();
             bytes += copied as u64;
         }
+        crate::watch::wrote_all(&wrote);
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]

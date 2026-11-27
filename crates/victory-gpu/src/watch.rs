@@ -1203,6 +1203,75 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// [`wrote`] for a run of our writes into title memory at once (title
+/// copies that follow one another in a list's steps, `VICTORY_COPY_RUNS=1`):
+/// the journal taken alone once and one asking number for all of them, where
+/// [`wrote`] takes it and a number per copy (18,000-21,000 copies a frame in
+/// the open world, after Geckomacabre/vx-layer b9a97e9d). The same pages are
+/// noted, the views elsewhere too; only the numbers between, which nothing
+/// compares with, are left out.
+pub(crate) fn wrote_all(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    if port_journal() && !journal().kept {
+        port7_count(P7_SKIPPED, 1);
+        return;
+    }
+    let pages = joined_pages(ranges);
+    if pages.is_empty() {
+        return;
+    }
+    let mut j = journal_mut();
+    if !j.kept {
+        return;
+    }
+    let now = next_asking();
+    j.ahead_asked = now;
+    for &(first, last) in &pages {
+        for page in first..last {
+            j.notes.note(page, WHOLE, now);
+        }
+    }
+    for &(at, len) in ranges {
+        for (_, others) in elsewhere(at, len) {
+            for other in others {
+                j.notes.note(other / PAGE, WHOLE, now);
+            }
+        }
+    }
+}
+
+/// The page ranges `[first, last)` of byte ranges `(at, len)`, sorted and
+/// joined where they touch or overlap; empty ones left out.
+fn joined_pages(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut pages: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.1 > 0)
+        .map(|&(at, len)| (at / PAGE, at.saturating_add(len).div_ceil(PAGE)))
+        .collect();
+    pages.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for (first, last) in pages {
+        match joined.last_mut() {
+            Some(prev) if first <= prev.1 => prev.1 = prev.1.max(last),
+            _ => joined.push((first, last)),
+        }
+    }
+    joined
+}
+
+/// Whether the title copies that follow one another in a list's steps are
+/// told to the journal together ([`wrote_all`]; `VICTORY_COPY_RUNS=1`, off
+/// by default: one [`wrote`] per copy, as before). What changes: a thread
+/// beside the submitting one that asks about those pages in the middle of
+/// a run finds them noted at the run's end, not copy by copy (it could
+/// already come between a copy and its note).
+pub(crate) fn copy_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_RUNS").is_some_and(|v| v == "1"))
+}
+
 /// The blocks of `[at, at + len)` whose pages the title shows at other
 /// addresses too, and there.
 fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
@@ -5856,6 +5925,60 @@ mod port7_tests {
     fn no_write_is_lost_with_port_7() {
         askers_and_a_submission(1);
         askers_and_a_submission(2);
+    }
+
+    /// `VICTORY_COPY_RUNS`: the pages of a run of copies are joined, empty
+    /// ones left out.
+    #[test]
+    fn a_run_of_copies_is_joined_by_pages() {
+        assert_eq!(joined_pages(&[]), Vec::<(usize, usize)>::new());
+        assert_eq!(joined_pages(&[(5 * PAGE, 0)]), Vec::<(usize, usize)>::new());
+        assert_eq!(
+            joined_pages(&[(3 * PAGE + 1, 10), (PAGE - 1, 2), (3 * PAGE + 100, PAGE), (9 * PAGE, PAGE)]),
+            [(0, 2), (3, 5), (9, 10)]
+        );
+    }
+
+    /// `VICTORY_COPY_RUNS`: a submission's run of copies told with
+    /// [`wrote_all`] under its one asking: every page of it is found written
+    /// after what was last read of it, as with one [`wrote`] per copy.
+    #[test]
+    fn a_run_of_copies_told_at_once_is_not_lost() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 24;
+        // SAFETY: a reservation of our own, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(at != 0 && at.is_multiple_of(PAGE));
+        let mut last = [0u64; PAGES];
+        let mut seed = 4242;
+        for round in 1..300u64 {
+            ask_once(&[(at, at + PAGES * PAGE)]);
+            let run: Vec<(usize, usize)> = (0..1 + rng(&mut seed, 5))
+                .map(|_| (at + rng(&mut seed, PAGES) * PAGE + 8 * rng(&mut seed, 64), 8 + 8 * rng(&mut seed, 4)))
+                .collect();
+            for &(to, len) in &run {
+                for k in (0..len).step_by(8) {
+                    // SAFETY: committed memory of ours.
+                    unsafe { ((to + k) as *mut u64).write_volatile(round) };
+                }
+            }
+            wrote_all(&run);
+            let mut read: Vec<usize> = run.iter().map(|&(to, _)| (to - at) / PAGE).collect();
+            read.sort_unstable();
+            read.dedup();
+            for p in read {
+                let (now, written) = writes(at + p * PAGE, at + (p + 1) * PAGE, false).expect("write-watched");
+                let number = written.iter().find(|w| w.0 == at / PAGE + p).map_or(0, |w| w.1);
+                assert!(number > last[p], "round {round}, page {p}: {number} is not after {}", last[p]);
+                last[p] = now;
+            }
+            ask_ahead_done();
+            ask_once_end();
+        }
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
     /// `port`: 1, renderer port #7 on in all threads; 2, in every other.
