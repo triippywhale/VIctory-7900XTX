@@ -1528,7 +1528,12 @@ impl Player {
             // The worker is another part of the player than `copy` uses.
             let other = Worker::new(&self.device, &self.worker.queue)?;
             let mut worker = std::mem::replace(&mut self.worker, other);
-            let sent = worker.send(|l| copy(self, l, &list, &buffer));
+            let sent = worker.send(|l| {
+                let name = format!("replay upload {} batch {n}", parts.len());
+                dred::name(l, &name);
+                copy(self, l, &list, &buffer);
+                dred::ops_recorded(&name);
+            });
             self.worker = worker;
             stagings[k].2 = sent?;
         }
@@ -1581,9 +1586,11 @@ impl Player {
                     continue;
                 };
                 let r = &player.frame.resources[o.index];
+                let what = format!("resource {} \"{}\" ({:?}, {:?})", r.id, r.name, r.place, r.desc);
                 // SAFETY: an open list; live resources.
                 unsafe {
                     if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                        dred::op(format!("contents of {what}: bytes {} to {}", c.first, c.first + len));
                         list.CopyBufferRegion(&o.res, c.first, staging, *at, *len);
                         continue;
                     }
@@ -1595,6 +1602,7 @@ impl Player {
                     );
                     for (i, mut f) in all.into_iter().enumerate() {
                         f.Offset += at;
+                        dred::op(format!("contents of {what}: subresource {}", c.first + i as u64));
                         let to = gpu::sub_location(&o.res, c.first as u32 + i as u32);
                         list.CopyTextureRegion(
                             &to,
@@ -1673,6 +1681,11 @@ impl Player {
         self.upload(&first, &file, |player, list, parts, staging| {
             for (d, len, at) in parts {
                 if let Some(o) = player.objects.get(&d.res) {
+                    let r = &player.frame.resources[o.index];
+                    dred::op(format!(
+                        "CPU changes to resource {} \"{}\" ({:?}, {} bytes): bytes {} to {}",
+                        r.id, r.name, r.place, r.desc.width, d.at, d.at + len
+                    ));
                     // SAFETY: an open list; live buffers.
                     unsafe { list.CopyBufferRegion(&o.res, d.at, staging, *at, *len) };
                 }

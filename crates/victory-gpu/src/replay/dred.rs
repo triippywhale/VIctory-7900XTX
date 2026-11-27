@@ -6,6 +6,36 @@
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{Interface, PCWSTR};
 
+/// What the commands of our recent setup lists were, by list name, one
+/// line a command: what a stopped list was at, in words.
+static OPS: std::sync::Mutex<(Vec<String>, Vec<(String, Vec<String>)>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
+
+/// The next command recorded into the list being recorded.
+pub(super) fn op(text: String) {
+    OPS.lock().unwrap_or_else(|e| e.into_inner()).0.push(text);
+}
+
+/// The commands noted since the last call were the list `name`'s.
+pub(super) fn ops_recorded(name: &str) {
+    let mut ops = OPS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::mem::take(&mut ops.0);
+    ops.1.retain(|(n, _)| n != name);
+    ops.1.push((name.to_owned(), now));
+    if ops.1.len() > 8 {
+        ops.1.remove(0);
+    }
+}
+
+fn ops_of(name: &str, done: usize) -> Vec<String> {
+    let ops = OPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, all)) = ops.1.iter().find(|(n, _)| n == name) else {
+        return Vec::new();
+    };
+    (done.saturating_sub(1)..(done + 2).min(all.len()))
+        .map(|i| format!("  command {i}{}: {}", if i == done { " (where it stopped)" } else { "" }, all[i]))
+        .collect()
+}
+
 /// Lines on why the device is gone; none while it stands.
 pub(super) fn report(device: &ID3D12Device) -> Vec<String> {
     let mut out = Vec::new();
@@ -75,17 +105,18 @@ pub(super) fn report(device: &ID3D12Device) -> Vec<String> {
                             format!(
                                 "{}{}",
                                 if i == done as usize { ">" } else { "" },
-                                op(history[i])
+                                op_name(history[i])
                             )
                         })
                         .collect();
+                    let name = wide(n.pCommandListDebugNameW);
                     out.push(format!(
-                        "list \"{}\" on queue \"{}\": {done} of {} operations done; around the stop: {}",
-                        wide(n.pCommandListDebugNameW),
+                        "list \"{name}\" on queue \"{}\": {done} of {} operations done; around the stop: {}",
                         wide(n.pCommandQueueDebugNameW),
                         n.BreadcrumbCount,
                         around.join(" ")
                     ));
+                    out.extend(ops_of(&name, done as usize));
                 }
             }
             node = n.pNext;
@@ -126,7 +157,7 @@ fn wide(p: PCWSTR) -> String {
     unsafe { p.to_string() }.unwrap_or_default()
 }
 
-fn op(o: D3D12_AUTO_BREADCRUMB_OP) -> String {
+fn op_name(o: D3D12_AUTO_BREADCRUMB_OP) -> String {
     let name = match o {
         D3D12_AUTO_BREADCRUMB_OP_SETMARKER => "marker",
         D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT => "begin",
