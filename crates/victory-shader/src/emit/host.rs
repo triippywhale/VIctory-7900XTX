@@ -155,6 +155,13 @@ pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
     }
 }
 
+/// The PCI vendor of the adapter [`create_preferred_device`] picks (0x1002
+/// for AMD), if a device can be made. The device is let go at once.
+pub fn preferred_vendor() -> Option<u32> {
+    let device = create_preferred_device().ok()?;
+    adapter_desc(&device).ok().map(|d| d.VendorId)
+}
+
 #[cfg(test)]
 #[test]
 fn an_explicit_adapter_matches_an_index_or_name() {

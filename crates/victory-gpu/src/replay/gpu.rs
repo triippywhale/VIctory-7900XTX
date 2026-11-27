@@ -56,6 +56,7 @@ impl Worker {
                         None,
                     )?;
                     list.Close()?;
+                    super::dred::name(&list, &format!("replay setup list {}", self.lists.len()));
                     self.lists.push((allocator, list, 0));
                     self.lists.len() - 1
                 }

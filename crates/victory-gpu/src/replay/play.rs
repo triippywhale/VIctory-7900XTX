@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::Interface;
 
+use super::dred;
 use super::edit::{self, Clamp, RESULTS};
 use super::gpu::{self, Seen, Worker};
 use super::snap::read_sub;
@@ -651,16 +652,30 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
-        step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
-        step("pipelines", &mut at);
-        player.make_descriptors()?;
-        step("descriptors", &mut at);
-        player.load_contents()?;
-        step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
-        step("copies to restore from", &mut at);
+        // Each step said as it starts, and the breadcrumbs read when the
+        // device goes: a setup that removes the device says where.
+        dred::name(&player.worker.queue, "replay queue");
+        let set_up = (|| -> Result<()> {
+            tracing::info!("replay: making resources");
+            player.make_resources(options.buffers, &options.only_buffers)?;
+            step("resources", &mut at);
+            tracing::info!("replay: making pipelines");
+            player.make_pipelines(options.shaders.as_deref())?;
+            step("pipelines", &mut at);
+            tracing::info!("replay: making descriptors");
+            player.make_descriptors()?;
+            step("descriptors", &mut at);
+            tracing::info!("replay: loading contents");
+            player.load_contents()?;
+            step("contents", &mut at);
+            tracing::info!("replay: copies to restore from");
+            player.make_masters(options.buffers, options.restore)?;
+            step("copies to restore from", &mut at);
+            Ok(())
+        })();
+        if let Err(e) = set_up {
+            return Err(dred::explain(&player.device, e));
+        }
         let steps: Vec<String> = steps
             .iter()
             .map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64()))
@@ -767,8 +782,12 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and
+        // not resident: the host makes memory that way and has it made
+        // resident before anything names it (`VICTORY_WAIT_RESIDENT`, on
+        // since 2026-11-25), which a replay never does, so its first copy
+        // into such a buffer was a page fault and removed the device.
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -785,7 +804,54 @@ impl Player {
                 .filter(|id| !textures.contains(id))
                 .collect()
         };
+        // Heaps the host opened on title memory (renderer port 1) are
+        // shared across adapters, and no heap the host makes is: how many,
+        // and what is placed in them. `VICTORY_REPLAY_OPENED=0` leaves them
+        // out (and what is placed in them), to tell whether they are what
+        // a replay trips on.
+        let opened: HashSet<u32> = self
+            .frame
+            .heaps
+            .iter()
+            .filter(|h| h.flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER.0 != 0)
+            .map(|h| h.id)
+            .collect();
+        let leave_opened = std::env::var("VICTORY_REPLAY_OPENED").is_ok_and(|v| v.trim() == "0");
+        {
+            let mb = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+            let all_bytes: u64 = self.frame.heaps.iter().map(|h| h.size).sum();
+            let opened_bytes: u64 = self.frame.heaps.iter().filter(|h| opened.contains(&h.id)).map(|h| h.size).sum();
+            let largest = self.frame.heaps.iter().filter(|h| opened.contains(&h.id)).map(|h| h.size).max().unwrap_or(0);
+            let (mut buffers, mut textures, mut placed_bytes) = (0u32, 0u32, 0u64);
+            for r in &self.frame.resources {
+                if let Place::Placed { heap, .. } = r.place
+                    && opened.contains(&heap)
+                {
+                    if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                        buffers += 1;
+                        placed_bytes += r.desc.width;
+                    } else {
+                        textures += 1;
+                    }
+                }
+            }
+            let line = format!(
+                "{} heaps ({:.0} MB); {} opened on title memory ({:.0} MB, the largest {:.1} MB), holding {buffers} buffers ({:.0} MB) and {textures} textures{}",
+                self.frame.heaps.len(),
+                mb(all_bytes),
+                opened.len(),
+                mb(opened_bytes),
+                mb(largest),
+                mb(placed_bytes),
+                if leave_opened { ": left out (VICTORY_REPLAY_OPENED=0)" } else { "" }
+            );
+            tracing::info!("replay: {line}");
+            self.notes.push(line);
+        }
         for h in &self.frame.heaps {
+            if leave_opened && opened.contains(&h.id) {
+                continue;
+            }
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
                 Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
@@ -1418,7 +1484,14 @@ impl Player {
             )?;
             stagings.push((b, data as usize, 0));
         }
+        tracing::info!(
+            "replay: {} parts, {} MB, in {} batches",
+            parts.len(),
+            parts.iter().map(|p| p.1).sum::<u64>() >> 20,
+            batches.len()
+        );
         for (n, batch) in batches.iter().enumerate() {
+            tracing::debug!("replay: batch {n}");
             let k = n % stagings.len();
             self.worker.wait(stagings[k].2)?;
             let map = stagings[k].1;
@@ -1459,7 +1532,12 @@ impl Player {
             // The worker is another part of the player than `copy` uses.
             let other = Worker::new(&self.device, &self.worker.queue)?;
             let mut worker = std::mem::replace(&mut self.worker, other);
-            let sent = worker.send(|l| copy(self, l, &list, &buffer));
+            let sent = worker.send(|l| {
+                let name = format!("replay upload {} batch {n}", parts.len());
+                dred::name(l, &name);
+                copy(self, l, &list, &buffer);
+                dred::ops_recorded(&name);
+            });
             self.worker = worker;
             stagings[k].2 = sent?;
         }
@@ -1512,9 +1590,11 @@ impl Player {
                     continue;
                 };
                 let r = &player.frame.resources[o.index];
+                let what = format!("resource {} \"{}\" ({:?}, {:?})", r.id, r.name, r.place, r.desc);
                 // SAFETY: an open list; live resources.
                 unsafe {
                     if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                        dred::op(format!("contents of {what}: bytes {} to {}", c.first, c.first + len));
                         list.CopyBufferRegion(&o.res, c.first, staging, *at, *len);
                         continue;
                     }
@@ -1526,6 +1606,7 @@ impl Player {
                     );
                     for (i, mut f) in all.into_iter().enumerate() {
                         f.Offset += at;
+                        dred::op(format!("contents of {what}: subresource {}", c.first + i as u64));
                         let to = gpu::sub_location(&o.res, c.first as u32 + i as u32);
                         list.CopyTextureRegion(
                             &to,
@@ -1604,6 +1685,11 @@ impl Player {
         self.upload(&first, &file, |player, list, parts, staging| {
             for (d, len, at) in parts {
                 if let Some(o) = player.objects.get(&d.res) {
+                    let r = &player.frame.resources[o.index];
+                    dred::op(format!(
+                        "CPU changes to resource {} \"{}\" ({:?}, {} bytes): bytes {} to {}",
+                        r.id, r.name, r.place, r.desc.width, d.at, d.at + len
+                    ));
                     // SAFETY: an open list; live buffers.
                     unsafe { list.CopyBufferRegion(&o.res, d.at, staging, *at, *len) };
                 }
@@ -3098,6 +3184,10 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
+        self.run_inner(o).map_err(|e| dred::explain(&self.device, e))
+    }
+
+    fn run_inner(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
