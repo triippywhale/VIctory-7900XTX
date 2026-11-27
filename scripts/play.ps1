@@ -15,6 +15,10 @@
 #               processors 8-12) and VICTORY_TABLE_MEMO=1 (a table entry made ready earlier in a list,
 #               with nothing changed since, not made ready again). -More @{VICTORY_TABLE_MEMO='verify'}
 #               checks the memo instead: its frame line must count 0 changes.
+# -CardLists    VICTORY_CARD_LISTS=1: card copies whose CPU side changed come from a list made as
+#               they are touched, not a walk over all of them at every submission (off without it)
+# -LateLists    the most host lists in the air before the flights are settled
+#               (VICTORY_LATE_WAIT_LISTS; the build's default is 256), for A/B runs: -LateLists 1024
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new
@@ -31,6 +35,8 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$CpuPorts,
+    [switch]$CardLists,
+    [int]$LateLists = 0,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
@@ -51,6 +57,8 @@ if ($Safe) {
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192' }
 if ($CpuPorts) { $settings.VICTORY_AFFINITY = 'free'; $settings.VICTORY_TABLE_MEMO = '1' }
+if ($CardLists) { $settings.VICTORY_CARD_LISTS = '1' }
+if ($LateLists -gt 0) { $settings.VICTORY_LATE_WAIT_LISTS = "$LateLists" }
 $portSwitches = [ordered]@{
     '1' = 'VICTORY_PORT_CONSTANTS'; '2' = 'VICTORY_PORT_DESCRIPTORS'; '5' = 'VICTORY_PORT_CBV'
     '6' = 'VICTORY_PORT_GUARD'; '7' = 'VICTORY_PORT_JOURNAL'
