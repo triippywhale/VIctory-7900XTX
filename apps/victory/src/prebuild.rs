@@ -122,8 +122,14 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                 return Ok(Prebuild::compute(&cs));
             }
         };
-        let [ps, vs, gs, es, ..] = g.stages;
-        if g.stages[4..].iter().any(Option::is_some) {
+        // The last slot, a vertex-fetch program, is ignored: the console
+        // driver builds it from the input layout, which the stream carries,
+        // and a run's vertex shader gets its attributes as inputs (the
+        // container's call to it is the translator's fetch call). Two
+        // records of the title have one, a debug-draw vertex shader with
+        // POSITION and COLOR; every other vertex record has it folded in.
+        let [ps, vs, gs, es, hs, ls, _fetch] = g.stages;
+        if hs.is_some() || ls.is_some() {
             return Err("stages other than vertex, geometry, mesh and pixel".into());
         }
         // A geometry pipeline: the vertex shader runs as the ES, the GS slot
