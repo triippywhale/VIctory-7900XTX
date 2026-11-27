@@ -4329,6 +4329,7 @@ fn late_line(frames: f64) {
     crate::watch::view_once_line(frames);
     crate::port_journal::line(frames);
     crate::port_rt::line(frames);
+    crate::ringmeter::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);

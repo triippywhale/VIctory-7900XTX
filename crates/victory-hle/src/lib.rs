@@ -19,6 +19,9 @@ pub use victory_gpu::frames_begun;
 
 pub mod modules;
 mod registry;
+/// `VICTORY_RING_METER`: hooks on the title's read-back rings.
+#[cfg(windows)]
+pub mod ringhook;
 pub mod runtime;
 
 pub use host::HostPolicy;
