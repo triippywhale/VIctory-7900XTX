@@ -23,6 +23,8 @@
 #               changes the named switches every 20 s and logs each phase's frame times, e.g.
 #               VICTORY_CLAMP_AFTER_WAIT (a pass that bounds indirect arguments right after a wait
 #               of the title's does not wait again) and VICTORY_JOIN_BARRIERS.
+#               -More @{VICTORY_SWAP_BUFFERS='3'}: a third back buffer, so that presenting does not
+#               stand until the frame before is on the screen (off without it; costs-2 run).
 # -NoPrebuild   skip making the title's pipelines ahead (translate --cache --pipelines), which
 #               otherwise runs first, with the same settings: long once per new build or driver,
 #               then only what is new

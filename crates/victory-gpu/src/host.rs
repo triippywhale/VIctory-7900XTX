@@ -9525,7 +9525,27 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// The swap chain's back buffers (`VICTORY_SWAP_BUFFERS=<2..8>`; 2 unless
+/// given).
+///
+/// With two, the buffer the next frame is copied into is the one on the
+/// screen until the frame just presented has been run by the card and
+/// shown, and `Present` may stand until then: in run costs-2 (ray tracing,
+/// 13 fps) the submitting thread was 17-19 ms of every 70 ms frame inside
+/// the host's `Present`, the title waiting behind it, while the card had
+/// nothing queued for 10-15 ms a frame. A third buffer is free at once.
+/// The picture is the same; a buffer more of the card's memory (33 MB at
+/// 3840x2160).
+fn swap_buffers() -> u32 {
+    static N: OnceLock<u32> = OnceLock::new();
+    *N.get_or_init(|| {
+        let n = std::env::var("VICTORY_SWAP_BUFFERS").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(2, |n| n.clamp(2, 8));
+        if n != 2 {
+            tracing::info!(buffers = n, "the swap chain's back buffers (VICTORY_SWAP_BUFFERS)");
+        }
+        n
+    })
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -10034,7 +10054,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(swap_buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
@@ -10287,7 +10307,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: swap_buffers(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
