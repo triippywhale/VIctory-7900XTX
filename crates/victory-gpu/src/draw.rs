@@ -1024,13 +1024,70 @@ fn recheck_frames() -> &'static [u64] {
 /// with nothing to tell of it (`changed_in_place`) is looked at for good,
 /// at the last wait: it stopped after the last look, and what the title
 /// painted into it later was never shown.
-fn next_texture_recheck(frames: &[u64], unchanged_looks: u8, changed_in_place: bool) -> Option<(u8, u64)> {
+/// A texture whose memory read all zeros at its upload (`blank`) is looked
+/// at after [`BLANK_RECHECK_FRAMES`], then twice, four and eight times
+/// that, for as long as its view stays and it reads so
+/// (`VICTORY_BLANK_RECHECK=0`: as any other).
+fn next_texture_recheck(frames: &[u64], unchanged_looks: u8, changed_in_place: bool, blank: bool) -> Option<(u8, u64)> {
+    if blank && blank_recheck() {
+        let wait = BLANK_RECHECK_FRAMES << unchanged_looks.min(3);
+        return Some((unchanged_looks.saturating_add(1), wait));
+    }
     let next = usize::from(unchanged_looks) + 1;
     match frames.get(next) {
         Some(&wait) => Some((next as u8, wait)),
         None => frames.last().filter(|_| changed_in_place).map(|&wait| (unchanged_looks, wait)),
     }
 }
+
+/// How often a texture uploaded from memory that read all zeros is looked
+/// at again. The title commits a texture's pages, writes its view, and
+/// streams or decompresses into it later: at 10-17 frames a second that can
+/// be minutes, after the last of the looks of [`RECHECK_FRAMES`] (576
+/// frames in all). Its host copy then kept the zeros for the rest of the
+/// run, a black surface under the layers drawn over it (the lockers of the
+/// cell block, black in one run and right in the next). A look reads 48 KiB;
+/// the waits grow to 64 frames, so that a backlog of thousands of such
+/// slots reads a few MB a frame at most.
+const BLANK_RECHECK_FRAMES: u64 = 8;
+
+fn blank_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BLANK_RECHECK").is_none_or(|v| v != "0"))
+}
+
+/// Names a texture picked by index whose memory reads all zeros (the first
+/// 300 such lines): its slot, memory and view, whether its pages are shown
+/// at other addresses too (written there, the pass would not see it here),
+/// and whether a title buffer holds its memory (shaders or copies may
+/// write it on the card through that buffer, out of this pass's sight).
+fn blank_texture_said(what: &str, slot: u32, address: u64, bytes: u64, frames: u64, view: Option<&View>) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 300 {
+        return;
+    }
+    let shown_elsewhere = crate::inplace::shown_elsewhere(address as usize & !0xffff, (address + bytes) as usize).len();
+    let in_buffers: Vec<String> = crate::shadow::spans()
+        .into_iter()
+        .filter(|&(start, len, _)| start < address + bytes && address < start + len)
+        .take(4)
+        .map(|(start, len, window)| format!("{start:#x}+{len:#x}{}", if window { " (window)" } else { "" }))
+        .collect();
+    tracing::warn!(
+        slot,
+        address = format_args!("{address:#x}"),
+        bytes,
+        frames_since_upload = frames,
+        blocks_shown_elsewhere = shown_elsewhere,
+        in_buffers = ?in_buffers,
+        view = ?view,
+        "a texture picked by index: {what}"
+    );
+}
+
+/// Since the start: whole uploads of textures picked by index from memory
+/// that read all zeros, and of those found filled by a later look.
+pub(crate) static HEAP_TEXTURES_BLANK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2778,7 +2835,13 @@ impl State {
                     checked;
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match next_texture_recheck(recheck_frames(), looks, checked.changed_in_place) {
+                    // Still all zeros some 250 frames on: named once, with
+                    // what may fill it where this pass does not read.
+                    if checked.blank && looks == 5 {
+                        let view = heap.handle(index).and_then(crate::descriptor::view);
+                        blank_texture_said("still all zeros", index, at, len, frame.saturating_sub(uploaded), view.as_ref());
+                    }
+                    match next_texture_recheck(recheck_frames(), looks, checked.changed_in_place, checked.blank) {
                         Some((looks, wait)) => {
                             checked.unchanged_looks = looks;
                             host.texture_slot_recheck(index, write, frame + wait, checked);
@@ -2788,6 +2851,9 @@ impl State {
                     continue;
                 }
                 changed_in_place = true;
+                if checked.blank {
+                    HEAP_TEXTURES_BLANK[1].fetch_add(1, Ordering::Relaxed);
+                }
                 if recheck_soon() {
                     again_in = 1;
                 }
@@ -2816,13 +2882,20 @@ impl State {
             // The slot was uploaded whole from `bytes` at `address`: its
             // first look is due.
             let schedule_recheck = |address, bytes| {
+                let (fingerprint, blank) = crate::texture::fingerprint_blank(address, bytes);
+                if blank {
+                    HEAP_TEXTURES_BLANK[0].fetch_add(1, Ordering::Relaxed);
+                    let view = heap.handle(index).and_then(crate::descriptor::view);
+                    blank_texture_said("uploaded from memory that reads all zeros", index, address, bytes, 0, view.as_ref());
+                }
                 let checked = TextureRecheck {
                     address,
                     bytes,
-                    fingerprint: crate::texture::fingerprint(address, bytes),
+                    fingerprint,
                     unchanged_looks: 0,
                     uploaded: frame,
                     changed_in_place,
+                    blank,
                 };
                 host.texture_slot_recheck(index, write, frame + again_in, checked);
             };
@@ -5370,18 +5443,29 @@ mod tests {
     fn only_previously_changed_textures_keep_the_final_recheck_interval() {
         let frames = &RECHECK_FRAMES[..5];
         for changed in [false, true] {
-            assert_eq!(next_texture_recheck(frames, 0, changed), Some((1, 12)));
-            assert_eq!(next_texture_recheck(frames, 1, changed), Some((2, 40)));
-            assert_eq!(next_texture_recheck(frames, 2, changed), Some((3, 120)));
-            assert_eq!(next_texture_recheck(frames, 3, changed), Some((4, 400)));
+            assert_eq!(next_texture_recheck(frames, 0, changed, false), Some((1, 12)));
+            assert_eq!(next_texture_recheck(frames, 1, changed, false), Some((2, 40)));
+            assert_eq!(next_texture_recheck(frames, 2, changed, false), Some((3, 120)));
+            assert_eq!(next_texture_recheck(frames, 3, changed, false), Some((4, 400)));
         }
-        assert_eq!(next_texture_recheck(frames, 4, false), None);
-        let (looks, wait) = next_texture_recheck(frames, 4, true).unwrap();
+        assert_eq!(next_texture_recheck(frames, 4, false, false), None);
+        let (looks, wait) = next_texture_recheck(frames, 4, true, false).unwrap();
         assert_eq!((looks, wait), (4, 400));
-        assert_eq!(next_texture_recheck(frames, looks, true), Some((4, 400)));
-        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 4, false), Some((5, 1200)));
-        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, false), None);
-        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, true), Some((6, 3600)));
+        assert_eq!(next_texture_recheck(frames, looks, true, false), Some((4, 400)));
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 4, false, false), Some((5, 1200)));
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, false, false), None);
+        assert_eq!(next_texture_recheck(&RECHECK_FRAMES, 6, true, false), Some((6, 3600)));
+    }
+
+    /// A texture uploaded from memory that read all zeros is looked at
+    /// every few frames for good, past the last of the usual looks.
+    #[test]
+    fn blank_textures_keep_being_looked_at() {
+        let frames = &RECHECK_FRAMES[..5];
+        for (looks, wait) in [(0, 8), (1, 16), (2, 32), (3, 64), (4, 64), (200, 64), (u8::MAX, 64)] {
+            assert_eq!(next_texture_recheck(frames, looks, false, true), Some((looks.saturating_add(1), wait)));
+        }
+        assert_eq!(super::BLANK_RECHECK_FRAMES, 8);
     }
 
     #[test]

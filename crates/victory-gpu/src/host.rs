@@ -10203,11 +10203,13 @@ impl Meter {
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                     {picked_waiting} waiting, {picked_away} passed over unmapped, {picked_blank} uploaded from memory that read all zeros ({picked_filled} of them filled later); depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
                     picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
+                    picked_blank = crate::draw::HEAP_TEXTURES_BLANK[0].load(Ordering::Relaxed),
+                    picked_filled = crate::draw::HEAP_TEXTURES_BLANK[1].load(Ordering::Relaxed),
                     du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
                     du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
                     du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
