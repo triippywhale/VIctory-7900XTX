@@ -43,6 +43,7 @@ pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
+mod helpers;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

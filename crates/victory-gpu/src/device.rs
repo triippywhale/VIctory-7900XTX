@@ -162,6 +162,9 @@ pub extern "system" fn create(
     if *iid == LEVEL_IIDS[8] {
         NEWER.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // Our own passes, while the title loads.
+    #[cfg(windows)]
+    crate::helpers::ahead();
     object::answer(object::DEVICE, iid, Some(device()), out)
 }
 
