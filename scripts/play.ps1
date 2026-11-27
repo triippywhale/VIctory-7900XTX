@@ -4,18 +4,20 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower;
 #               kept in a band of the stand-in's estimate (VICTORY_AMBIENT_RT=1,1.5)
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
-# -Build        target\diag (the default, the build all measurements are of) or target\release
+# -Build        target\diag (the default, the build all measurements are of), target\release, or
+#               target\x3d (`cargo x3d`: the diag build made for Zen 4, -C target-cpu=znver4)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # -Ports        which renderer patches run, for A/B runs (README.md, "Renderer patches"):
 #               1 = VICTORY_PORT_CONSTANTS, 2 = VICTORY_PORT_DESCRIPTORS, 5 = VICTORY_PORT_CBV,
 #               6 = VICTORY_PORT_GUARD, 7 = VICTORY_PORT_JOURNAL. The listed ones are set to 1 and
 #               the others to 0: -Ports 1,5, -Ports all, or -Ports none (all five off). Without it
 #               each keeps the build's default (1 and 5 on, the rest off). -More still wins over it.
-# -CpuPorts     two recording-thread trims from Op-lite/victory-scarlett, both off without it:
-#               VICTORY_AFFINITY=free (the title's five recording threads not pinned to logical
-#               processors 8-12) and VICTORY_TABLE_MEMO=1 (a table entry made ready earlier in a list,
+# -CpuPorts     a recording-thread trim from Op-lite/victory-scarlett, off without it:
+#               VICTORY_TABLE_MEMO=1 (a table entry made ready earlier in a list,
 #               with nothing changed since, not made ready again). -More @{VICTORY_TABLE_MEMO='verify'}
-#               checks the memo instead: its frame line must count 0 changes.
+#               checks the memo instead: its frame line must count 0 changes. (The title's five
+#               recording threads are no longer pinned to logical processors 8-12 in any case;
+#               -More @{VICTORY_AFFINITY='console'} pins them as before.)
 # -CardLists    VICTORY_CARD_LISTS=1: card copies whose CPU side changed come from a list made as
 #               they are touched, not a walk over all of them at every submission (off without it)
 # -LateLists    the most host lists in the air before the flights are settled
@@ -48,7 +50,7 @@ param(
     [switch]$CardLists,
     [int]$LateLists = 0,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
-    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateSet('diag', 'release', 'x3d')][string]$Build = 'diag',
     [hashtable]$More = @{},
     [switch]$NoPrebuild,
     [switch]$CleanCache,
@@ -66,7 +68,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1'; $settings.VICTORY_BVH_FAULTS = '8192'; $settings.VICTORY_AMBIENT_RT = '1,1.5' }
-if ($CpuPorts) { $settings.VICTORY_AFFINITY = 'free'; $settings.VICTORY_TABLE_MEMO = '1' }
+if ($CpuPorts) { $settings.VICTORY_TABLE_MEMO = '1' }
 if ($CardLists) { $settings.VICTORY_CARD_LISTS = '1' }
 if ($LateLists -gt 0) { $settings.VICTORY_LATE_WAIT_LISTS = "$LateLists" }
 $portSwitches = [ordered]@{

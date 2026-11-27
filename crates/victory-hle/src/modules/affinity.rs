@@ -7,13 +7,18 @@
 //! squeeze busy threads onto a few cores (measured: recording 210 → 165 ms
 //! summed a frame with the masks lifted).
 //!
-//! `VICTORY_AFFINITY=free` (off by default; `scripts\play.ps1 -CpuPorts` sets it):
-//! calls from title code succeed, report the previous mask the title set (or
-//! the thread's real one) and are remembered per thread id, so a get after a
-//! set returns what the title expects, but the thread is not narrowed.
-//! `VICTORY_AFFINITY=console` (the default): passed to Windows as before. Only
-//! the title's imports reach these functions; the layer's own threads are
-//! never touched.
+//! `VICTORY_AFFINITY=free` (the default): calls from title code succeed,
+//! report the previous mask the title set (or the thread's real one) and are
+//! remembered per thread id, so a get after a set returns what the title
+//! expects, but the thread is not narrowed. `VICTORY_AFFINITY=console`: passed
+//! to Windows as before. Only the title's imports reach these functions; the
+//! layer's own threads are never touched.
+//!
+//! On by default since the PC this fork is played on is a Ryzen 7 7800X3D: 8
+//! cores, 16 logical processors, two to a core. There mask 0x1f00 is cores 4,
+//! 5 and half of 6, so the five recorders shared two and a half cores while
+//! the rest of the processor was free to them. The measurement below is of a
+//! 9800X3D, the same layout of cores and cache.
 //!
 //! From Op-lite/victory-scarlett (`scarlett-fox`, 411a745/c45b43e), measured
 //! there on a Ryzen 7 9800X3D: recording 210 -> 165 ms summed a frame, heavy
@@ -61,11 +66,11 @@ fn mode() -> Mode {
         _ => {}
     }
     let m = match std::env::var("VICTORY_AFFINITY").ok().as_deref().map(str::trim) {
-        Some("free") => Mode::Free,
-        None | Some("") | Some("console") => Mode::Console,
+        None | Some("") | Some("free") => Mode::Free,
+        Some("console") => Mode::Console,
         Some(other) => {
-            tracing::warn!(value = other, "VICTORY_AFFINITY: unknown value, using console");
-            Mode::Console
+            tracing::warn!(value = other, "VICTORY_AFFINITY: unknown value, using free");
+            Mode::Free
         }
     };
     MODE.store(if m == Mode::Free { 1 } else { 2 }, Relaxed);
