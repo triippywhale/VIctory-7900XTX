@@ -118,7 +118,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let g = match job {
             Job::Graphics(i) => &graphics[i],
             Job::Compute(i) => {
-                let (cs, _) = container(compute[i].stage.program).ok_or("shader not found")?;
+                let (cs, _) = container(compute[i].stage.program).ok_or("compute shader not found")?;
                 return Ok(Prebuild::compute(&cs));
             }
         };
@@ -138,19 +138,19 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let mut geometry = None;
         let (first, stage) = match es {
             Some(es) => {
-                let (vs, stage) = container(es.program).ok_or("shader not found")?;
+                let (vs, stage) = container(es.program).ok_or("vertex shader (ES) not found")?;
                 let (g, gstage) =
-                    gs.and_then(|s| container(s.program)).ok_or("shader not found")?;
+                    gs.and_then(|s| container(s.program)).ok_or("geometry shader not found")?;
                 if (stage, gstage) != (HwStage::Es, HwStage::Gs) {
                     return Err("an ES without a geometry program".into());
                 }
                 geometry = Some(g);
                 (vs, HwStage::Vs)
             }
-            None => vs.or(gs).and_then(|s| container(s.program)).ok_or("shader not found")?,
+            None => vs.or(gs).and_then(|s| container(s.program)).ok_or("vertex or mesh shader not found")?,
         };
         let pixel = match ps {
-            Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
+            Some(ps) => Some(container(ps.program).ok_or("pixel shader not found")?.0),
             None => None,
         };
         let mesh = match stage {
