@@ -398,10 +398,12 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes), and for how many of those uses
+/// the pass was recorded before the draw or dispatch after all
+/// (`VICTORY_PLANE_NOW`).
 #[cfg(windows)]
-pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -4773,6 +4775,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
+        plane_from_twin(false);
+    }
+
+    /// (`VICTORY_PLANE_NOW`) The list that wrote the twin uses the depth
+    /// texture afterwards: the pass is recorded before that use, not at
+    /// the list's close (which then has nothing left to draw).
+    #[test]
+    fn a_depth_plane_is_given_its_twin_before_a_use_in_the_same_list() {
+        plane_from_twin(true);
+    }
+
+    fn plane_from_twin(early: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -4952,6 +4966,16 @@ mod tests {
         let list = host.new_list().unwrap();
         assert!(list.twin_use(depth, true, true));
         list.twins_written();
+        if early && crate::host::plane_now() {
+            // A use of the depth texture by the same list: its plane is
+            // noted as late, and the pass recorded now. The close finds
+            // nothing left to do for it.
+            assert!(list.twin_use(depth, false, false));
+            let late = list.take_plane_late();
+            assert_eq!(late.len(), 1);
+            list.planes_now(&late);
+            assert!(list.take_plane_late().is_empty());
+        }
         list.close();
         host.execute(&[&list]);
 
