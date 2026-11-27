@@ -4549,6 +4549,37 @@ fn make_twinned(
         // make_at and the mirror path write a typed null for this view.
         View::Constant(0, _) => None,
         &View::Constant(address, size) => {
+            // Renderer port 1, constants in place (`VICTORY_PORT_CONSTANTS=3`):
+            // in the title's 32-bit heap, a view of the title's bytes there
+            // (the region's buffer outlives the view). With renderer port 5
+            // the slot is read raw through its twin: a raw view on 16 bytes
+            // (a slot read raw must hold a raw view); else a constant buffer
+            // view on 256.
+            if crate::port::constants_only() {
+                if crate::port_cbv::on() {
+                    if let Some((whole, gpu)) = crate::port::constant_raw_view(address, u64::from(size), crate::port::Bound::Slot)
+                        && constant_twinned(whole, gpu, size, at, twin)
+                    {
+                        return Some(Some(whole.clone()));
+                    }
+                } else if let Some((whole, gpu)) =
+                    crate::port::constant_gpu(address, u64::from(constant_bytes(size).max(256)), crate::port::Bound::Slot)
+                {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: gpu,
+                        SizeInBytes: constant_bytes(size),
+                    };
+                    // SAFETY: slots of our heap; the range lies in the
+                    // region's buffer.
+                    unsafe {
+                        device.CreateConstantBufferView(Some(&desc), at);
+                        if let Some(twin) = twin {
+                            device.CreateConstantBufferView(Some(&desc), twin);
+                        }
+                    }
+                    return Some(Some(whole.clone()));
+                }
+            }
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if crate::port_cbv::on() {
