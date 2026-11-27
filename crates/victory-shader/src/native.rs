@@ -61,7 +61,23 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//!
+//! A geometry program (GS) runs as the GS half of a legacy (not NGG) merged
+//! ES+GS stage; its record is longer and holds its copy shader too:
+//!
+//! ```text
+//! GS  record +0x88 u64 copy shader code offset, +0x90 u64 its size
+//!             (payload-relative): the hardware VS program that reads each
+//!             emitted vertex back from the GS-VS ring and exports it
+//!     E+0x150 32 outputs of 6 B as VS (`exp param<n>` of the copy shader);
+//!             E+0x210 u32 count
+//!     E+0x27c u32 GS-VS ring item per primitive (dwords: maximum vertices
+//!             times the vertex size), E+0x284 u32 maximum vertices,
+//!             E+0x28c u32 vertex size (dwords)
+//! ```
+//!
+//! Other merged stages (ES, LS, HS) keep their stage data in another layout
+//! (not read).
 //!
 //! Kind 0x0c holds the same `FSSM` blob unpacked.
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
@@ -126,6 +142,17 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+/// GS stage data: the copy shader (offset, size), outputs, ring layout.
+const GS_COPY: usize = 0x34;
+const GS_OUTPUTS: usize = 0x150;
+const GS_OUTPUT_COUNT: usize = 0x210;
+const GS_ITEM: usize = 0x27c;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX: usize = 0x28c;
+/// A geometry shader emits at most 1024 vertices (DXIL).
+const MAX_GS_VERTICES: u32 = 1024;
+/// A vertex of the GS-VS ring: at most 32 four-dword rows.
+const MAX_GS_VERTEX_DWORDS: u32 = 128;
 const FSPX_VERSION: u32 = 1;
 const FSPX_HEADER: usize = 0x10;
 const FSPX_PACKET: u32 = 0;
@@ -196,8 +223,58 @@ impl NativeProgram {
                 }
             }
         }
+        if let StageIo::Gs(_) = &self.io
+            && let Some(at) = gs_lane_count(&code)
+        {
+            code[at..at + 4].copy_from_slice(&S_MOV_B64_EXEC_ALL.to_le_bytes());
+        }
         code
     }
+}
+
+/// `s_mov_b64 exec, -1`.
+const S_MOV_B64_EXEC_ALL: u32 = 0xBEFE_04C1;
+
+/// Where a geometry program sets EXEC to its wave's primitives: the GS
+/// lane count (bits 8-15 of the merged wave info in s3, `s_bfe_* sN, s3,
+/// 0x80008`) made into a mask (`s_bfm_b64 exec, sN, 0`) before the first
+/// branch. On the host every lane is a primitive: there the code is
+/// patched to all lanes, as the same lane count of a full wave would set
+/// them. (A count of 64 goes through `s_cselect_b64 exec, -1, exec` after
+/// it, which then keeps all lanes.)
+fn gs_lane_count(code: &[u8]) -> Option<usize> {
+    use crate::gfx10::{Fields, Operand};
+    let insts = crate::gfx10::decode(code).ok()?;
+    let mut count = None;
+    for i in insts.iter().take(64) {
+        let fields = i.fields(true);
+        let name = i.name().unwrap_or("");
+        let Fields::Sop { dst, src, .. } = &fields else {
+            if matches!(fields, Fields::Sopp { .. }) && name.starts_with("s_cbranch") {
+                return None;
+            }
+            continue;
+        };
+        let dst = match dst {
+            Some(Operand::Scalar { code, .. }) => Some(*code),
+            _ => None,
+        };
+        match (name, &src[..]) {
+            (
+                "s_bfe_i32" | "s_bfe_u32",
+                [Operand::Scalar { code: 3, .. }, Operand::Literal(0x0008_0008)],
+            ) => count = dst,
+            ("s_bfm_b64", [Operand::Scalar { code, .. }, Operand::Const(128)])
+                if dst == Some(126) && count == Some(*code) && i.words.len() == 1 =>
+            {
+                return Some(i.offset);
+            }
+            // The count is overwritten, or s3 is.
+            _ if dst.is_some() && (dst == count || dst == Some(3)) => count = None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// What a semantic is, as the stage data names it.
@@ -286,6 +363,24 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's outputs and ring layout. Each lane runs one input
+/// primitive: it reads its vertices from the ES-GS ring in LDS (each one's
+/// offset in a 16-bit field of v0, v1 or v4), writes the vertices it makes
+/// into its item of the GS-VS ring (vertex k at `k * vertex_dwords`), and
+/// counts them with `s_sendmsg` GS EMIT (CUT ends a strip). The copy shader
+/// reads each emitted vertex back and exports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// The copy shader's `exp param<n>` targets.
+    pub outputs: Vec<VsOutput>,
+    pub max_vertices: u32,
+    /// A vertex of the GS-VS ring, in dwords.
+    pub vertex_dwords: u32,
+    /// The copy shader (a hardware VS program), as stored.
+    pub copy: Vec<u8>,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -745,6 +840,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data, payload)?,
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -819,7 +915,11 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
 }
 
 fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
-    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+    outputs_at(data, VS_OUTPUTS, VS_OUTPUT_COUNT)
+}
+
+fn outputs_at(data: &[u8], at: usize, count_at: usize) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, at, 6, count_at)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -847,6 +947,25 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         .collect();
     let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn gs_io(data: &[u8], payload: &[u8]) -> Result<StageIo, ShaderError> {
+    let copy = bytes(payload, u64_at(data, GS_COPY)?, u64_at(data, GS_COPY + 8)?)
+        .ok_or(Malformed("copy shader out of bounds"))?;
+    let max_vertices = u32_at(data, GS_MAX_VERTICES)?;
+    let vertex_dwords = u32_at(data, GS_VERTEX)?;
+    if !(1..=MAX_GS_VERTICES).contains(&max_vertices)
+        || !(1..=MAX_GS_VERTEX_DWORDS).contains(&vertex_dwords)
+        || u64::from(u32_at(data, GS_ITEM)?) != u64::from(max_vertices) * u64::from(vertex_dwords)
+    {
+        return Err(Malformed("implausible GS-VS ring layout"));
+    }
+    Ok(StageIo::Gs(GeometryIo {
+        outputs: outputs_at(data, GS_OUTPUTS, GS_OUTPUT_COUNT)?,
+        max_vertices,
+        vertex_dwords,
+        copy: copy.to_vec(),
+    }))
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -967,6 +1086,48 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// A geometry program's record: its outputs, ring layout and copy
+    /// shader; a layout whose item is not the vertices times their size is
+    /// refused.
+    #[test]
+    fn reads_geometry_stage_data() {
+        let mut blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Gs);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Gs)).unwrap() as usize;
+        // The copy shader: the first half of the program's code.
+        let code = u64_at(&blob, record).unwrap();
+        let mut put = |at: usize, v: &[u8]| blob[e + at..e + at + v.len()].copy_from_slice(v);
+        put(GS_COPY, &code.to_le_bytes());
+        put(GS_COPY + 8, &4u64.to_le_bytes());
+        put(GS_OUTPUTS, &[6, 1, 0, 1, 0, 0, 6, 2, 1, 2, 0, 0]);
+        put(GS_OUTPUT_COUNT, &2u32.to_le_bytes());
+        put(GS_ITEM, &48u32.to_le_bytes());
+        put(GS_MAX_VERTICES, &3u32.to_le_bytes());
+        put(GS_VERTEX, &16u32.to_le_bytes());
+        let found = programs(&blob).unwrap();
+        let output = |row, param| VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        assert_eq!(
+            found[0].io,
+            StageIo::Gs(GeometryIo {
+                outputs: vec![output(1, 0), output(2, 1)],
+                max_vertices: 3,
+                vertex_dwords: 16,
+                copy: VS_CODE[..4].to_vec(),
+            })
+        );
+        blob[e + GS_ITEM] = 47;
+        assert_eq!(
+            programs(&blob),
+            Err(Malformed("implausible GS-VS ring layout"))
+        );
     }
 
     #[test]

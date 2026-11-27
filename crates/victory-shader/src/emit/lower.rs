@@ -14,10 +14,10 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Copied, Export, Input, Interp, Io, Message, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, MEMORY, Resources, Role, SYSTEM, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -85,6 +85,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: what the stage declares (from the container's `PSV0`).
+    pub geometry: Option<super::shader::Geometry>,
 }
 
 enum Stop {
@@ -407,6 +409,11 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Geometry: the lane's GS-VS ring item as the program has written it
+    /// so far, by dword ([`Lower::emit_vertices`]).
+    ring: HashMap<u32, V>,
+    /// Geometry: each emit and cut so far, with the lanes it holds for.
+    gs_marks: Vec<(Message, Option<V>)>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2204,6 +2211,9 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        if let StageIo::Gs(_) = &x.native.io {
+            s.geometry = x.geometry;
+        }
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -2342,7 +2352,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Gs => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -2366,6 +2376,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            ring: HashMap::new(),
+            gs_marks: Vec::new(),
         }
     }
 
@@ -3191,7 +3203,18 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            // A geometry program's primitive is the host's.
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                return self.system_value("primitiveID.i32", 108);
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            Input::GsInstanceId => return self.system_value("gsInstanceID.i32", 100),
+            // Only ring addresses are made of these (`crate::geometry`), and
+            // no ring access is lowered as an address.
+            Input::GsVertexOffsets | Input::GsRingOffset => return Val::I32(self.s.m.i32(0)),
+            // Each host lane is a primitive: a whole wave of ES and GS lanes,
+            // message id 0.
+            Input::GsWaveInfo => return Val::I32(self.s.m.i32(64 | 64 << 8)),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -3268,6 +3291,12 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
+    /// A system value without operands, read in the entry block.
+    fn system_value(&mut self, name: &str, opcode: u32) -> Val {
+        let entry = self.s.entry;
+        Val::I32(self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[]))
+    }
+
     /// A component of a compute thread or group id, read in the entry block.
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
@@ -3298,6 +3327,11 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        self.load_input_at(id, col, None)
+    }
+
+    /// [`Self::load_any_input`] of a geometry program's input `vertex`.
+    fn load_input_at(&mut self, id: usize, col: u8, vertex: Option<u32>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -3320,7 +3354,10 @@ impl<'a> Lower<'a> {
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
+            match vertex {
+                Some(k) => self.s.m.i32(k),
+                None => self.s.m.undef(self.s.t.i32),
+            },
         ];
         let v = self.s.op(
             entry,
@@ -5780,8 +5817,191 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A geometry program's LDS access ([`crate::io::Geometry`]): a read of
+    /// an input vertex, or a write into the lane's GS-VS ring item, which
+    /// is kept in values ([`Self::emit_vertices`]).
+    fn ring_access(
+        &mut self,
+        inst: &Inst,
+        g: &crate::io::Geometry,
+        site: Site,
+    ) -> Result<(), Why> {
+        let Fields::Ds { dst, data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let guard = self.guard(site.0, site.1)?;
+        if let Some((_, dwords)) = g.reads.iter().find(|r| r.0 == site) {
+            let Some(Operand::Vector { reg, .. }) = *dst else {
+                return Err("an LDS read result");
+            };
+            for (n, &(vertex, dword)) in dwords.iter().enumerate() {
+                let (row, ch) = ((dword / 4) as u8, (dword % 4) as u8);
+                let (id, col) = self
+                    .find_input(row, ch)
+                    .ok_or("an input vertex's dword the signature lacks")?;
+                if self.s.inputs[id].half {
+                    return Err("a 16-bit geometry input");
+                }
+                let Val::I32(x) = self.load_input_at(id, col, Some(u32::from(vertex))) else {
+                    return Err("a geometry input");
+                };
+                self.write(inst, Reg::V(reg + n as u8), x, guard);
+            }
+            return Ok(());
+        }
+        let (_, dwords) = g
+            .writes
+            .iter()
+            .find(|w| w.0 == site)
+            .ok_or("an LDS access of a geometry program")?;
+        let mut values = Vec::new();
+        for d in data {
+            let Operand::Vector { dwords, .. } = *d else {
+                return Err("an LDS write");
+            };
+            values.extend(self.vgprs(inst, d, dwords)?);
+        }
+        if values.len() != dwords.len() {
+            return Err("an LDS write");
+        }
+        let c = self.cur;
+        for (&d, x) in dwords.iter().zip(values) {
+            let x = match guard {
+                Some(g) => {
+                    let old = match self.ring.get(&d) {
+                        Some(&old) => old,
+                        None => self.s.m.i32(0),
+                    };
+                    self.s.m.select(c, g, x, old)
+                }
+                None => x,
+            };
+            self.ring.insert(d, x);
+        }
+        Ok(())
+    }
+
+    /// A geometry program's emit or cut, kept for [`Self::emit_vertices`].
+    fn gs_message(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        let g = self.x.io.geometry.as_ref().ok_or("a message")?;
+        let &(_, m) = g
+            .messages
+            .iter()
+            .find(|m| m.0 == (b, i))
+            .ok_or("a message of a geometry program")?;
+        if m != Message::Done {
+            let guard = self.guard(b, i)?;
+            self.gs_marks.push((m, guard));
+        }
+        Ok(())
+    }
+
+    /// The end of a geometry program: each vertex the lane emitted, from its
+    /// GS-VS ring item as the copy shader exports it, with `emitStream`; a
+    /// strip ends before the vertex a cut came before.
+    fn emit_vertices(&mut self) -> Result<(), Why> {
+        let g = self.x.io.geometry.as_ref().ok_or("a geometry program")?;
+        let i32t = self.s.t.i32;
+        let one = self.s.m.i32(1);
+        let mut count = self.s.m.i32(0);
+        // The vertex count where each cut came, and its lanes.
+        let mut cuts = Vec::new();
+        for (m, guard) in self.gs_marks.clone() {
+            let c = self.cur;
+            if matches!(m, Message::Emit | Message::EmitCut) {
+                let add = match guard {
+                    Some(g) => self.s.m.cast(c, Cast::ZExt, g, i32t),
+                    None => one,
+                };
+                count = self.s.m.bin(c, Bin::Add, count, add);
+            }
+            if matches!(m, Message::Cut | Message::EmitCut) {
+                cuts.push((count, guard));
+            }
+        }
+        // Where each exported channel goes: (output element, column, value).
+        let mut stores: Vec<(usize, u8, Copied)> = Vec::new();
+        for (target, channels) in &g.copies {
+            for (ch, value) in channels.iter().enumerate() {
+                let Some(value) = *value else { continue };
+                let ch = ch as u8;
+                let outputs = &self.s.outputs;
+                let found = match *target {
+                    Target::Position(0) => {
+                        outputs.iter().position(|o| o.kind == 3).map(|id| (id, ch))
+                    }
+                    Target::Param { row, .. } => outputs
+                        .iter()
+                        .position(|o| {
+                            o.row == Some(u32::from(row)) && ch >= o.col && ch < o.col + o.cols
+                        })
+                        .map(|id| (id, ch - outputs[id].col)),
+                    Target::Unread | Target::Null => None,
+                    _ => return Err("clip, cull or point-size exports"),
+                };
+                if let Some((id, col)) = found {
+                    if outputs[id].half {
+                        return Err("a 16-bit geometry output");
+                    }
+                    stores.push((id, col, value));
+                }
+            }
+        }
+        let stream = self.s.m.i8(0);
+        let void = self.s.t.void;
+        for k in 0..g.max_vertices {
+            let (then, next) = (self.s.m.new_block(), self.s.m.new_block());
+            let kk = self.s.m.i32(k);
+            let more = self.s.m.cmp(self.cur, pred::IUGT, count, kk);
+            self.s.m.terminate(self.cur, Term::CondBr(more, then, next));
+            self.cur = then;
+            if k > 0 && !cuts.is_empty() {
+                let mut cut = self.s.m.bool(false);
+                for &(at, guard) in &cuts {
+                    let here = self.s.m.cmp(then, pred::EQ, at, kk);
+                    let here = match guard {
+                        Some(g) => self.s.m.bin(then, Bin::And, here, g),
+                        None => here,
+                    };
+                    cut = self.s.m.bin(then, Bin::Or, cut, here);
+                }
+                let (restart, after) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(then, Term::CondBr(cut, restart, after));
+                self.s.op(restart, "cutStream", Attr::NoUnwind, void, 98, &[stream]);
+                self.s.m.terminate(restart, Term::Br(after));
+                self.cur = after;
+            }
+            for &(id, col, value) in &stores {
+                let x = match value {
+                    Copied::Ring(d) => match self.ring.get(&(k * g.vertex_dwords + d)) {
+                        Some(&x) => x,
+                        None => self.s.m.i32(0),
+                    },
+                    Copied::Const(n) => self.s.m.i32(n),
+                };
+                let el = &mut self.s.outputs[id];
+                el.usage |= 1 << col;
+                let (suffix, x) = if el.comp == 9 {
+                    (".f32", self.as_float(x))
+                } else {
+                    (".i32", x)
+                };
+                let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), x];
+                let name = format!("storeOutput{suffix}");
+                self.s.op(self.cur, &name, Attr::NoUnwind, void, 5, &args);
+            }
+            self.s.op(self.cur, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
+            self.s.m.terminate(self.cur, Term::Br(next));
+            self.cur = next;
+        }
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        if let Some(g) = self.x.io.geometry.as_ref() {
+            return self.ring_access(inst, g, (b, i));
+        }
         let Fields::Ds {
             dst,
             addr,
@@ -6316,6 +6536,10 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { .. } if name.starts_with("s_sendmsg") && self.x.io.geometry.is_some() =>
+            {
+                return self.gs_message(b, i).map_err(|why| unsupported(offset, why));
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -7141,6 +7365,18 @@ impl<'a> Lower<'a> {
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
+        }
+        if self.scalar.get(&site).is_some_and(|a| a.param == SYSTEM) {
+            // The driver's table: its dword places the GS-VS ring in LDS,
+            // which the host has not got (`resource::SYSTEM`).
+            let Some(Operand::Scalar { code, dwords }) = *data else {
+                return Err("a scalar load");
+            };
+            for k in 0..dwords {
+                let z = self.s.m.i32(0);
+                self.write(inst, Reg::S(code + k), z, None);
+            }
+            return Ok(());
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -13998,6 +14234,9 @@ impl<'a> Lower<'a> {
                 Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
+                if self.x.io.geometry.is_some() {
+                    self.emit_vertices().map_err(|why| unsupported(offset, why))?;
+                }
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
                     // A lane leaving without its final export was killed.
                     let t = self.s.m.bool(true);
@@ -14639,6 +14878,7 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap()
     }
@@ -14689,6 +14929,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .map(|_| ())
     }
@@ -14739,6 +14980,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
     }
 
@@ -14909,6 +15151,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         }).unwrap();
 
         let container =

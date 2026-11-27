@@ -87,6 +87,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod geometry_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -385,8 +387,8 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or geometry program of a
+/// console shader container.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -423,12 +425,12 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or geometry program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -749,7 +751,16 @@ fn emit_program(
     }
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
-    let interpolated = if pixel { &mut inputs } else { &mut outputs };
+    let geometry = native.stage == HwStage::Gs;
+    let interpolated: Vec<&mut container::SigElement> = if pixel {
+        inputs.iter_mut().collect()
+    } else if geometry {
+        // A geometry program's inputs are vertex outputs: their modes as a
+        // vertex shader declares them (as the rectangle stage, `rect.rs`).
+        inputs.iter_mut().chain(outputs.iter_mut()).collect()
+    } else {
+        outputs.iter_mut().collect()
+    };
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
@@ -764,11 +775,15 @@ fn emit_program(
         };
     }
     // (DexNom/VIctory 5f4c3df4.)
-    if native.stage == HwStage::Vs
+    if matches!(native.stage, HwStage::Vs | HwStage::Gs)
         && let Some(psv) = c.part(FourCC::PSV0)
     {
         vertex_output_interpolation(psv.data, &mut outputs)?;
     }
+    let geometry = match (&native.io, io.geometry.as_ref()) {
+        (crate::native::StageIo::Gs(_), Some(g)) => Some(geometry_state(c, g.max_vertices)?),
+        _ => None,
+    };
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -811,6 +826,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        geometry,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -838,7 +854,36 @@ fn emit_program(
     Ok((shader, wave_size))
 }
 
-/// The title's vertex output interpolation lives in PSV0. A float packed
+/// What a geometry program's container says of its stage (`PSV0`):
+/// input primitive, output topology, one stream, as many vertices as the
+/// stage data says.
+fn geometry_state(c: &Container, max_vertices: u32) -> Result<shader::Geometry, ShaderError> {
+    let unsupported = |what| ShaderError::Unsupported { offset: 0, what };
+    let psv = c
+        .part(FourCC::PSV0)
+        .ok_or(unsupported("a geometry program without PSV0"))?
+        .data;
+    let at = |o: usize| crate::dxbc::u32_at(psv, 4 + o);
+    // PSVRuntimeInfo1: the stage (2: geometry) and the vertex maximum.
+    if crate::dxbc::u32_at(psv, 0)? < 36 || psv.get(4 + 24) != Some(&2) {
+        return Err(unsupported("a geometry program's PSV0 without its stage"));
+    }
+    let g = shader::Geometry {
+        max_vertices,
+        input: at(0)?,
+        topology: at(4)?,
+    };
+    let declared = psv.get(4 + 26..4 + 28).map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
+    if at(8)? != 1 || declared != Some(max_vertices) {
+        return Err(unsupported("a geometry program with more than one stream"));
+    }
+    if g.input_vertices().is_none() || !matches!(g.topology, 1 | 3 | 5) {
+        return Err(unsupported("a geometry program's primitive"));
+    }
+    Ok(g)
+}
+
+/// The title's vertex (and geometry) output interpolation lives in PSV0. A float packed
 /// beside an integer can be explicitly constant, as can a float on its own.
 /// OSG1 supplies the physical rows and columns used to match both tables.
 fn vertex_output_interpolation(
@@ -859,7 +904,7 @@ fn vertex_output_interpolation(
     let info = take(&mut data, info_size)?;
     // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
     // these stage and signature count fields.
-    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+    if info.len() < 36 || !matches!(info[24], 1 | 2) || info[29] == 0 {
         return Ok(());
     }
     let resources = size(&mut data)?;
@@ -2327,6 +2372,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2455,6 +2501,7 @@ mod tests {
                 outputs: Vec::new(),
                 prims: Vec::new(),
                 mesh_stride: 0,
+                geometry: None,
             })
             .unwrap();
             super::shader::CONSTANTS_RAW_HERE.set(None);
@@ -2613,6 +2660,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         let mut dxil = l.dxil;

@@ -261,7 +261,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs | HwStage::Gs
             )
         })
         .map(|p| p.used)

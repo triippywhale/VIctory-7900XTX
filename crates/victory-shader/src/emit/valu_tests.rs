@@ -173,6 +173,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        geometry: None,
     })
     .expect("lower");
 
@@ -2174,6 +2175,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        geometry: None,
     })
     .expect("lower");
 
@@ -2450,6 +2452,7 @@ fn cbv_narrow_buffer_loads_extract_and_sign_extend() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         let mut dxil = l.dxil;

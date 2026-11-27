@@ -567,13 +567,15 @@ impl Stream<'_> {
 }
 
 /// The stream the engine builds for record `g` with the given shader
-/// containers (`first` a mesh shader if `mesh`).
+/// containers (`first` a mesh shader if `mesh`; `geometry` a geometry
+/// shader after a vertex shader).
 pub fn stream<'a>(
     g: &Graphics,
     named: &Named,
     first: &'a [u8],
     mesh: bool,
     pixel: Option<&'a [u8]>,
+    geometry: Option<&'a [u8]>,
 ) -> Result<Stream<'a>, Unnamed> {
     let depth = named
         .depth
@@ -619,6 +621,10 @@ pub fn stream<'a>(
     if let Some(ps) = pixel {
         put64(&mut s, 0x30, ps.as_ptr() as u64);
         put64(&mut s, 0x38, ps.len() as u64);
+    }
+    if let Some(gs) = geometry {
+        put64(&mut s, 0x78, gs.as_ptr() as u64);
+        put64(&mut s, 0x80, gs.len() as u64);
     }
     s[0x8c..0x1d4].copy_from_slice(&blend_desc(blend));
     put(&mut s, 0x1dc, u32::MAX);
@@ -785,14 +791,14 @@ mod tests {
             .insert(2, [3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0]);
         let (vs, ps) = ([1u8; 12], [2u8; 20]);
         assert_eq!(
-            stream(&g, &named, &vs, false, Some(&ps)).err(),
+            stream(&g, &named, &vs, false, Some(&ps), None).err(),
             Some(Unnamed::Blend)
         );
         let mut blend = [0u8; BLEND];
         blend[4..12].copy_from_slice(&[1, 5, 6, 1, 2, 1, 1, 15]);
         named.blend.insert(3, blend);
 
-        let s = stream(&g, &named, &vs, false, Some(&ps)).unwrap();
+        let s = stream(&g, &named, &vs, false, Some(&ps), None).unwrap();
         let b = s.bytes();
         let w = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
         let q = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
@@ -828,7 +834,7 @@ mod tests {
             .collect();
         assert_eq!(words, [1, 28, 1, 12, 1, 1]);
         // A mesh shader goes in the first slot as type 24.
-        let s = stream(&g, &named, &vs, true, None).unwrap();
+        let s = stream(&g, &named, &vs, true, None, None).unwrap();
         assert_eq!(
             (s.bytes()[0x10], &s.bytes()[0x30..0x40]),
             (24, &[0u8; 16][..])

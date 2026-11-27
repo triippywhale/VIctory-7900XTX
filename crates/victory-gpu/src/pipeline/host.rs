@@ -383,7 +383,7 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex, then pixel, then geometry stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -426,14 +426,17 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        if mesh.is_some() && find("geometry").is_some() {
+            return refuse("a geometry stage after a mesh shader", shaders);
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -444,6 +447,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(find("geometry").map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -601,6 +605,11 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Where the pixel and geometry stages are (none: past the end).
+        let at = |v: D3D12_SHADER_VISIBILITY| {
+            stages.iter().position(|s| s.1 == v).unwrap_or(usize::MAX)
+        };
+        let (ps, gs) = (at(D3D12_SHADER_VISIBILITY_PIXEL), at(D3D12_SHADER_VISIBILITY_GEOMETRY));
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -675,10 +684,10 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(ps), g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -707,8 +716,11 @@ impl HostPipeline {
         // shader made. Without it (refused here or by the host) the draws
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
+        if g.topology.0 == RECTANGLES && gs != usize::MAX {
+            return refuse("a geometry stage with rectangle lists", shaders);
+        }
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
+            let ps = stages.get(ps).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
@@ -719,8 +731,9 @@ impl HostPipeline {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
-            PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+            PS: code(ps),
+            // The title's geometry stage, or the rectangles' one.
+            GS: rect_gs.as_ref().map_or(code(gs), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
                     BytecodeLength: gs.len(),
@@ -750,17 +763,24 @@ impl HostPipeline {
         zero_padding(&mut desc.BlendState, &mut desc.DepthStencilState);
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
-        let name = |gs: Option<&Vec<u8>>| match gs {
+        let title_gs = code_bytes(&code(gs));
+        let name = |rect: Option<&Vec<u8>>| match rect {
+            None if gs != usize::MAX => super::library::name(
+                "graphics geometry",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps)), &title_gs[..]],
+                &state,
+            ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps)), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&code(0)), &code_bytes(&code(ps))],
                 &state,
             ),
         };

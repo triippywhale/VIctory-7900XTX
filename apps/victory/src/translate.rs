@@ -71,6 +71,11 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// The same for geometry programs.
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
+    gs_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -132,6 +137,10 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
+        self.gs_pipelines += other.gs_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -265,6 +274,19 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
     let seen = Mutex::new(HashSet::new());
     // Containers translated now, already cached, refused.
     let counts = [const { AtomicUsize::new(0) }; 3];
+    // Why the refused ones are refused: the translator's message, how many,
+    // and the hash of one (as a run's log names it), printed at the end.
+    // `VICTORY_REFUSED_LIST=<file>` writes each refused container's hash and
+    // message; `VICTORY_FAIL_DUMP=<dir>` keeps the first 3 containers of each
+    // message (`.cdxil`), to work on a translator gap offline. Both are
+    // game-derived, so neither may be inside the repository.
+    let refused_why: Mutex<BTreeMap<String, (usize, String)>> = Mutex::new(BTreeMap::new());
+    let refused_list = std::env::var_os("VICTORY_REFUSED_LIST").map(PathBuf::from);
+    let fail_dump = std::env::var_os("VICTORY_FAIL_DUMP").map(PathBuf::from);
+    for p in refused_list.iter().chain(&fail_dump) {
+        victory_core::ensure_outside_repo(p)?;
+    }
+    let refused_lines = Mutex::new(Vec::new());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
@@ -295,7 +317,30 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
                             let k = match victory_hle::modules::d3d12x::warm_shader(container) {
                                 Ok(true) => 0,
                                 Ok(false) => 1,
-                                Err(_) => 2,
+                                Err(why) => {
+                                    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+                                    let was = {
+                                        let mut m = lock(&refused_why);
+                                        let e = m.entry(why.clone()).or_insert((0, hash.clone()));
+                                        e.0 += 1;
+                                        e.0 - 1
+                                    };
+                                    if let Some(dir) = &fail_dump
+                                        && was < 3
+                                    {
+                                        let stem: String = why
+                                            .chars()
+                                            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                                            .take(60)
+                                            .collect();
+                                        let _ = std::fs::create_dir_all(dir);
+                                        let _ = std::fs::write(dir.join(format!("{stem}_{was}.{hash}.cdxil")), container);
+                                    }
+                                    if refused_list.is_some() {
+                                        lock(&refused_lines).push(format!("{hash}  {}  {why}", job.label()));
+                                    }
+                                    2
+                                }
                             };
                             counts[k].fetch_add(1, Ordering::Relaxed);
                         }
@@ -321,6 +366,18 @@ pub fn cache(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Resul
         translated + cached + refused,
         started.elapsed().as_secs_f64()
     );
+    let refused_why = refused_why.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut by_count: Vec<_> = refused_why.into_iter().collect();
+    by_count.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    for (why, (n, hash)) in by_count {
+        println!("  {n:>5}  {why}  (e.g. {hash})");
+    }
+    if let Some(list) = &refused_list {
+        let mut lines = refused_lines.into_inner().unwrap_or_else(|e| e.into_inner());
+        lines.sort();
+        std::fs::write(list, lines.join("\n") + "\n")?;
+        println!("refused      listed in {}", list.display());
+    }
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
@@ -467,6 +524,10 @@ pub fn run(
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
+    );
+    println!(
+        "             {} emitted of {} geometry programs; {} validated, {} pipelines",
+        t.gs_emitted, t.gs_programs, t.gs_validated, t.gs_pipelines
     );
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -697,7 +758,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs) {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -835,6 +896,7 @@ fn check(
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+            HwStage::Gs => h.geometry_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
         match made {
@@ -904,6 +966,12 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_emitted,
             &mut t.ms_validated,
             &mut t.ms_pipelines,
+        ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.gs_pipelines,
         ],
         _ => [
             &mut t.emit_programs,
