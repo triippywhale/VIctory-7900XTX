@@ -46,6 +46,14 @@ pub const CODE: usize = usize::MAX;
 /// 64-bit address from the instruction's operands.
 pub const MEMORY: usize = usize::MAX - 1;
 
+/// [`Address::param`] of the console driver's own table, which a geometry
+/// program finds in user data 0-1 (bits 32-39 of its address in the low
+/// byte of dword 1) and no root parameter gives. The program reads where
+/// its GS-VS ring sits in LDS from it; the host has no such ring, and the
+/// ring's base cancels out of everything the translation takes from the
+/// ring (`io`), so lowering reads 0. The offset is the byte in the table.
+pub const SYSTEM: usize = usize::MAX - 2;
+
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
 const RAW: [&str; 5] = [
@@ -300,6 +308,7 @@ pub fn track(
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     let address = t
                         .smem_address(inst, base, *offset, soffset)
+                        .or_else(|why| t.system(inst, base, *offset, soffset).ok_or(why))
                         .or_else(|why| t.by_address(why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
@@ -871,6 +880,43 @@ impl<'a> Tracer<'a> {
             return t;
         }
         self.origin(v)
+    }
+
+    /// A scalar load of a geometry program from the driver's table
+    /// ([`SYSTEM`]): the address is user data 0, and user data 1 or its low
+    /// byte, as they arrived, when no root parameter has them.
+    fn system(
+        &self,
+        inst: &Inst,
+        base: &Operand,
+        offset: i32,
+        soffset: &Operand,
+    ) -> Option<Address> {
+        let Operand::Scalar { code, .. } = *base else {
+            return None;
+        };
+        if self.stage != HwStage::Gs
+            || !inst.name().starts_with("s_load_dword")
+            || !matches!(soffset, Operand::Scalar { code: NULL, .. })
+        {
+            return None;
+        }
+        let user = |t: Term, k: u8| {
+            let reg = Reg::S(self.stage.user_sgpr(k));
+            matches!(t, Term::Value(v) if self.inputs[v.0 as usize] == Some(reg))
+                && self.param_of(reg).is_none()
+        };
+        let lo = self.origin(inst.read(Reg::S(code))?);
+        let hi = self.origin(inst.read(Reg::S(code + 1))?);
+        let high = user(hi, 1)
+            || matches!(hi, Term::Value(v) if self
+                .sop2(v, &["s_and_b32"])
+                .is_some_and(|(_, [a, b])| user(a, 1) && b == Term::Const(0xFF)));
+        (user(lo, 0) && high).then_some(Address {
+            param: SYSTEM,
+            offset: offset as u32,
+            dynamic: None,
+        })
     }
 
     /// The address of an access that traces to no root parameter (`why`

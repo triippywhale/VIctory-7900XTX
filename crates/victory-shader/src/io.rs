@@ -70,6 +70,16 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Geometry: v0, v1 or v4, two input vertices' offsets in the ES-GS
+    /// ring; only ring addresses are made of them ([`Geometry`]).
+    GsVertexOffsets,
+    /// Geometry: s2, the wave's offset in the GS-VS ring (addresses only).
+    GsRingOffset,
+    /// Geometry: s3, the ES and GS lane counts in bits 0-7 and 8-15, the
+    /// wave's message id in bits 16-23.
+    GsWaveInfo,
+    /// Geometry: v3, the instance of the geometry shader.
+    GsInstanceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +200,47 @@ pub struct Io {
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+    /// Geometry: the ring accesses, messages and copy shader.
+    pub geometry: Option<Geometry>,
+}
+
+/// What a geometry program reads of its input vertices and writes of the
+/// vertices it makes (`crate::geometry`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Geometry {
+    /// Each LDS read of the input vertices: per dword read, the vertex and
+    /// the dword of its ES-GS ring item (`4 * row + channel` of the input
+    /// signature).
+    pub reads: Vec<(Site, Vec<(u8, u32)>)>,
+    /// Each LDS write into the GS-VS ring: per dword written, the dword of
+    /// the lane's item (vertex `dword / vertex_dwords`).
+    pub writes: Vec<(Site, Vec<u32>)>,
+    pub messages: Vec<(Site, Message)>,
+    /// The copy shader's exports: per channel, a dword of the emitted
+    /// vertex or a constant.
+    pub copies: Vec<(Target, [Option<Copied>; 4])>,
+    pub max_vertices: u32,
+    pub vertex_dwords: u32,
+}
+
+/// A geometry program's `s_sendmsg`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Message {
+    /// A vertex is complete (the next one goes after it).
+    Emit,
+    /// The strip ends.
+    Cut,
+    EmitCut,
+    /// No more output.
+    Done,
+}
+
+/// What a copy shader exports in a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copied {
+    /// A dword of the emitted vertex.
+    Ring(u32),
+    Const(u32),
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -311,6 +362,20 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             ];
             (loaded, &[][..], &ms.outputs[..])
         }
+        // Geometry: what the ring accesses mean is raised on its own; the
+        // program has no exports (its copy shader has them).
+        (StageIo::Gs(_), HwStage::Gs) => {
+            let loaded = vec![
+                (Reg::V(0), Input::GsVertexOffsets),
+                (Reg::V(1), Input::GsVertexOffsets),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::GsInstanceId),
+                (Reg::V(4), Input::GsVertexOffsets),
+                (Reg::S(2), Input::GsRingOffset),
+                (Reg::S(3), Input::GsWaveInfo),
+            ];
+            (loaded, &[][..], &[][..])
+        }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
     let inputs: Vec<(Value, Input)> = p
@@ -345,6 +410,10 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            _ => None,
+        },
+        geometry: match &native.io {
+            StageIo::Gs(gs) => Some(crate::geometry::raise(p, native, gs)?),
             _ => None,
         },
         ..Io::default()

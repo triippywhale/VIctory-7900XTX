@@ -61,7 +61,23 @@
 //! ```
 //!
 //! Rows are registers of the container's signature parts (`ISG1`, `OSG1`).
-//! Merged stages keep their stage data in another layout (not read).
+//!
+//! A geometry program (GS) runs as the GS half of a legacy (not NGG) merged
+//! ES+GS stage; its record is longer and holds its copy shader too:
+//!
+//! ```text
+//! GS  record +0x88 u64 copy shader code offset, +0x90 u64 its size
+//!             (payload-relative): the hardware VS program that reads each
+//!             emitted vertex back from the GS-VS ring and exports it
+//!     E+0x150 32 outputs of 6 B as VS (`exp param<n>` of the copy shader);
+//!             E+0x210 u32 count
+//!     E+0x27c u32 GS-VS ring item per primitive (dwords: maximum vertices
+//!             times the vertex size), E+0x284 u32 maximum vertices,
+//!             E+0x28c u32 vertex size (dwords)
+//! ```
+//!
+//! Other merged stages (ES, LS, HS) keep their stage data in another layout
+//! (not read).
 //!
 //! Kind 0x0c holds the same `FSSM` blob unpacked.
 //! Other kinds seen: 0x07 program header + bitcode (or a stub when stripped),
@@ -126,6 +142,17 @@ const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
 const MS_CLIP_CNTL: usize = 0x194;
 const MS_INFO: usize = 0x448;
+/// GS stage data: the copy shader (offset, size), outputs, ring layout.
+const GS_COPY: usize = 0x34;
+const GS_OUTPUTS: usize = 0x150;
+const GS_OUTPUT_COUNT: usize = 0x210;
+const GS_ITEM: usize = 0x27c;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX: usize = 0x28c;
+/// A geometry shader emits at most 1024 vertices (DXIL).
+const MAX_GS_VERTICES: u32 = 1024;
+/// A vertex of the GS-VS ring: at most 32 four-dword rows.
+const MAX_GS_VERTEX_DWORDS: u32 = 128;
 const FSPX_VERSION: u32 = 1;
 const FSPX_HEADER: usize = 0x10;
 const FSPX_PACKET: u32 = 0;
@@ -286,6 +313,24 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    Gs(GeometryIo),
+}
+
+/// A geometry program's outputs and ring layout. Each lane runs one input
+/// primitive: it reads its vertices from the ES-GS ring in LDS (each one's
+/// offset in a 16-bit field of v0, v1 or v4), writes the vertices it makes
+/// into its item of the GS-VS ring (vertex k at `k * vertex_dwords`), and
+/// counts them with `s_sendmsg` GS EMIT (CUT ends a strip). The copy shader
+/// reads each emitted vertex back and exports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeometryIo {
+    /// The copy shader's `exp param<n>` targets.
+    pub outputs: Vec<VsOutput>,
+    pub max_vertices: u32,
+    /// A vertex of the GS-VS ring, in dwords.
+    pub vertex_dwords: u32,
+    /// The copy shader (a hardware VS program), as stored.
+    pub copy: Vec<u8>,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -745,6 +790,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
+            HwStage::Gs => gs_io(stage_data, payload)?,
             _ => StageIo::None,
         };
         out.push(NativeProgram {
@@ -819,7 +865,11 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
 }
 
 fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
-    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+    outputs_at(data, VS_OUTPUTS, VS_OUTPUT_COUNT)
+}
+
+fn outputs_at(data: &[u8], at: usize, count_at: usize) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, at, 6, count_at)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -847,6 +897,25 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         .collect();
     let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn gs_io(data: &[u8], payload: &[u8]) -> Result<StageIo, ShaderError> {
+    let copy = bytes(payload, u64_at(data, GS_COPY)?, u64_at(data, GS_COPY + 8)?)
+        .ok_or(Malformed("copy shader out of bounds"))?;
+    let max_vertices = u32_at(data, GS_MAX_VERTICES)?;
+    let vertex_dwords = u32_at(data, GS_VERTEX)?;
+    if !(1..=MAX_GS_VERTICES).contains(&max_vertices)
+        || !(1..=MAX_GS_VERTEX_DWORDS).contains(&vertex_dwords)
+        || u64::from(u32_at(data, GS_ITEM)?) != u64::from(max_vertices) * u64::from(vertex_dwords)
+    {
+        return Err(Malformed("implausible GS-VS ring layout"));
+    }
+    Ok(StageIo::Gs(GeometryIo {
+        outputs: outputs_at(data, GS_OUTPUTS, GS_OUTPUT_COUNT)?,
+        max_vertices,
+        vertex_dwords,
+        copy: copy.to_vec(),
+    }))
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
