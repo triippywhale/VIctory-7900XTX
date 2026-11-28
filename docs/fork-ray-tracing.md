@@ -126,12 +126,26 @@ dispatches, faults and what came.
   every frame, and what it read was as old as before. Open.
 - Moving objects' structures held the builder's own records where triangles
   should be (dump bvhcheck-4) while no other build wrote inside, and the
-  builder touched pages that are not the title's every frame (0.2-3.2). The
-  cause found: in a partial final group a first-lane read counted the threads
-  kept only for barriers, and the scalar it made went to every launched lane
-  as part of a pointer. With that mended (run stores1) the builder's pages that
-  are not the title's and pages without a copy were 0.0 a frame from the first
-  10 seconds on. Whether the structures are whole now is to be seen in a dump.
+  builder touched pages that are not the title's every frame (0.2-3.2). One
+  cause mended: in a partial final group a first-lane read counted the threads
+  kept only for barriers. That only happens on a host whose waves are 32 lanes
+  wide (a wave64 program split in halves); on a 64-lane host (RX 7900 XT) it
+  never runs, and run rtcheck2 there showed the same bursts of stray pages as
+  before, so the quiet minutes of run stores1 were the scene, not the mend.
+- A static structure broken for good (dump of rtcheck2, bottom level at
+  0xce06c8100): its boxes and leaves are laid out right, but its triangles
+  have x = 0 and y, z = ±infinity, and every box above them took that on.
+  LeafRehydration, which unpacks them once, reads the vertices, indices and
+  transforms by the addresses in its geometry records (48 bytes: transform,
+  index and vertex formats and counts, index and vertex buffers, stride), and
+  nothing made those pages ready before the dispatch: only its views' were.
+  A page with no copy reads zeros, and a fault gives it one only in the next
+  frame, after the one unpacking. Now (`memory::ready`) a builder dispatch's
+  views that read as geometry records have what they point to made ready when
+  it is recorded, and pages still without a copy, or that came lately, are
+  taken again at its submission. The 10 s memory line counts it ("geometry
+  records given to the builder"). Whether that mends the picture is to be seen
+  in a run.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
