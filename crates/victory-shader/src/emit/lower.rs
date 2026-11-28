@@ -1681,6 +1681,25 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_NAN_SCRUB=1`: a float colour a pixel program exports is 0 where it is NaN or an
+/// infinity ([`Lower::scrub_nan`]). Off by default: the console passes such values on. The
+/// switch is part of the shader cache's key. (After PalmVI 0b7a6d19, from
+/// trustno1-coder/VIctory-NVIDIA 77e13a974.)
+fn nan_scrub_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_scrub_on`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -13785,6 +13804,20 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `f`, or 0 where it is NaN or an infinity (`|f| >= inf`, unordered, so NaN too), with
+    /// `VICTORY_NAN_SCRUB=1`. For the colours pixel programs export: one NaN that reaches a
+    /// title's bloom, blur or temporal passes spreads into black patches that stay in their
+    /// history, and an infinity through bloom or exposure can turn the whole picture white.
+    /// Not what the console does, hence a switch.
+    fn scrub_nan(&mut self, f: V) -> V {
+        let c = self.cur;
+        let a = self.unary(6, f); // |f|
+        let inf = self.s.m.f32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -13970,6 +14003,10 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // A colour a pixel program exports, scrubbed of NaN and infinities
+        // (`VICTORY_NAN_SCRUB=1`). Only float elements below: integer targets keep their
+        // bits.
+        let scrub = self.s.pixel && matches!(e.target, Target::Color(_)) && nan_scrub_on();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13988,13 +14025,12 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
-                        Some(&f) => f,
-                        None => self.as_float(x),
+                        Some(&f) if half.is_none() => f,
+                        _ => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if scrub { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };

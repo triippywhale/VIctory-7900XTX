@@ -161,6 +161,13 @@ fn build() -> [u8; 32] {
         if std::env::var_os("VICTORY_PORTABLE_FLOAT_FAST").is_some_and(|v| v == "1") {
             bytes.extend_from_slice(b"VICTORY_PORTABLE_FLOAT_FAST=1");
         }
+        // `VICTORY_NAN_SCRUB=1` (float colours a pixel program exports are 0
+        // where NaN or infinite) adds code to every pixel program. Read as
+        // the translator reads it; only when on, so the translations cached
+        // without it keep their key.
+        if std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1") {
+            bytes.extend_from_slice(b"VICTORY_NAN_SCRUB=1");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

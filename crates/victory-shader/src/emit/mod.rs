@@ -3346,6 +3346,24 @@ mod barycentric_tests {
         let _ = shader;
     }
 
+    /// With `VICTORY_NAN_SCRUB=1` each float colour channel a pixel program exports goes
+    /// through `|f| >= inf ? 0 : f` (an abs, an unordered compare and a select per channel);
+    /// without it the export is as before. Both translations validate.
+    #[test]
+    fn nan_scrub_zeroes_exported_colours_only_when_on() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let was = lower::TEST_NAN_SCRUB.replace(Some(false));
+        let off = pixel(&words, PERSP_CENTER);
+        lower::TEST_NAN_SCRUB.set(Some(true));
+        let on = pixel(&words, PERSP_CENTER);
+        lower::TEST_NAN_SCRUB.set(was);
+        let (off, on) = (off.unwrap(), on.unwrap());
+        assert!(on.dxil.len() > off.dxil.len(), "{} vs {}", on.dxil.len(), off.dxil.len());
+        validate(&off);
+        validate(&on);
+    }
+
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
     /// weights of vertices 1 and 2.
