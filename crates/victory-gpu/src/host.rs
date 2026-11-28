@@ -358,7 +358,7 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
 }
 
-/// (`VICTORY_BUFFER_NO_WAIT=1`, off) The short-lived buffers of [`Host::upload_buffer`],
+/// (On; `VICTORY_BUFFER_NO_WAIT=0`: waited for as before) The short-lived buffers of [`Host::upload_buffer`],
 /// [`Host::shared_buffer`] and [`Host::uav_buffer`] are made resident and not waited for
 /// ([`resident`], [`mapped`]): only lists recorded after them name them, and those wait for
 /// the system's mapping when they are sent. The waits guard descriptor slots read by lists
@@ -366,7 +366,7 @@ pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
 /// as the main source of hitches (about 25 s of a five-minute session); rewritten here.
 fn short_no_wait() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Heap flags of the short-lived buffers ([`short_no_wait`]).
