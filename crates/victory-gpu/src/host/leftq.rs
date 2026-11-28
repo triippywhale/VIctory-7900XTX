@@ -3,9 +3,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 use super::{Host, QUEUE_ORDER, fail};
@@ -29,6 +29,43 @@ unsafe impl Send for Rig {}
 
 static RIG: Mutex<Option<Rig>> = Mutex::new(None);
 
+/// A fetch that has waited for the card, for the log.
+struct Waited {
+    /// On the host's queue, behind every send so far; else on the copy
+    /// queue of this module.
+    ordered: bool,
+    pieces: usize,
+    bytes: u64,
+    seconds: f64,
+    thread: String,
+    /// Of the fetch's own fence: the value reached, the value waited for.
+    reached: (u64, u64),
+    /// Of the host's queue: the value its fence reached, and the last
+    /// submission signalled behind, if the submission lock is free.
+    host: (u64, Option<u64>),
+}
+
+/// The line of a fetch that waits: the path, what is fetched, how far the
+/// card is, and the locks the thread holds meanwhile (`crate::left`,
+/// "Locks").
+fn waited(w: &Waited) -> String {
+    let path = match w.ordered {
+        true => "ordered, on the host's queue behind every send so far",
+        false => "on the copy queue of its own",
+    };
+    let submission = match w.host.1 {
+        Some(sent) => format!("{sent} (the submission lock is free)"),
+        None => "not known (the submission lock is held, by this thread or another)".to_owned(),
+    };
+    format!(
+        "pieces left on the card: a fetch ({path}) of {} pieces, {} bytes, has waited {:.0} s for the card on thread {}; its fence is \
+         at {} of {}, the host queue's at {}, the last submission signalled {submission}; the thread holds the gate of pieces \
+         left and the fetch's rig (not the book, the order of the queue, the journal or the guards), and whatever its caller \
+         held; still waiting (VICTORY_SKIP_WC_BACK)",
+        w.pieces, w.bytes, w.seconds, w.thread, w.reached.0, w.reached.1, w.host.0
+    )
+}
+
 /// What the card wrote in `pieces` (copy, offsets) and was left there is
 /// fetched now and merged into title memory as copy-back merges
 /// (`Shadow::fetched_left`). On a copy queue of its own, which does not
@@ -37,6 +74,19 @@ static RIG: Mutex<Option<Rig>> = Mutex::new(None);
 /// copies and may not be there yet: then on the host's queue, behind every
 /// send so far, as the relay's fetch without a copy queue (and without the
 /// relay, whose sends are not noted, always so).
+///
+/// There is no switch to keep the fetch off the host's queue
+/// (`VICTORY_SKIP_WC_BACK_ORDERED=0` was thought of, to narrow a hang
+/// down): on the copy queue a fetch may run before title bytes that are
+/// on their way up, and the merge then leaves every noted send out; where
+/// a shader wrote over such bytes after they arrived, its write would be
+/// lost to title memory for good (the piece is never left again, and the
+/// card's compare knows it as unchanged). Nor does the ordered wait depend
+/// on the CPU: what is ahead of it on the host's queue are lists the card
+/// runs by itself (`crate::left`, "Locks").
+///
+/// The wait for the card is never without end and without a word: every
+/// `crate::left::STEP` of it is said in the log ([`waited`]).
 pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
     if pieces.is_empty() {
         return;
@@ -144,7 +194,44 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
                 0
             };
             fence.SetEventOnCompletion(sent, event)?;
-            WaitForSingleObject(event, INFINITE);
+            // Never without end and without a word: a wait of
+            // `crate::left::STEP` is said, each time, with what is waited
+            // for and what this thread holds meanwhile.
+            let began = std::time::Instant::now();
+            let mut said = false;
+            loop {
+                match WaitForSingleObject(event, crate::left::STEP.as_millis() as u32) {
+                    WAIT_OBJECT_0 => break,
+                    WAIT_TIMEOUT => {}
+                    _ => return Err(windows::core::Error::from_thread()),
+                }
+                // (A fence of a device that is gone reads as all ones.)
+                if fence.GetCompletedValue() == u64::MAX {
+                    host.device.GetDeviceRemovedReason()?;
+                }
+                said = true;
+                tracing::warn!(
+                    "{}",
+                    waited(&Waited {
+                        ordered,
+                        pieces: pieces.len(),
+                        bytes: total,
+                        seconds: began.elapsed().as_secs_f64(),
+                        thread: crate::left::thread_name(&std::thread::current()),
+                        reached: (fence.GetCompletedValue(), sent),
+                        host: (
+                            host.fence.GetCompletedValue(),
+                            host.submitted.try_lock().ok().map(|n| *n)
+                        ),
+                    })
+                );
+            }
+            if said {
+                tracing::warn!(
+                    "pieces left on the card: the fetch that waited came after {:.1} s (VICTORY_SKIP_WC_BACK)",
+                    began.elapsed().as_secs_f64()
+                );
+            }
             Ok(after)
         })()
     };
@@ -162,5 +249,46 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
         let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, hi - lo) };
         shadow.fetched_left(*lo, gpu, after, &mut title);
         at += hi - lo;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Waited, waited};
+
+    /// The line of a fetch that waits names its path, what it fetches and
+    /// the locks held.
+    #[test]
+    fn a_fetch_that_waits_says_its_path_and_its_locks() {
+        let mut w = Waited {
+            ordered: true,
+            pieces: 5,
+            bytes: 131072,
+            seconds: 4.0,
+            thread: "victory-wide-2".into(),
+            reached: (41, 42),
+            host: (1000, None),
+        };
+        let line = waited(&w);
+        assert!(line.contains("ordered, on the host's queue"), "{line}");
+        assert!(
+            line.contains("5 pieces, 131072 bytes, has waited 4 s"),
+            "{line}"
+        );
+        assert!(line.contains("thread victory-wide-2"), "{line}");
+        assert!(line.contains("at 41 of 42"), "{line}");
+        assert!(line.contains("the submission lock is held"), "{line}");
+        assert!(
+            line.contains("holds the gate of pieces left and the fetch's rig"),
+            "{line}"
+        );
+        w.ordered = false;
+        w.host.1 = Some(1001);
+        let line = waited(&w);
+        assert!(line.contains("on the copy queue of its own"), "{line}");
+        assert!(
+            line.contains("signalled 1001 (the submission lock is free)"),
+            "{line}"
+        );
     }
 }
