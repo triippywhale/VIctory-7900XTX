@@ -1605,6 +1605,7 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
 /// module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted. None if the host cannot hold it; the draw is then dropped.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
