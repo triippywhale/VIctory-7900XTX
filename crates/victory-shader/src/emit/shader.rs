@@ -292,6 +292,10 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// The part of it a compute program allocates itself (the rest is the translation's
+    /// own): with `VICTORY_LDS_BOUNDS=1`, the program's accesses past it read 0 and drop
+    /// their writes.
+    pub lds_own: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -345,6 +349,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             lds_dwords: 0,
+            lds_own: 0,
             lds: None,
             main,
             entry,

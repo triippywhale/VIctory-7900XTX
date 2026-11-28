@@ -1681,6 +1681,27 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_LDS_BOUNDS=1`: a compute program's LDS accesses past what it allocates read 0
+/// and drop their writes, as the console's do; the host index never leaves the group-shared
+/// array, and the translation's own dwords past the program's are not reachable. Off by
+/// default, as at the source: every LDS access gets a compare, and every write a branch.
+/// The switch is part of the shader cache's key. (After PalmVI 787a2762, 37bf76ce and
+/// 5cac9c03; upstream VIctory eabb6b850 #1949, uiliannn/VItoriaBr a13a7195 and 40beb26.)
+fn lds_bounds_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_BOUNDS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_BOUNDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_bounds_on`], for its thread only.
+    pub(super) static TEST_LDS_BOUNDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_NAN_SCRUB=1`: a float colour a pixel program exports is 0 where it is NaN or an
 /// infinity ([`Lower::scrub_nan`]). Off by default: the console passes such values on. The
 /// switch is part of the shader cache's key. (After PalmVI 0b7a6d19, from
@@ -2057,6 +2078,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            s.lds_own = s.lds_dwords;
             // The scatter's scratch: a dword per lane of every console wave
             // in the group, past the program's LDS. (The zero-initialized
             // `tmp` of the ISA's ds_permute_b32; see its lowering in `ds`.)
@@ -6284,16 +6306,49 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as dword-aligned, and in bounds unless
+        // `VICTORY_LDS_BOUNDS=1` ([`lds_bounds_on`]; out-of-bounds console accesses read 0
+        // and drop writes).
+        let bound = (lds_bounds_on() && self.s.lds_own > 0).then_some(self.s.lds_own);
+        // Each dword comes with whether it lies inside the program's LDS (with a bound); the
+        // address is `addr + offset` in 32 bits, and wraps. Outside, the host's pointer is
+        // dword 0's, so it stays inside the array.
+        let dword = |l: &mut Self, bytes: u32| -> (V, Option<V>) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let (index, inside) = match bound {
+                Some(n) => {
+                    let n = l.s.m.i32(n);
+                    let inside = l.s.m.cmp(c, pred::IULT, index, n);
+                    let zero = l.s.m.i32(0);
+                    (l.s.m.select(c, inside, index, zero), Some(inside))
+                }
+                None => (index, None),
+            };
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
+        };
+        // A read: 0 outside.
+        let read = |l: &mut Self, p: V, inside: Option<V>| -> V {
+            let x = l.s.m.load(l.cur, p);
+            match inside {
+                Some(inside) => {
+                    let zero = l.s.m.i32(0);
+                    l.s.m.select(l.cur, inside, x, zero)
+                }
+                None => x,
+            }
+        };
+        // A write's guard: the lane's, and the dword inside.
+        let on = |l: &mut Self, inside: Option<V>| -> Option<V> {
+            match (guard, inside) {
+                (Some(g), Some(i)) => Some(l.s.m.bin(l.cur, Bin::And, g, i)),
+                (g, None) => g,
+                (None, i) => i,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -6327,7 +6382,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -6336,7 +6391,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.s.m.load(c, p);
+                let w = read(self, p, inside);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -6378,7 +6433,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-                self.lds_merge(p, keep, x, guard);
+                let g = on(self, inside);
+                self.lds_merge(p, keep, x, g);
             }
             return Ok(());
         }
@@ -6394,8 +6450,8 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let (p, inside) = dword(self, off + 4 * k);
+                    let x = read(self, p, inside);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -6417,12 +6473,23 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+            if bound.is_none() {
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let (p, _) = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
+            } else {
+                // each dword under its own guard: one past the end is dropped alone
+                for (off, x) in stores {
+                    let (p, inside) = dword(self, off);
+                    let g = on(self, inside);
+                    let at = self.begin_guarded(g);
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(at, &[]);
+                }
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -6455,7 +6522,18 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inside) = dword(self, offset);
+        // What a lane the atomic leaves out gets back: a lane the guard leaves out keeps
+        // its register, a running lane outside the LDS reads 0 like any LDS read there.
+        let outside = match (inside, guard) {
+            (None, _) => outside,
+            (Some(_), Some(g)) => {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, g, zero, outside)
+            }
+            (Some(_), None) => self.s.m.i32(0),
+        };
+        let guard = on(self, inside);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),

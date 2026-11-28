@@ -92,6 +92,8 @@ mod geometry_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lds_bounds_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -3199,6 +3201,67 @@ mod atomic_tests {
             {
                 v.validate(&mut shader.dxil.clone()).unwrap();
             }
+        }
+    }
+
+    /// With `VICTORY_LDS_BOUNDS=1` a compute program's LDS reads, writes and atomics are
+    /// bounded by its allocation, which is more code; without it the translation is as
+    /// before (the same as with the switch unset).
+    #[test]
+    fn lds_bounds_change_the_translation_only_when_on() {
+        let ds = |op: u32, dst: u32, addr: u32, data: u32| [0x36 << 26 | op << 18, dst << 24 | data << 8 | addr];
+        let mut words = vec![
+            0x7E02_02FF,
+            0x1234_5678, // v_mov_b32 v1, 0x12345678
+            0x7E04_0280, // v_mov_b32 v2, 0
+        ];
+        // v4 = 512 + 4 * the thread index: no address the translator knows.
+        words.extend([0x3408_0082, 0x4A08_08FF, 512]); // v_lshlrev_b32 v4, 2, v0; v_add_nc_u32 v4, 512, v4
+        words.extend(ds(0x0D, 0, 2, 1)); // ds_write_b32 v2, v1: dword 0
+        words.extend(ds(0x0D, 0, 4, 1)); // ds_write_b32 v4, v1: past the end
+        words.extend(ds(0x36, 5, 4, 0)); // ds_read_b32 v5, v4
+        words.extend(ds(0x20, 6, 4, 1)); // ds_add_rtn_u32 v6, v4, v1
+        words.extend(ds(0x0D, 0, 2, 5)); // ds_write_b32 v2, v5
+        words.extend(ds(0x0D, 0, 2, 6)); // ds_write_b32 v2, v6
+        words.push(0xBF81_0000);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15, // 512 bytes of LDS
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "ds_add_rtn_u32"));
+        let bytes = crate::dxbc::build(&[]);
+        let translate = || {
+            emit(
+                &Container::parse(&bytes).unwrap(),
+                &native,
+                &p,
+                &structure::structure(&p).unwrap(),
+                &io::raise(&p, &native).unwrap(),
+                &resource::track(&p, &native.layout, native.stage, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let unset = translate();
+        let was = lower::TEST_LDS_BOUNDS.replace(Some(false));
+        let off = translate();
+        lower::TEST_LDS_BOUNDS.set(Some(true));
+        let on = translate();
+        lower::TEST_LDS_BOUNDS.set(was);
+        assert_eq!(off.dxil, unset.dxil);
+        assert!(on.dxil.len() > off.dxil.len(), "{} vs {}", on.dxil.len(), off.dxil.len());
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut off.dxil.clone()).unwrap();
+            v.validate(&mut on.dxil.clone()).unwrap();
         }
     }
 }
