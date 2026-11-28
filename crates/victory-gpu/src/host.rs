@@ -3265,7 +3265,8 @@ fn lists_with_room(most: usize, room: bool) -> usize {
 /// [`settle_room`]. Each run is a copy of its own to a copy in the card's
 /// memory, at about 1.5 us a run. Another tree's run 218 had 500 to 5,400
 /// changed runs a frame of a few bytes each, and the cap of 512 settled the
-/// flights twice a frame, 50 ms of the submitting thread.
+/// flights twice a frame, 50 ms of the submitting thread. How often the cap
+/// still settles them is on the frame line ([`masked::line`]).
 /// (The name and the bound after PalmVI b7bbf59f4 / fxceless 06702fe.)
 fn merge_runs() -> usize {
     static GIVEN: OnceLock<Option<usize>> = OnceLock::new();
@@ -3809,9 +3810,13 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         // ([`merge_runs`]: `VICTORY_MERGE_RUNS`, `VICTORY_SETTLE_ROOM`.)
+        // With `VICTORY_MASKED_PATCH` a page past it goes up by mask and
+        // is no reason to settle ([`masked`]).
         let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let marks = masked::marks();
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        masked::merged(marks, !spans.is_empty());
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -4449,6 +4454,7 @@ fn late_line(frames: f64) {
             ms(4),
             u[8],
         );
+        masked::line(frames);
     }
 }
 
@@ -4458,6 +4464,7 @@ mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 pub(crate) mod leftq;
+pub(crate) mod masked;
 mod panel;
 mod place;
 pub(crate) mod rec;

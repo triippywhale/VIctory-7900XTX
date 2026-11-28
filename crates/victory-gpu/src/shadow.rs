@@ -124,6 +124,12 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<SentRuns>,
+    /// With `VICTORY_MASKED_PATCH` (`crate::host::masked`): the runs that
+    /// pages past the merge's cap put into `dirty`
+    /// ([`Shadow::merge_under_writes`]), until the next send takes them
+    /// ([`Shadow::card_patched`]): changed ranges that hold one go up by
+    /// mask. Never held with another lock.
+    patched: Mutex<Vec<(usize, usize)>>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
     /// (`VICTORY_CARD_LISTS=1`; after foxhound 441446d via Op-lite/victory-scarlett) The copy
@@ -4059,7 +4065,9 @@ impl Shadow {
     /// it is now is compared with what the copy held when the range was
     /// given to the shaders: the copy's CPU side for a copy in the card's
     /// memory (the changed runs go up before the next submission, each a
-    /// copy of its own bytes, `runs_left` of them at most), the snapshot
+    /// copy of its own bytes, `runs_left` of them at most; with
+    /// `VICTORY_MASKED_PATCH` a page with more goes up by mask,
+    /// `crate::host::masked`), the snapshot
     /// for the others (the changed bytes go into the copy and into the
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
@@ -4212,6 +4220,7 @@ impl Shadow {
             under_ns(4, t);
             if over.into_inner() {
                 note_stale(2);
+                crate::host::masked::gave_up();
                 return true;
             }
         }
@@ -4221,7 +4230,9 @@ impl Shadow {
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
     /// page, compared with the reference, which begins at `held`, and put in.
     /// The runs that changed, none if it cannot be read, and an error if
-    /// there were more to copy one by one than `left`.
+    /// there were more to copy one by one than `left` (with
+    /// `VICTORY_MASKED_PATCH` the page is then taken by its changed bytes,
+    /// which go up by mask, and nothing of `left` is used).
     ///
     /// # Safety
     /// The reference holds the copy's length, and nothing else writes these
@@ -4272,7 +4283,7 @@ impl Shadow {
                             false
                         }
                     };
-                let runs = if fused {
+                let mut runs = if fused {
                     word_runs_put(lo, title, held)
                 } else if crate::host::words_under() {
                     word_runs(lo, title, held)
@@ -4286,8 +4297,21 @@ impl Shadow {
                     left.fetch_add(most - copies, Ordering::Relaxed);
                     return Ok(Some(runs));
                 }
+                let mut patched = false;
                 if copies > 0 && left.fetch_sub(copies, Ordering::Relaxed) < copies {
-                    return Err(());
+                    if !crate::host::masked::now() {
+                        return Err(());
+                    }
+                    // Past the cap (`crate::host::masked`): the page by the
+                    // bytes that differ, which the send stores by mask.
+                    // They are no copies: what was taken of `left` goes
+                    // back. (The words above hold the same bytes and
+                    // equal ones beside them: the CPU's side is the same
+                    // either way, the card's side keeps what a flight
+                    // wrote in the equal bytes.)
+                    left.fetch_add(copies, Ordering::Relaxed);
+                    runs = changed_runs(title, held);
+                    patched = true;
                 }
                 let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                 if !fused {
@@ -4297,6 +4321,12 @@ impl Shadow {
                 }
                 if let Some(was) = was {
                     crate::host::upcheck::note(self.id, at, &was, held);
+                }
+                if patched {
+                    // Before the caller notes the runs as changed: the send
+                    // that takes those finds these.
+                    self.card_patch(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+                    crate::host::masked::took(runs.len(), runs.iter().map(|r| r.1).sum());
                 }
                 return Ok(Some(runs));
             }
@@ -4826,6 +4856,26 @@ impl Shadow {
         }
     }
 
+    /// A page past the merge's cap put the title's bytes in at offsets
+    /// `runs` (`crate::host::masked`): the changed ranges that hold them go
+    /// up by mask.
+    fn card_patch(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        if let Some(card) = &self.card {
+            card.patched.lock().unwrap_or_else(|e| e.into_inner()).extend(runs);
+        }
+    }
+
+    /// The runs of [`Shadow::card_patch`] since the last call, taken: in
+    /// order, those that touch as one. For the send that took the copy's
+    /// changed offsets ([`card_dirty`]): the runs are among them.
+    pub(crate) fn card_patched(&self) -> Vec<(usize, usize)> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        let runs = std::mem::take(&mut *card.patched.lock().unwrap_or_else(|e| e.into_inner()));
+        if runs.is_empty() { runs } else { joined(runs) }
+    }
+
     /// Whether shaders were ever declared to write it.
     pub(crate) fn written(&self) -> bool {
         self.written.load(Ordering::Relaxed)
@@ -5148,6 +5198,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                patched: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
@@ -5305,6 +5356,7 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+            patched: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
             size: len as u64,
@@ -5898,6 +5950,7 @@ fn lookup_innermost(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    patched: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
                     size,
@@ -6150,6 +6203,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
+        patched: Mutex::default(),
         touched: Default::default(),
         me: Default::default(),
         size: len,
@@ -6246,6 +6300,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                patched: Mutex::default(),
                 touched: Default::default(),
                 me: Default::default(),
                 size: len,
