@@ -104,6 +104,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_WALK=1` | a meter (diagnostics builds): every node test counts itself per thread, and a frame line per program says how many nodes its threads test (mean, median, p90, p99, max; boxes and triangles apart). Slower, and the translations get their own cache key. Also: children entered per box test (a tight structure keeps it near 1-2; loose or overlapping boxes push it to 3-4) and the threads that read a node off a page with no copy (it reads zeros: a broken walk), overall and among those ended by the loop limit. After Op-lite/victory-scarlett c45b43e, where primary rays tested 1,213 nodes a thread |
 | `VICTORY_BVH_WALK_LIMIT=<n>` | a ray's loop that has gone round `n` times tests no more nodes (a box node answers with no child, anything else with a miss), so its walk runs out and its result is written. Without it such a ray goes round to the loop limit (4,096) and is killed, result lost; a wave waits for its longest lane. Run rtwalk-B: 0.2-5.6 % of the two big tracers' threads pass 1,024 tests and end at 4,085-4,089, the rest have a p90 under 512. Off unless set; 1024 is the value to try. Own cache key |
 | `VICTORY_BVH_INPUTS=1` | logs where the builder's reads of title buffers come from (diagnostics builds): the buffer's own copy, or an arena page or window of title memory, which does not have what shaders wrote into the buffer's copy; and every page read by address over buffers shaders write. Run bvhcheck-1 found moving objects built from vertices that were not there (z to 3.4e38, bytes of other records) |
+| `VICTORY_BVH_STORES=1` | which of the builder's programs store where (diagnostics builds): every store by address of a builder program also notes its page and its dispatch, and the log puts each to the dispatch's views (own, past another live dispatch's view, outside its views) with a sum by program every 10 s. Its own cache key. The views it knows are root views only: a program that writes its structure through a pointer from its build description shows as "outside" or "past a neighbour" while it is right (run stores1: the results views of builds 128 bytes apart) |
 | `VICTORY_BVH_MIRROR=1` | experiment, off unless set: before a list's first builder dispatch, pages read by address as title memory has them (arena pages, windows) take, on the card, the bytes of the title buffers in them that shaders write. Meant to stop moving objects' structures being built from stale vertices (boxes to 3.4e38 in bvhcheck-1 to -3). It did not help: in bvhcheck-4 it mirrored 17 pages, about 40 ranges a frame, and the huge boxes stayed. Kept as a record; leave it off. |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics). `cargo run --release -p victory-shader --example bvh_dump -- <folder> [--all]` also writes the CPU's side of the held pages (`title.bin`, `title-pages.txt`); `--example dump_title -- <folder> <address>` compares the two. `--example bvh_dump -- <folder> [--all]` checks the structures in it (`bvh_check.rs`): cycles, nodes reached twice or outside the structure, loose and escaping boxes, and a surface estimate of the node tests a ray makes, per top level and for the bottom levels that cost the most |
@@ -123,6 +124,14 @@ dispatches, faults and what came.
   neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
   did not mend it and costs some 20 ms a frame (light-15): the title asks in
   every frame, and what it read was as old as before. Open.
+- Moving objects' structures held the builder's own records where triangles
+  should be (dump bvhcheck-4) while no other build wrote inside, and the
+  builder touched pages that are not the title's every frame (0.2-3.2). The
+  cause found: in a partial final group a first-lane read counted the threads
+  kept only for barriers, and the scalar it made went to every launched lane
+  as part of a pointer. With that mended (run stores1) the builder's pages that
+  are not the title's and pages without a copy were 0.0 a frame from the first
+  10 seconds on. Whether the structures are whole now is to be seen in a dump.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
