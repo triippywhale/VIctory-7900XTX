@@ -1376,6 +1376,53 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
 const DS_WRITE_B32: u8 = 0x0D;
 const DS_READ_B32: u8 = 0x36;
 
+/// `v_fma_f16` rounds once, to nearest even, as the console's fused multiply-add does: the
+/// sums below land on or next to the midpoint of two halves, where an f32 sum rounded again
+/// to 16 bits gives the other half (cases from upstream VIctory #1387).
+#[test]
+fn a_fused_16_bit_multiply_add_rounds_once() {
+    let cases: [([u32; 3], u32); 9] = [
+        ([0x3E00, 0x6C03, 0x0400], 0x6E05), // 1.5 * 4108 + 2^-14
+        ([0x3E00, 0x6C01, 0x8400], 0x6E01), // 1.5 * 4100 - 2^-14
+        ([0x3E00, 0x4000, 0x3C00], 0x4400), // 1.5 * 2 + 1
+        ([0x3E00, 0x6C03, 0], 0x6E04),      // an exact tie, to the lower even
+        ([0x3E00, 0x6C01, 0], 0x6E02),      // an exact tie, to the upper even
+        ([0xBE00, 0x6C03, 0x8400], 0xEE05), // a negative one past the midpoint
+        ([0x0400, 0x1000, 0], 0),           // a tie at half the least subnormal
+        ([0x0400, 0x1000, 1], 2),           // a tie between subnormals
+        ([0x7BFF, 0x3C00, 0x4C00], 0x7C00), // past the largest half: infinity
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for ([a, b, c], want) in cases {
+        let words = [
+            0x7E0E_02FF,
+            a, // v_mov_b32 v7, a
+            0x7E0C_02FF,
+            b, // v_mov_b32 v6, b
+            0x7E0A_02FF,
+            c, // v_mov_b32 v5, c
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xD74B_0000,
+            0x0416_0D07, // v_fma_f16 v0, v7, v6, v5
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ];
+        let native = native_of(&words, false, 32);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_fma_f16"));
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(got) = on_the_card(&shader, [0, 0]) else {
+            return;
+        };
+        eprintln!("v_fma_f16 {a:#x} * {b:#x} + {c:#x}: {:#x}, the console's {want:#x}", got & 0xFFFF);
+        assert_eq!(got & 0xFFFF, want, "{a:#x} * {b:#x} + {c:#x}");
+    }
+}
+
 /// The wave size `native` lowers to on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {
     let p = crate::spill::build(native).expect("build");
