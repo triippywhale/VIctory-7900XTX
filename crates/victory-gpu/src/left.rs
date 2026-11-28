@@ -96,6 +96,14 @@
 //! thread that holds the gate; and the gate knows whether the thread that
 //! asks holds it ([`Gate`]): asked for again by that thread, it stops the
 //! process and says so, where it stood without a word.
+//!
+//! What is said whenever a mode is on: a thread that has waited [`STEP`]
+//! for the gate names who holds it, for what and since when; a fetch that
+//! has waited so long for the card names its path, its pieces and bytes,
+//! how far the fences are and the locks its thread holds
+//! (`crate::host::leftq`); both go on waiting, and say so again every
+//! [`STEP`]. At debug level the first [`SAY_FIRST`] pieces left are named
+//! with the copy that wrote them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -109,6 +117,9 @@ const WRITE_COMBINED: u32 = 0x400;
 /// Pieces are kept by the 64 KiB of title memory they lie in (a card copy's
 /// pieces lie in one each: `crate::shadow::card_piece_of`).
 const PIECE: u64 = 64 << 10;
+/// So many of the first pieces left are said in the log, at debug level:
+/// where, how long, and the copy that wrote them.
+const SAY_FIRST: u64 = 64;
 
 /// `VICTORY_SKIP_WC_BACK`: 2 leaves pieces on the card (see the file);
 /// unset or 0: off. Other values are not modes of this build: off.
@@ -247,9 +258,47 @@ static FETCHING: AtomicU64 = AtomicU64::new(0);
 /// One thread at a time, and never twice by one thread: a thread that
 /// holds it and asks again is told so ([`Nested`]) and does not wait for
 /// itself (see the file, "Locks").
+///
+/// It says who holds it: a thread that has waited [`STEP`] for it says so
+/// in the log, with the holder, and goes on waiting in such steps.
 struct Gate {
-    held: Mutex<bool>,
+    held: Mutex<Option<Holder>>,
     freed: Condvar,
+}
+
+/// Who holds a [`Gate`]: the thread, what it holds it for, for which copy
+/// (0: for none), and since when.
+struct Holder {
+    thread: std::thread::Thread,
+    what: &'static str,
+    copy: u64,
+    since: std::time::Instant,
+}
+
+/// A wait for the gate or for the card (`crate::host::leftq`) is said in
+/// the log when it has lasted so long, and again every time it has lasted
+/// so long once more.
+pub(crate) const STEP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A thread, by its name or else its number, for the log.
+pub(crate) fn thread_name(thread: &std::thread::Thread) -> String {
+    match thread.name() {
+        Some(name) => name.to_owned(),
+        None => format!("{:?}", thread.id()),
+    }
+}
+
+/// The line of a thread that waits for a gate `holder` holds.
+fn gate_waited(what: &str, copy: u64, waited: std::time::Duration, holder: &Holder) -> String {
+    format!(
+        "pieces left on the card: {what} (copy {copy}) has waited {:.0} s for the gate, which thread {} holds for {} (copy {}) since \
+         {:.0} s; still waiting (VICTORY_SKIP_WC_BACK)",
+        waited.as_secs_f64(),
+        thread_name(&holder.thread),
+        holder.what,
+        holder.copy,
+        holder.since.elapsed().as_secs_f64()
+    )
 }
 
 /// The gate, held until dropped.
@@ -267,21 +316,46 @@ thread_local! {
 impl Gate {
     const fn new() -> Gate {
         Gate {
-            held: Mutex::new(false),
+            held: Mutex::new(None),
             freed: Condvar::new(),
         }
     }
 
-    /// Waits until no other thread holds the gate, and holds it.
-    fn enter(&self) -> Result<Gated<'_>, Nested> {
+    /// Waits until no other thread holds the gate, and holds it, for
+    /// `what` of copy `copy` (0: of none). A wait of `step` is said in the
+    /// log, each time.
+    fn enter(
+        &self,
+        what: &'static str,
+        copy: u64,
+        step: std::time::Duration,
+    ) -> Result<Gated<'_>, Nested> {
         if HOLDING.get() {
             return Err(Nested);
         }
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        while *held {
-            held = self.freed.wait(held).unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            let began = std::time::Instant::now();
+            while held.is_some() {
+                let (still, waited) = self
+                    .freed
+                    .wait_timeout(held, step)
+                    .unwrap_or_else(|e| e.into_inner());
+                held = still;
+                if waited.timed_out()
+                    && let Some(holder) = held.as_ref()
+                {
+                    GATE_WAITS.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("{}", gate_waited(what, copy, began.elapsed(), holder));
+                }
+            }
         }
-        *held = true;
+        *held = Some(Holder {
+            thread: std::thread::current(),
+            what,
+            copy,
+            since: std::time::Instant::now(),
+        });
         HOLDING.set(true);
         Ok(Gated(self))
     }
@@ -289,7 +363,7 @@ impl Gate {
 
 impl Drop for Gated<'_> {
     fn drop(&mut self) {
-        *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) = None;
         HOLDING.set(false);
         self.0.freed.notify_one();
     }
@@ -297,15 +371,18 @@ impl Drop for Gated<'_> {
 
 static GATE: Gate = Gate::new();
 
+/// How often a thread said that it had waited [`STEP`] for a gate.
+static GATE_WAITS: AtomicU64 = AtomicU64::new(0);
+
 /// [`GATE`], held. A thread that holds it already cannot be let in (the
 /// fetch it asks for may merge into the copy whose refresh holds the gate)
 /// and would wait for itself: the process stops with the reason.
-fn gate() -> Gated<'static> {
-    match GATE.enter() {
+fn gate(what: &'static str, copy: u64) -> Gated<'static> {
+    match GATE.enter(what, copy, STEP) {
         Ok(gate) => gate,
         Err(Nested) => crate::host::fail(format_args!(
-            "a thread that holds the gate of pieces left on the card asked for it again: work of another's ran inside a \
-             refresh or a fetch (VICTORY_SKIP_WC_BACK)"
+            "a thread that holds the gate of pieces left on the card asked for it again, for {what} (copy {copy}): work of \
+             another's ran inside a refresh or a fetch (VICTORY_SKIP_WC_BACK)"
         )),
     }
 }
@@ -322,7 +399,7 @@ pub(crate) fn gate_held() -> bool {
 /// holds it.
 #[cfg(test)]
 pub(crate) fn hold_gate() -> Gated<'static> {
-    gate()
+    gate("a test", 0)
 }
 
 /// Since the last frame line: pieces left and their bytes; pieces fetched
@@ -422,6 +499,7 @@ pub(crate) fn skip_back(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
         .first()
         .filter(|p| p.0 == key as usize)
         .map(|p| p.1);
+    let new;
     {
         let mut book = BOOK.write().unwrap_or_else(|e| e.into_inner());
         // Taken once while left; or another copy left its bytes here, and
@@ -439,6 +517,7 @@ pub(crate) fn skip_back(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
             Some(left) => {
                 add_run(&mut left.runs, lo, hi);
                 STATS[5].fetch_add(1, Ordering::Relaxed);
+                new = false;
             }
             None => {
                 let page = page.filter(|page| !book.by_page.contains_key(page));
@@ -454,7 +533,23 @@ pub(crate) fn skip_back(shadow: &Arc<Shadow>, lo: usize, hi: usize) -> bool {
                     },
                 );
                 LEFT_N.fetch_add(1, Ordering::SeqCst);
+                new = true;
             }
+        }
+    }
+    // At debug level: the first pieces left, with the copy that wrote them.
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if new && SAID.load(Ordering::Relaxed) < SAY_FIRST && tracing::enabled!(tracing::Level::DEBUG) {
+        let n = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= SAY_FIRST {
+            let (at, len) = shadow.span();
+            tracing::debug!(
+                "piece left on the card, {n} of the first {SAY_FIRST}: {start:#x}+{:#x}, written by shaders to copy {} ({} \
+                 {at:#x}+{len:#x}) (VICTORY_SKIP_WC_BACK)",
+                end - start,
+                shadow.id(),
+                shadow.kind()
+            );
         }
     }
     STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -517,7 +612,7 @@ pub(crate) fn before_take(from: usize, to: usize, taker: u64) {
     if !any() || from >= to {
         return;
     }
-    let _gate = gate();
+    let _gate = gate("a reader's fetch", taker);
     fetch_in(from as u64, to as u64, taker);
 }
 
@@ -593,7 +688,7 @@ pub(crate) fn sweep() {
     if LEFT_N.load(Ordering::SeqCst) == 0 {
         return;
     }
-    let _gate = gate();
+    let _gate = gate("the sweep's fetch", 0);
     let orphans: Vec<u64> = {
         let book = BOOK.read().unwrap_or_else(|e| e.into_inner());
         let mut held: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
@@ -698,7 +793,7 @@ pub(crate) fn before_refresh(id: u64, from: usize, to: usize) -> Refreshing {
             _taking: taking,
         };
     }
-    let gate = gate();
+    let gate = gate("a refresh", id);
     fetch_in(from as u64, to as u64, id);
     let own = own_left_in(id, from, to);
     Refreshing {
@@ -768,7 +863,7 @@ pub(crate) fn log(frames: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Gate, add_run, cut_run, gate_held};
+    use super::{GATE_WAITS, Gate, Holder, STEP, add_run, cut_run, gate_held, gate_waited};
 
     /// The cycle that hung the process, on one thread: a refresh holds the
     /// gate and a job of another's that runs on its thread asks for it. It
@@ -778,15 +873,18 @@ mod tests {
     fn the_gate_is_not_waited_for_by_the_thread_that_holds_it() {
         let gate = Gate::new();
         assert!(!gate_held());
-        let refresh = gate.enter().expect("nobody holds it");
+        let refresh = gate.enter("a refresh", 1, STEP).expect("nobody holds it");
         assert!(gate_held());
-        assert!(gate.enter().is_err(), "asked again by the thread that holds it");
+        assert!(
+            gate.enter("a reader's fetch", 0, STEP).is_err(),
+            "asked again by the thread that holds it"
+        );
         // (Nor another gate: what the thread may not do meanwhile is the same.)
-        assert!(Gate::new().enter().is_err());
+        assert!(Gate::new().enter("a refresh", 2, STEP).is_err());
         std::thread::scope(|threads| {
             let other = threads.spawn(|| {
                 assert!(!gate_held());
-                let got = gate.enter().is_ok();
+                let got = gate.enter("a reader's fetch", 0, STEP).is_ok();
                 // (Let go of when the statement above ended.)
                 got && !gate_held()
             });
@@ -798,10 +896,44 @@ mod tests {
         });
         assert!(!gate_held());
         // Free again, for the thread that held it too.
-        let again = gate.enter().expect("let go of");
+        let again = gate.enter("a refresh", 1, STEP).expect("let go of");
         assert!(gate_held());
         drop(again);
         assert!(!gate_held());
+    }
+
+    /// A thread that has waited a step for the gate says so, with what
+    /// holds it, and goes on waiting: it is let in when the gate is free.
+    #[test]
+    fn a_long_wait_for_the_gate_is_said_and_goes_on() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let gate = Gate::new();
+        let said = GATE_WAITS.load(Ordering::Relaxed);
+        let held = gate.enter("a refresh", 7, STEP).expect("nobody holds it");
+        std::thread::scope(|threads| {
+            let other = threads.spawn(|| {
+                gate.enter("a reader's fetch", 0, Duration::from_millis(10))
+                    .is_ok()
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!other.is_finished(), "let in while the gate was held");
+            drop(held);
+            assert!(other.join().expect("no panic"));
+        });
+        assert!(GATE_WAITS.load(Ordering::Relaxed) > said);
+        let holder = Holder {
+            thread: std::thread::current(),
+            what: "a refresh",
+            copy: 7,
+            since: std::time::Instant::now(),
+        };
+        let line = gate_waited("a reader's fetch", 0, Duration::from_secs(4), &holder);
+        assert!(
+            line.contains("a reader's fetch (copy 0) has waited 4 s"),
+            "{line}"
+        );
+        assert!(line.contains("holds for a refresh (copy 7)"), "{line}");
     }
 
     /// One thread at a time is inside, however many ask.
@@ -814,8 +946,14 @@ mod tests {
             for _ in 0..6 {
                 threads.spawn(|| {
                     for _ in 0..500 {
-                        let held = gate.enter().expect("not held by this thread");
-                        assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two threads inside");
+                        let held = gate
+                            .enter("a refresh", 3, STEP)
+                            .expect("not held by this thread");
+                        assert_eq!(
+                            inside.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "two threads inside"
+                        );
                         std::thread::yield_now();
                         inside.fetch_sub(1, Ordering::SeqCst);
                         passes.fetch_add(1, Ordering::Relaxed);
@@ -825,7 +963,7 @@ mod tests {
             }
         });
         assert_eq!(passes.load(Ordering::Relaxed), 3000);
-        assert!(!*gate.held.lock().unwrap());
+        assert!(gate.held.lock().unwrap().is_none());
     }
 
     #[test]

@@ -3497,6 +3497,12 @@ impl Shadow {
         self.id
     }
 
+    /// What the copy is a copy of, in a word, for a line of the log that
+    /// names it (`crate::left`).
+    pub(crate) fn kind(&self) -> &'static str {
+        if self.window { "a window of title memory outside buffers" } else { "a title buffer" }
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
