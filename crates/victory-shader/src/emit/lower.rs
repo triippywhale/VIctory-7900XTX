@@ -3938,6 +3938,9 @@ impl<'a> Lower<'a> {
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
         self.end_guarded(noting, &[]);
+        if store && super::bvh_stores() && crate::spill::is_spilled(self.x.native) {
+            self.store_note(page, guard);
+        }
         let c = self.cur;
         self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
         let copy = if store {
@@ -3956,6 +3959,38 @@ impl<'a> Lower<'a> {
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// (`VICTORY_BVH_STORES=1`) A store by address of the structure builder
+    /// leaves `page` with the dispatch's tag in the store notes after the
+    /// builder's fault notes (`shader.rs` `MEMORY_STORE_NOTES`), for lanes
+    /// that run (`guard`).
+    fn store_note(&mut self, page: V, guard: Option<V>) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_STORE_NOTES, SLOT_FAULTS, USER_DISPATCH_TAG};
+        let tag = self.host_word(RootType::Other(USER_DISPATCH_TAG), 0, 0);
+        let noting = self.begin_guarded(guard);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k21, kmask) = (k(self, 21), k(self, 0x7FF));
+        let tag = self.s.m.bin(c, Bin::And, tag, kmask);
+        let high = self.s.m.bin(c, Bin::Shl, tag, k21);
+        let note = self.s.m.bin(c, Bin::Or, page, high);
+        // The place: a hash of both, past the sink.
+        let mix = k(self, 0x9E37_79B1);
+        let hashed = self.s.m.bin(c, Bin::Mul, note, mix);
+        let k18 = k(self, 18);
+        let hashed = self.s.m.bin(c, Bin::LShr, hashed, k18);
+        let places = k(self, MEMORY_STORE_NOTES - 1);
+        let place = self.s.m.bin(c, Bin::URem, hashed, places);
+        let first = k(self, MEMORY_FAULTS + 1);
+        let place = self.s.m.bin(c, Bin::Add, place, first);
+        let k2 = k(self, 2);
+        let place = self.s.m.bin(c, Bin::Shl, place, k2);
+        let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let (iu, mask, align, void) = (self.s.m.undef(i32t), self.s.m.i8(1), k(self, 4), self.s.t.void);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, note, iu, iu, iu, mask, align]);
+        self.end_guarded(noting, &[]);
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -10465,6 +10500,14 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                // The threads a partial final group keeps for its barriers are not in the
+                // console's EXEC: they skipped the loads the value is made of, so the first
+                // lane is the first launched one (after fxceless 1320dfd: the structure
+                // builder's prefix sums, `s17 + lds[s18 * 4]`).
+                let guard = match (guard, self.partial_active) {
+                    (Some(g), Some(on)) => Some(self.s.m.bin(self.cur, Bin::And, g, on)),
+                    (g, on) => g.or(on),
+                };
                 let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value

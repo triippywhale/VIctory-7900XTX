@@ -104,6 +104,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_WALK=1` | a meter (diagnostics builds): every node test counts itself per thread, and a frame line per program says how many nodes its threads test (mean, median, p90, p99, max; boxes and triangles apart). Slower, and the translations get their own cache key. Also: children entered per box test (a tight structure keeps it near 1-2; loose or overlapping boxes push it to 3-4) and the threads that read a node off a page with no copy (it reads zeros: a broken walk), overall and among those ended by the loop limit. After Op-lite/victory-scarlett c45b43e, where primary rays tested 1,213 nodes a thread |
 | `VICTORY_BVH_WALK_LIMIT=<n>` | a ray's loop that has gone round `n` times tests no more nodes (a box node answers with no child, anything else with a miss), so its walk runs out and its result is written. Without it such a ray goes round to the loop limit (4,096) and is killed, result lost; a wave waits for its longest lane. Run rtwalk-B: 0.2-5.6 % of the two big tracers' threads pass 1,024 tests and end at 4,085-4,089, the rest have a p90 under 512. Off unless set; 1024 is the value to try. Own cache key |
 | `VICTORY_BVH_INPUTS=1` | logs where the builder's reads of title buffers come from (diagnostics builds): the buffer's own copy, or an arena page or window of title memory, which does not have what shaders wrote into the buffer's copy; and every page read by address over buffers shaders write. Run bvhcheck-1 found moving objects built from vertices that were not there (z to 3.4e38, bytes of other records) |
+| `VICTORY_BVH_STORES=1` | which of the builder's programs store where (diagnostics builds): every store by address of a builder program also notes its page and its dispatch, and the log puts each to the dispatch's views (own, past another live dispatch's view, outside its views) with a sum by program every 10 s. Its own cache key. The views it knows are root views only: a program that writes its structure through a pointer from its build description shows as "outside" or "past a neighbour" while it is right (run stores1: the results views of builds 128 bytes apart) |
 | `VICTORY_BVH_MIRROR=1` | experiment, off unless set: before a list's first builder dispatch, pages read by address as title memory has them (arena pages, windows) take, on the card, the bytes of the title buffers in them that shaders write. Meant to stop moving objects' structures being built from stale vertices (boxes to 3.4e38 in bvhcheck-1 to -3). It did not help: in bvhcheck-4 it mirrored 17 pages, about 40 ranges a frame, and the huge boxes stayed. Kept as a record; leave it off. |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics). `cargo run --release -p victory-shader --example bvh_dump -- <folder> [--all]` also writes the CPU's side of the held pages (`title.bin`, `title-pages.txt`); `--example dump_title -- <folder> <address>` compares the two. `--example bvh_dump -- <folder> [--all]` checks the structures in it (`bvh_check.rs`): cycles, nodes reached twice or outside the structure, loose and escaping boxes, and a surface estimate of the node tests a ray makes, per top level and for the bottom levels that cost the most |
@@ -123,6 +124,34 @@ dispatches, faults and what came.
   neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
   did not mend it and costs some 20 ms a frame (light-15): the title asks in
   every frame, and what it read was as old as before. Open.
+- Moving objects' structures held the builder's own records where triangles
+  should be (dump bvhcheck-4) while no other build wrote inside, and the
+  builder touched pages that are not the title's every frame (0.2-3.2). One
+  cause mended: in a partial final group a first-lane read counted the threads
+  kept only for barriers. That only happens on a host whose waves are 32 lanes
+  wide (a wave64 program split in halves); on a 64-lane host (RX 7900 XT) it
+  never runs, and run rtcheck2 there showed the same bursts of stray pages as
+  before, so the quiet minutes of run stores1 were the scene, not the mend.
+- A static structure broken for good (dump of rtcheck2, bottom level at
+  0xce06c8100): its boxes and leaves are laid out right, but its triangles
+  have x = 0 and y, z = ±infinity, and every box above them took that on.
+  LeafRehydration, which unpacks them once, reads the vertices, indices and
+  transforms by the addresses in its geometry records (48 bytes: transform,
+  index and vertex formats and counts, index and vertex buffers, stride), and
+  nothing made those pages ready before the dispatch: only its views' were.
+  A page with no copy reads zeros, and a fault gives it one only in the next
+  frame, after the one unpacking. Now (`memory::ready`) a builder dispatch's
+  views that read as geometry records have what they point to made ready when
+  it is recorded, and pages still without a copy, or that came lately, are
+  taken again at its submission. The 10 s memory line counts it ("geometry
+  records given to the builder"). Run rtcheck3 (10 min, b1ebafd): structure
+  nodes reached twice in the dump fell from 78,009 to 3,197 and the builder
+  found pages without a copy only in the first 2.5 minutes; no page was still
+  without one at submission. What is left may be geometry in title buffers:
+  the directory points at the buffer's copy, which only a draw or view that
+  names it brings up to date, and streamed-in geometry is unpacked before
+  anything draws with it. Those ranges' copies are now brought up to date too
+  (counted as "ranges in buffers brought up to date").
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame

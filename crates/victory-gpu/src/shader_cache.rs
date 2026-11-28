@@ -136,6 +136,10 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::bvh_walk() {
             bytes.extend_from_slice(b"VICTORY_BVH_WALK=1 detail");
         }
+        // The builder's store notes (a diagnostic), only when on.
+        if victory_shader::emit::bvh_stores() {
+            bytes.extend_from_slice(b"VICTORY_BVH_STORES=1");
+        }
         // And the bound on a ray's node tests.
         if let Some(limit) = victory_shader::emit::bvh_walk_limit() {
             bytes.extend_from_slice(format!("VICTORY_BVH_WALK_LIMIT={limit}").as_bytes());

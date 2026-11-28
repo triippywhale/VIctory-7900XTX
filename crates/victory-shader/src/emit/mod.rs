@@ -127,8 +127,8 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_STORE_NOTES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_TAG, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -246,6 +246,17 @@ thread_local! {
     pub(crate) static TEST_WALK_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// [`bvh_walk`] on for a test's thread.
     pub(crate) static TEST_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A diagnostic (`VICTORY_BVH_STORES=1`): every store by address of the
+/// structure builder's programs also notes its page and the dispatch's tag
+/// (`shader.rs` [`MEMORY_STORE_NOTES`]), so the host can say which program
+/// stores outside the structures its dispatch was given. Adds a store to a
+/// buffer of ours per store; what the program computes is unchanged. Part of
+/// the translation: the shader cache keys on it.
+pub fn bvh_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_STORES").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near

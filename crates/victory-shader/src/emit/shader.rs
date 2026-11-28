@@ -83,6 +83,16 @@ pub const MEMORY_PAGES: u32 = 1 << 21;
 pub const MEMORY_READ_ONLY: u32 = 1 << 31;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// (`VICTORY_BVH_STORES=1`, a diagnostic) Dwords of store notes after the
+/// builder's half of the [`SLOT_FAULTS`] notes: a structure-builder program's
+/// store by address leaves its page and the dispatch's [`USER_DISPATCH_TAG`]
+/// (`page | tag << 21`) at a place by both (dword 0 a sink), which the host
+/// reads once a frame to say which program stored where.
+pub const MEMORY_STORE_NOTES: u32 = 1 << 14;
+/// `RootType::Other` code of a user-data dword the host sets per dispatch of
+/// the structure builder with `VICTORY_BVH_STORES=1`: a number (11 bits) it
+/// knows the dispatch by ([`MEMORY_STORE_NOTES`]).
+pub const USER_DISPATCH_TAG: u32 = 0x107;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

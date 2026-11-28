@@ -90,6 +90,9 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
+#[cfg(feature = "diagnostics")]
+mod stores;
+
 /// Copies that can be numbered (the run of heap slots is one longer).
 const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
@@ -311,6 +314,8 @@ struct Memory {
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
     trace: trace::Trace,
+    #[cfg(feature = "diagnostics")]
+    stores: stores::Stores,
 }
 
 /// Since the last report.
@@ -349,6 +354,11 @@ struct Stats {
     adopted: u64,
     /// Ranges copied from shader-written buffers into pages they share.
     mirrored: u64,
+    /// Arrays of geometry records builder dispatches were given; pages that
+    /// came for what they point to when the dispatch was recorded, and at
+    /// its submission ([`Memory::land_geometry`]); ranges in title buffers
+    /// whose copies were brought up to date.
+    geometry: [u64; 4],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -368,6 +378,9 @@ pub(crate) struct Ready {
     /// number. False once the numbers have run out ([`COPIES`]): what it
     /// names then reads zeros, a dropped stage for the structure builder.
     pub(crate) whole: bool,
+    /// (`VICTORY_BVH_STORES=1`) The dispatch's tag in the builder's store
+    /// notes; 0 otherwise.
+    pub(crate) tag: u32,
 }
 
 impl Memory {
@@ -380,10 +393,13 @@ impl Memory {
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         // Twice the notes a shader knows of: the programs that walk leave
         // theirs in the first half, the builder in the second ([`ready`]).
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8)?;
+        // After them the builder's store notes (`VICTORY_BVH_STORES=1`).
+        let notes =
+            MEMORY_FAULTS as usize * 8 + victory_shader::emit::MEMORY_STORE_NOTES as usize * 4;
+        let (faults, data) = host.shared_buffer(notes as u64)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 8) };
+        unsafe { std::ptr::write_bytes(data, 0, notes) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -425,6 +441,8 @@ impl Memory {
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
             trace: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            stores: Default::default(),
         })
     }
 
@@ -1034,6 +1052,29 @@ impl Memory {
         true
     }
 
+    /// At the submission of a list whose builder dispatch was given the
+    /// geometry records at `at`: the pages they point to that have no copy
+    /// get one, and those that came lately are taken again (the buffers may
+    /// have been streamed in since the dispatch was recorded). Read wrong
+    /// once, the triangles of a packed structure are unpacked so for good.
+    fn land_geometry(&mut self, at: u64) {
+        for (start, len) in geometry(read_title, at) {
+            for page in start / PAGE..=(start + len - 1) / PAGE {
+                if self.copy_of(page).is_none() {
+                    if self.place(page) {
+                        self.stats.geometry[2] += 1;
+                    }
+                } else if self
+                    .pages
+                    .get(&page)
+                    .is_some_and(|h| h.born + YOUNG >= self.frame)
+                {
+                    self.take(page, 0, PAGE as usize, false);
+                }
+            }
+        }
+    }
+
     /// Bytes `from..to` of `page` from title memory into its arena's page, at
     /// a submission; `whole`: sent whether they differ from those last taken
     /// or not.
@@ -1308,7 +1349,8 @@ impl Memory {
              since the last line {} made, {} given back for others ({} of them wanted again within {} frames), \
              {} gone with the title's memory, {} named by a list since; per frame {:.1} not the title's ({:.1} of them below 4 GiB), \
              {:.1} over the frame's limit, {:.1} without room, {:.1} left by the builder; \
-             pages wanted above 4 GiB: {} since the last line, {} in all",
+             pages wanted above 4 GiB: {} since the last line, {} in all; geometry records given to the builder {} times, \
+             pages for what they point to {} when recorded and {} at submission, ranges in buffers brought up to date {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1353,7 +1395,11 @@ impl Memory {
             s.left[1] as f64 / frames,
             s.builders as f64 / frames,
             wanted[1],
-            wanted[0]
+            wanted[0],
+            s.geometry[0],
+            s.geometry[1],
+            s.geometry[2],
+            s.geometry[3]
         );
         // Where the copies shaders walk lie: a read of the PC's memory
         // crosses the bus.
@@ -1566,6 +1612,97 @@ fn packed_len(header: u64) -> Option<u64> {
     (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
 }
 
+/// A geometry record of the builder's inputs, as LeafRehydration and the
+/// builds read them from a view (`idxen`, 48 bytes apiece): the transform's
+/// address, the index and vertex formats, the index and vertex counts, the
+/// index and vertex buffers' addresses, the vertices' stride (its low 15
+/// bits). The programs reach the buffers by those addresses alone, so the
+/// views' pages being ready does not make theirs ready.
+const RECORD: u64 = 48;
+/// At most so many records to an array, and so many bytes of buffers.
+const RECORDS: u64 = 4096;
+const RECORDS_BYTES: u64 = 256 << 20;
+
+/// The ranges of title memory the geometry records at `at` point to
+/// (address, length), the records' own included; none if what lies there
+/// does not read as records. `read` reads title memory, false where it has
+/// none. The array ends at the first record that does not read as one.
+fn geometry(read: impl Fn(u64, &mut [u8]) -> bool, at: u64) -> Vec<(u64, u64)> {
+    let title = |a: u64| (1 << 32..1 << 40).contains(&a);
+    let mut ranges = Vec::new();
+    let mut bytes = 0;
+    for n in 0..RECORDS {
+        let mut r = [0u8; RECORD as usize];
+        if !read(at + n * RECORD, &mut r) {
+            break;
+        }
+        let d = |i: usize| u32::from_le_bytes(r[4 * i..4 * i + 4].try_into().unwrap());
+        let q = |i: usize| u64::from(d(i)) | u64::from(d(i + 1)) << 32;
+        let (transform, index_format, vertex_format) = (q(0), d(2), d(3));
+        let (indices, vertices, ib, vb, stride) = (
+            u64::from(d(4)),
+            u64::from(d(5)),
+            q(6),
+            q(8),
+            u64::from(d(10) & 0x7FFF),
+        );
+        // The index formats the program knows: 32-bit, 16-bit, its own
+        // packed one (a header of offsets; at most as long as 32-bit
+        // indices and a header), none.
+        let index_bytes = match index_format {
+            42 => indices * 4,
+            57 => indices * 2,
+            53 => indices * 4 + 4096,
+            0 => 0,
+            _ => break,
+        };
+        let ok = (1..132).contains(&vertex_format)
+            && title(vb)
+            && stride > 0
+            && (1..=1 << 24).contains(&vertices)
+            && indices <= 1 << 26
+            && (index_format == 0 || (title(ib) && indices > 0))
+            && (transform == 0 || title(transform));
+        if !ok {
+            break;
+        }
+        let these = [
+            (vb, vertices * stride),
+            (ib, index_bytes),
+            (transform, if transform == 0 { 0 } else { 48 }),
+        ];
+        let len: u64 = these.iter().map(|r| r.1).sum();
+        if bytes + len > RECORDS_BYTES {
+            break;
+        }
+        bytes += len;
+        ranges.extend(these.into_iter().filter(|r| r.1 > 0));
+        if n == 0 {
+            ranges.push((at, RECORD));
+        } else if let Some(own) = ranges.iter_mut().find(|r| r.0 == at) {
+            own.1 += RECORD;
+        }
+    }
+    ranges
+}
+
+/// What title memory holds at `at`, as a shader would find it there; false
+/// where it has none.
+fn read_title(at: u64, out: &mut [u8]) -> bool {
+    let end = at + out.len() as u64;
+    if at < 1 << 32 || end > u64::from(MEMORY_PAGES) * PAGE {
+        return false;
+    }
+    // (Committed page by page: a record may cross one.)
+    let (first, last) = (at / PAGE, (end - 1) / PAGE);
+    if !(first..=last).all(|p| crate::texture::committed((p * PAGE) as *const u8, PAGE as usize)) {
+        return false;
+    }
+    crate::left::before_take(at as usize, end as usize, 0);
+    crate::host::copy_mapped(out.as_mut_ptr(), at as *const u8, out.len(), false);
+    true
+}
+
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
 /// differ. How many.
 fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
@@ -1592,6 +1729,7 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
 /// module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
 /// submitted. None if the host cannot hold it; the draw is then dropped.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ready(
     list: &HostList,
     heap: &HostHeap,
@@ -1600,6 +1738,7 @@ pub(crate) fn ready(
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
+    name: Option<&str>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -1616,12 +1755,22 @@ pub(crate) fn ready(
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
+        #[cfg(feature = "diagnostics")]
+        m.take_stores();
     }
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
     let builds = use_ != Use::Reads;
+    #[cfg(feature = "diagnostics")]
+    let tag = if builds && stores::on() {
+        m.stores.tag(frame, name.unwrap_or("?"), written, addresses)
+    } else {
+        0
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let (tag, _) = (0, name);
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
@@ -1708,6 +1857,38 @@ pub(crate) fn ready(
                 came[1] += held(m).saturating_sub(before);
             }
         }
+        if builds
+            && !packed
+            && !written.contains(&at)
+            && list.first_use(usize::MAX - (9 << 33) - (at >> 4 & 0x7FFF_FFFF) as usize)
+        {
+            let ranges = geometry(read_title, at);
+            if !ranges.is_empty() {
+                m.stats.geometry[0] += 1;
+                let before = held(m);
+                for &(start, len) in &ranges {
+                    m.ready(start, len);
+                    // In a title buffer the directory points at the buffer's
+                    // copy, which is brought up to date only by a draw or
+                    // view that names it: streamed-in geometry is unpacked
+                    // before anything draws with it (as a draw's vertex
+                    // buffers are brought up to date).
+                    if crate::shadow::in_buffer(start, len).is_some()
+                        && let Some(shadow) = crate::shadow::find(start, len)
+                    {
+                        shadow.refresh(list, start, len);
+                        m.stats.geometry[3] += 1;
+                    }
+                }
+                m.stats.geometry[1] += held(m).saturating_sub(before);
+                list.defer_host(move || {
+                    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        m.land_geometry(at);
+                    }
+                });
+                m.bring_up(list);
+            }
+        }
         if packed || !named(2, at) {
             continue;
         }
@@ -1780,6 +1961,7 @@ pub(crate) fn ready(
         faults: m.faults.2 + if builds { u64::from(MEMORY_FAULTS) * 4 } else { 0 },
         base,
         whole: !m.short,
+        tag,
     })
 }
 
@@ -2218,6 +2400,92 @@ mod tests {
             !guard.as_ref().unwrap().heaps.contains_key(&key),
             "MEMORY.heaps retained dropped HostHeap key {key:#x}"
         );
+    }
+
+    /// A geometry record as the builder reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        transform: u64,
+        index_format: u32,
+        vertex_format: u32,
+        indices: u32,
+        vertices: u32,
+        ib: u64,
+        vb: u64,
+        stride: u32,
+    ) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend(transform.to_le_bytes());
+        r.extend(index_format.to_le_bytes());
+        r.extend(vertex_format.to_le_bytes());
+        r.extend(indices.to_le_bytes());
+        r.extend(vertices.to_le_bytes());
+        r.extend(ib.to_le_bytes());
+        r.extend(vb.to_le_bytes());
+        r.extend((stride | 0x8000).to_le_bytes());
+        r.extend(0u32.to_le_bytes());
+        assert_eq!(r.len() as u64, RECORD);
+        r
+    }
+
+    #[test]
+    fn geometry_records_name_their_buffers() {
+        let at = 0x9_0000_0000;
+        let mut bytes = record(
+            0x9_1000_0000,
+            42,
+            6,
+            300,
+            100,
+            0x9_2000_0000,
+            0x9_3000_0000,
+            12,
+        );
+        bytes.extend(record(0, 57, 16, 6, 4, 0x9_4000_0000, 0x9_5000_0000, 8));
+        // Not a record: the array ends there.
+        bytes.extend([0u8; RECORD as usize]);
+        let read = |a: u64, out: &mut [u8]| {
+            let Some(from) = a
+                .checked_sub(at)
+                .map(|o| o as usize)
+                .filter(|&o| o + out.len() <= bytes.len())
+            else {
+                return false;
+            };
+            out.copy_from_slice(&bytes[from..from + out.len()]);
+            true
+        };
+        let ranges = geometry(read, at);
+        assert_eq!(
+            ranges,
+            vec![
+                (0x9_3000_0000, 1200),
+                (0x9_2000_0000, 1200),
+                (0x9_1000_0000, 48),
+                (at, 2 * RECORD),
+                (0x9_5000_0000, 32),
+                (0x9_4000_0000, 12),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_does_not_read_as_geometry_records_names_nothing() {
+        let at = 0x9_0000_0000;
+        // A vertex buffer below 4 GiB, an index format the program does not
+        // know, no stride, memory that is not there.
+        for bytes in [
+            record(0, 42, 6, 3, 3, 0x9_2000_0000, 0x1000, 12),
+            record(0, 7, 6, 3, 3, 0x9_2000_0000, 0x9_3000_0000, 12),
+            record(0, 0, 6, 0, 3, 0, 0x9_3000_0000, 0x8000),
+        ] {
+            let read = |a: u64, out: &mut [u8]| {
+                out.copy_from_slice(&bytes[(a - at) as usize..][..out.len()]);
+                true
+            };
+            assert!(geometry(read, at).is_empty());
+        }
+        assert!(geometry(|_, _| false, at).is_empty());
     }
 
     #[test]

@@ -1701,6 +1701,9 @@ impl State {
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
+        if kind == victory_shader::emit::USER_DISPATCH_TAG {
+            return memory.map_or(0, |m| m.tag);
+        }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
@@ -1800,7 +1803,10 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        let name = victory_shader::emit::bvh_stores()
+            .then(|| crate::pipeline::host_pipeline(self.pipeline as This).map(|p| p.name.as_str()))
+            .flatten();
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads, name)
     }
 
     /// The bound heap holding `handle`.
