@@ -11,7 +11,9 @@
 //! twice, nodes outside the structure, nodes the dump does not have), loose
 //! and escaping boxes, and the surface estimate of the node tests a ray
 //! through the root makes. Then the bottom levels that cost the top levels
-//! the most.
+//! the most. Bottom levels still packed (marks 0x100) are counted apart and
+//! not walked: their nodes come when the builder unpacks them; those a
+//! builder dispatch was given or a top level instances are listed.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -167,11 +169,19 @@ fn main() {
     );
     let found = headers(&d);
     let (tops, bottoms): (Vec<&Header>, Vec<&Header>) = found.iter().partition(|h| !h.bottom());
+    // Bottom levels still packed have no nodes yet (the builder unpacks them
+    // in place, on the card): walked, their root reads empty and their
+    // nodes reached twice. They are told apart, not checked.
+    let (packed, bottoms): (Vec<&Header>, Vec<&Header>) =
+        bottoms.into_iter().partition(|h| h.packed());
     println!(
-        "{} top levels and {} bottom levels found",
+        "{} top levels and {} bottom levels found, and {} bottom levels still packed",
         tops.len(),
-        bottoms.len()
+        bottoms.len(),
+        packed.len()
     );
+    let packed_at: BTreeSet<u64> = packed.iter().map(|h| h.address).collect();
+    let mut packed_instanced: BTreeSet<u64> = BTreeSet::new();
     let mut checked: HashMap<u64, Option<Report>> = HashMap::new();
     // Bottom levels by what they cost the top levels: (summed chance x
     // estimate, instances, estimate, static).
@@ -215,6 +225,9 @@ fn main() {
             );
         }
         for i in instanced {
+            if packed_at.contains(&i.address) {
+                packed_instanced.insert(i.address);
+            }
             let c = cost
                 .entry(i.address)
                 .or_insert((0.0, 0, i.expected, i.static_root));
@@ -266,5 +279,39 @@ fn main() {
             sum.loose_over_2,
             sum.escapes
         );
+    }
+    // Still packed is what a structure is until a dispatch of the builder
+    // unpacks it. One the memory module landed for a dispatch, or one a top
+    // level instances, should not still be: those are listed.
+    let landed: HashMap<u64, u64> = d.packed.iter().copied().collect();
+    let landed_n = packed
+        .iter()
+        .filter(|h| landed.contains_key(&h.address))
+        .count();
+    println!(
+        "still packed: {} bottom levels (not walked); {} of them given to a builder dispatch (the memory module's packed list), {} instanced by a top level",
+        packed.len(),
+        landed_n,
+        packed_instanced.len()
+    );
+    for h in &packed {
+        let given = landed.get(&h.address);
+        let instanced = packed_instanced.contains(&h.address);
+        if given.is_some() || instanced {
+            println!(
+                "  still packed {:#x} marks {:#x} {} bytes{}{}",
+                h.address,
+                h.marks >> 16,
+                h.bytes,
+                given.map_or(String::new(), |len| format!(
+                    ", given to a dispatch ({len} bytes)"
+                )),
+                if instanced {
+                    ", instanced by a top level"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 }

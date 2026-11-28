@@ -36,6 +36,9 @@ pub const PAGE: u64 = 1 << 16;
 const VERSION: u32 = 6;
 /// A header's mark of a bottom level (dword 0).
 pub const BOTTOM: u32 = 0x8000_0000;
+/// A header's mark of a structure still packed (dword 0): the builder has
+/// not unpacked it in place yet, so its root and nodes are not there.
+pub const PACKED: u32 = 0x0100_0000;
 /// An instance root pointer's mark of a static structure.
 const STATIC_ROOT: u32 = 1 << 30;
 
@@ -92,6 +95,12 @@ impl Header {
 
     pub fn bottom(&self) -> bool {
         self.marks & BOTTOM != 0
+    }
+
+    /// Still packed: its root points at nodes the builder has not written
+    /// yet (and walking it finds an empty root and nodes reached twice).
+    pub fn packed(&self) -> bool {
+        self.marks & PACKED != 0
     }
 }
 
