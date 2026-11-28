@@ -784,9 +784,19 @@ pub(crate) enum TableCount {
     LongerSlots,
     /// Stages that found their table made already, shared so.
     FoundShared,
+    /// (`VICTORY_STAGED_TABLES`) Tables that went into their slots at once
+    /// (`crate::descriptor::host::HostHeap::unstage`).
+    Staged,
+    /// Their descriptors.
+    StagedSlots,
+    /// Those of them whose raw twins went with a second copy.
+    StagedTwins,
+    /// Tables written slot by slot all the same: too long for the staging
+    /// heap, or the thread has none.
+    NotStaged,
 }
 
-const TABLE_COUNTS: usize = 3;
+const TABLE_COUNTS: usize = 7;
 
 /// Since the last frame line ([`TableCount`]).
 static TABLE_COUNTED: [AtomicU64; TABLE_COUNTS] = [const { AtomicU64::new(0) }; TABLE_COUNTS];
@@ -827,6 +837,17 @@ pub(crate) fn tables_line(frames: f64) {
             per(TableCount::MadeShared),
             per(TableCount::LongerSlots),
             per(TableCount::FoundShared),
+        );
+    }
+    if v[TableCount::Staged as usize] + v[TableCount::NotStaged as usize] > 0 {
+        tracing::info!(
+            "fresh tables staged (VICTORY_STAGED_TABLES=1) per frame: {:.0} tables of {:.0} descriptors copied into their slots in one call each ({:.1} descriptors a table), {:.0} of them with a second call for their raw twins; {:.0} tables written slot by slot (longer than {} slots, or the thread has no staging heap)",
+            per(TableCount::Staged),
+            per(TableCount::StagedSlots),
+            v[TableCount::StagedSlots as usize] as f64 / v[TableCount::Staged as usize].max(1) as f64,
+            per(TableCount::StagedTwins),
+            per(TableCount::NotStaged),
+            crate::descriptor::host::TableStage::SLOTS,
         );
     }
 }
@@ -4505,15 +4526,28 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            // (`VICTORY_STAGED_TABLES`) The table is written into this
+            // thread's heap beside the card's and goes into its slots at
+            // once, after the last.
+            let stage = if crate::descriptor::host::staged_tables() {
+                let stage = crate::descriptor::host::TableStage::get(n);
+                if stage.is_none() {
+                    table_count(TableCount::NotStaged, 1);
+                }
+                stage
+            } else {
+                None
+            };
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                let fresh = stage.as_deref().map_or(crate::descriptor::host::Fresh::SLOT, |stage| stage.slot(k));
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = host.make_listed(recording, words, index, fresh)
                 {
                     let kind = group
                         .entry(k)
@@ -4558,7 +4592,7 @@ impl State {
                         // Constants a copy at its place in this list wrote:
                         // copied on the card behind it.
                         if let Some((buffer, gpu)) = list.placed_constants(address as usize, size as usize) {
-                            host.constant_at(index, &buffer, gpu, size);
+                            host.constant_fresh(index, &buffer, gpu, size, fresh);
                             continue;
                         }
                         // Renderer port 1, constants in place
@@ -4570,7 +4604,7 @@ impl State {
                         if crate::port::constants_only() {
                             let made = if crate::port_cbv::in_place_on() {
                                 let raw = crate::port::constant_raw_view(address, u64::from(size), crate::port::Bound::Table)
-                                    .is_some_and(|(whole, gpu)| host.constant_raw_at(index, whole, gpu, size));
+                                    .is_some_and(|(whole, gpu)| host.constant_raw_fresh(index, whole, gpu, size, fresh));
                                 if raw {
                                     crate::port_cbv::in_place(size);
                                 }
@@ -4578,7 +4612,7 @@ impl State {
                             } else {
                                 let len = u64::from(size.min(65536).next_multiple_of(256).max(256));
                                 crate::port::constant_gpu(address, len, crate::port::Bound::Table)
-                                    .map(|(whole, gpu)| host.constant_at(index, whole, gpu, size))
+                                    .map(|(whole, gpu)| host.constant_fresh(index, whole, gpu, size, fresh))
                                     .is_some()
                             };
                             if made {
@@ -4591,7 +4625,7 @@ impl State {
                         if crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
                                 Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                    if host.constant_raw_fresh(index, &shadow.buffer, shadow.gpu(address), size, fresh) {
                                         crate::port_cbv::in_place(size);
                                         crate::port::table_constant(true);
                                         continue;
@@ -4602,16 +4636,16 @@ impl State {
                             }
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
-                            host.make_null(index);
+                            host.null_fresh(index, fresh);
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         crate::port::table_constant(false);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_fresh(index, &buffer, gpu, size, fresh);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_fresh(index, &view, fresh);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4634,12 +4668,15 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        host.null_fresh(index, fresh);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
+            }
+            if let Some(stage) = &stage {
+                host.unstage(first, n, stage);
             }
             made.push((slot, first * 32));
         }
