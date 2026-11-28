@@ -3109,6 +3109,13 @@ fn view_guard() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }
 
+/// Whether a write of the title's through one view of a page is told to
+/// the copies of the memory at its other views ([`view_guard`];
+/// `crate::left`, which gives such copies bytes on the card only then).
+pub(crate) fn views_guarded() -> bool {
+    view_guard()
+}
+
 /// Diagnostics: blocks guarded together with their other views, blocks
 /// opened because another view of theirs was written, and blocks opened
 /// because a view of theirs was mapped; since the start.

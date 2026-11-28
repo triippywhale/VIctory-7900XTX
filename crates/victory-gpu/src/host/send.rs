@@ -17,7 +17,10 @@
 //! the submission's own when they are taken from the dirty lists, and the
 //! card copies them from there. Runs of a few words, which a refresh that
 //! sends only what changed makes many of, go as pairs of offset and value,
-//! stored by one dispatch per copy; the others as a copy each.
+//! stored by one dispatch per copy; the others as a copy each. With
+//! `VICTORY_MASKED_PATCH` ([`masked`]) the ranges that hold bytes a page
+//! past the merge's cap put in go as words of offset, mask and value,
+//! stored by one more dispatch per copy.
 
 use super::*;
 use crate::shadow::Shadow;
@@ -77,6 +80,45 @@ void main(uint3 id : SV_DispatchThreadID) {
 struct Pass {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// With `VICTORY_MASKED_PATCH`: [`masked::MASKED`]'s pipeline, with
+    /// `root`.
+    masked: Option<ID3D12PipelineState>,
+}
+
+/// [`masked::MASKED`]'s pipeline, with the pairs' root signature (the same
+/// is inside it). Without it no page is taken past the merge's cap.
+///
+/// # Safety
+/// A live device and root signature.
+unsafe fn masked_pass(host: &Host, root: &ID3D12RootSignature) -> Option<ID3D12PipelineState> {
+    let made = compile(masked::MASKED, windows::core::s!("main"), windows::core::s!("cs_5_1")).and_then(|code| {
+        // SAFETY: the caller's; the code lives through the call.
+        unsafe {
+            host.device.CreateComputePipelineState::<ID3D12PipelineState>(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })
+        }
+    });
+    match made {
+        Ok(pso) => {
+            name(&pso, || "victory: changed bytes sent to the card by mask".into());
+            masked::READY.store(true, Ordering::Relaxed);
+            tracing::info!(
+                "VICTORY_MASKED_PATCH is on: a page with more changed runs under flights' shader writes than the merge's cap leaves \
+                 goes up by byte masks, and the flights are not settled for it"
+            );
+            Some(pso)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "VICTORY_MASKED_PATCH: the pass's pipeline could not be made; the flights are settled as before");
+            None
+        }
+    }
 }
 
 fn pass(host: &Host) -> Option<&'static Pass> {
@@ -99,7 +141,8 @@ fn pass(host: &Host) -> Option<&'static Pass> {
                 })
                 .ok()?;
             name(&pso, || "victory: changed words sent to the card".into());
-            Some(Pass { root, pso })
+            let masked = if masked::mode() != 0 { masked_pass(host, &root) } else { None };
+            Some(Pass { root, pso, masked })
         }
     })
     .as_ref()
@@ -183,10 +226,12 @@ pub(super) fn give_back(memory: Memory) {
 pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// One copy's sends: ranges copied (offset in the copy, in the memory,
-/// bytes), and its pairs (where in the memory, how many).
+/// bytes), its pairs (where in the memory, how many), and its words stored
+/// by mask (the same; [`masked`]).
 struct Copy {
     runs: Vec<(usize, u64, usize)>,
     pairs: (u64, u32),
+    masks: (u64, u32),
 }
 
 /// Where a submission's bytes are taken to.
@@ -209,20 +254,47 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    // With `VICTORY_MASKED_PATCH`: per copy, the words stored by mask, made
+    // of the CPU side as it is now, as the pairs are.
+    let by_mask = masked::mode() != 0 && pass(host).is_some_and(|p| p.masked.is_some());
+    let mut masks: Vec<Vec<masked::Word>> = Vec::new();
+    for (shadow, ranges) in dirty {
+        // (Taken with the pass or without: they are of these ranges.)
+        let patched = if masked::mode() != 0 { shadow.card_patched() } else { Vec::new() };
         let mut runs = Vec::new();
+        let mut words_by_mask = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
+            if by_mask && masked::by_mask(a, b, &patched) {
+                // SAFETY: inside the copy's mapping (its CPU side, which
+                // the thread that asked alone writes in these ranges).
+                let bytes = unsafe { std::slice::from_raw_parts(shadow.card_data().add(a), b - a) };
+                masked::words(a, bytes, &mut words_by_mask);
+                continue;
+            }
             runs.push((a, at, b - a));
             at += ((b - a) as u64).next_multiple_of(16);
         }
         let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
+        let pairs = (at, words as u32);
         at += (words as u64 * 8).next_multiple_of(16);
+        copies.push(Copy { runs, pairs, masks: (at, words_by_mask.len() as u32) });
+        at += (words_by_mask.len() as u64 * 12).next_multiple_of(16);
+        if by_mask {
+            masks.push(words_by_mask);
+        }
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
+    for (copy, words) in copies.iter().zip(&masks).filter(|(_, w)| !w.is_empty()) {
+        // SAFETY: the memory has room for every word of 12 bytes, a
+        // copy's behind its pairs.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), (memory.data + copy.masks.0 as usize) as *mut u8, words.len() * 12);
+        }
+        masked::SENT[0].fetch_add(words.len() as u64, Ordering::Relaxed);
+    }
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
@@ -291,7 +363,7 @@ impl Own {
                 unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
-            if copy.pairs.1 > 0 {
+            if copy.pairs.1 > 0 || copy.masks.1 > 0 {
                 if let Some(was) = state {
                     first.push(transition(&shadow.buffer, was, write));
                 }
@@ -300,7 +372,7 @@ impl Own {
             let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             if let Some(was) = state
                 && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
+                && (!copy.runs.is_empty() || copy.pairs.1 > 0 || copy.masks.1 > 0)
             {
                 last.push(transition(&shadow.buffer, was, read));
             }
@@ -309,6 +381,32 @@ impl Own {
         unsafe {
             if !first.is_empty() {
                 list.ResourceBarrier(&first);
+            }
+            // The words stored by mask ([`masked`]), a dispatch a copy. No
+            // dword of them is one of the pairs below (the ranges are
+            // apart, and a pair's is whole words), so nothing waits
+            // between the two passes; the copies above are done.
+            if let Some(pass) = pass(host)
+                && let Some(pso) = &pass.masked
+                && self.copies.iter().any(|c| c.masks.1 > 0)
+            {
+                list.SetComputeRootSignature(&pass.root);
+                list.SetPipelineState(pso);
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
+                for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.masks.1 > 0) {
+                    list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
+                    const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+                    let (at, words) = copy.masks;
+                    let mut done = 0;
+                    while done < words {
+                        let n = (words - done).min(MOST);
+                        let constants = [at as u32 + done * 12, n];
+                        list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                        list.Dispatch(n.div_ceil(64), 1, 1);
+                        masked::SENT[1].fetch_add(1, Ordering::Relaxed);
+                        done += n;
+                    }
+                }
             }
             if let Some(pass) = pass(host)
                 && self.copies.iter().any(|c| c.pairs.1 > 0)

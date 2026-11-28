@@ -636,7 +636,7 @@ pub(crate) struct Spans {
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: std::collections::HashMap<[u32; 14], Option<u64>, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -2950,15 +2950,97 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make_twinned(view, self.at(index), self.twin(index));
+    /// host cannot. `fresh`: where its descriptor is written ([`Fresh`]).
+    pub(crate) fn make_fresh(&self, index: u32, view: &View, fresh: Fresh) {
+        let at = self.fresh_at(index, fresh);
+        let kept = make_twinned(view, at, self.fresh_twin(index, fresh));
         if kept.is_none() {
-            null_for(view, self.at(index));
+            null_for(view, at);
         }
-        self.put(index);
-        self.twin_made(index, kept.is_some() && twinned(view));
+        self.fresh_put(index, fresh);
+        self.fresh_twin_made(index, kept.is_some() && twinned(view), fresh);
         self.keep(index, kept.flatten());
+    }
+
+    /// Where the descriptor of slot `index` is made: its place in the
+    /// staging heap of the table it is a slot of, or as [`HostHeap::at`]
+    /// says.
+    fn fresh_at(&self, index: u32, fresh: Fresh) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        match fresh.stage {
+            Some(stage) => stage.at(fresh.k),
+            None => self.at(index),
+        }
+    }
+
+    /// [`HostHeap::put`], unless the slot's table is staged: its descriptor
+    /// then goes with the table's ([`HostHeap::unstage`]).
+    fn fresh_put(&self, index: u32, fresh: Fresh) {
+        if fresh.stage.is_none() {
+            self.put(index);
+        }
+    }
+
+    /// [`HostHeap::twin`], or the twin's place in the staging heap.
+    fn fresh_twin(&self, index: u32, fresh: Fresh) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        match fresh.stage {
+            Some(stage) => (index < self.twins.len() as u32).then(|| stage.hand_twin(fresh.k)),
+            None => self.twin(index),
+        }
+    }
+
+    /// [`HostHeap::twin_made`], or the same said to the staging heap, which
+    /// the table's twins go out of at once.
+    fn fresh_twin_made(&self, index: u32, made: bool, fresh: Fresh) {
+        match fresh.stage {
+            Some(stage) => stage.twin_is(fresh.k, made && index < self.twins.len() as u32),
+            None => self.twin_made(index, made),
+        }
+    }
+
+    /// (`VICTORY_STAGED_TABLES`) The `n` descriptors written into `stage`
+    /// (this thread's staging heap) go into slots `first..first + n`, with
+    /// one copy; their raw twins with a second, if any of them has one or
+    /// had one in these slots.
+    pub(crate) fn unstage(&self, first: u32, n: u32, stage: &TableStage) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = host() else { return };
+        let fits = first.checked_add(n).is_some_and(|end| end <= self.count + self.dynamic);
+        if self.sampler || n == 0 || n > TableStage::SLOTS || !fits {
+            return;
+        }
+        let twins = self.twins.get(first as usize..(first + n) as usize);
+        // (Asked before the copy: nothing but the copies follows it.)
+        let any_twin = twins.is_some_and(|twins| (0..n).any(|k| stage.twin_made(k) || twins[k as usize].load(Relaxed)));
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(first as usize..(first + n) as usize) {
+            let now = crate::host::coarse_ms() as u32;
+            for written in written {
+                written.store(now, Relaxed);
+            }
+        }
+        // SAFETY: `n` slots of our heap, and as many of this thread's
+        // staging heap, which the card does not see.
+        unsafe { host.device.CopyDescriptorsSimple(n, self.cpu(first), stage.at(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        if let Some(twins) = twins.filter(|_| any_twin) {
+            // SAFETY: as above, the twins' slots of both. (A twin's place
+            // in the staging heap holds a null buffer view unless one was
+            // made there: what `clear_twin` writes.)
+            unsafe {
+                host.device.CopyDescriptorsSimple(n, self.cpu(self.raw + first), stage.twin(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+            for (k, shown) in (0..n).zip(twins) {
+                let made = stage.twin_made(k);
+                if shown.load(Relaxed) != made {
+                    shown.store(made, Relaxed);
+                }
+            }
+        }
+        stage.done(n);
+        crate::draw::table_count(crate::draw::TableCount::Staged, 1);
+        crate::draw::table_count(crate::draw::TableCount::StagedSlots, u64::from(n));
+        if any_twin {
+            crate::draw::table_count(crate::draw::TableCount::StagedTwins, 1);
+        }
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2966,7 +3048,7 @@ impl HostHeap {
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32, fresh: Fresh) -> Option<Listed> {
         if self.sampler {
             return None;
         }
@@ -2999,12 +3081,23 @@ impl HostHeap {
                 views.made.insert(words, ListView { view, at, twin, kept, listed });
             }
             let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
+            match fresh.stage {
+                Some(stage) => {
+                    stage.copy_in(stage.at(fresh.k), views.slot(made.at));
+                    if made.twin && twins {
+                        stage.copy_in(stage.hand_twin(fresh.k), views.slot(made.at + 1));
+                    }
+                    stage.twin_is(fresh.k, made.twin && twins);
+                }
+                None => {
+                    self.copy_from(index, views.slot(made.at));
+                    if made.twin && twins {
+                        self.copy_from(self.raw + index, views.slot(made.at + 1));
+                        self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        self.clear_twin(index);
+                    }
+                }
             }
             self.keep(index, made.kept.clone());
             Some(made.listed)
@@ -3025,13 +3118,19 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.null_fresh(index, Fresh::SLOT);
+    }
+
+    /// [`HostHeap::make_null`]; `fresh`: where the descriptor is written
+    /// ([`Fresh`]; a sampler heap's slot is never staged).
+    pub(crate) fn null_fresh(&self, index: u32, fresh: Fresh) {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            null_view(self.fresh_at(index, fresh));
+            self.fresh_put(index, fresh);
         }
-        self.clear_twin(index);
+        self.fresh_twin_made(index, false, fresh);
         self.keep(index, None);
     }
 
@@ -3229,6 +3328,12 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.constant_fresh(index, buffer, gpu, size, Fresh::SLOT);
+    }
+
+    /// [`HostHeap::constant_at`]; `fresh`: where the descriptor is written
+    /// ([`Fresh`]).
+    pub(crate) fn constant_fresh(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, fresh: Fresh) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3239,11 +3344,11 @@ impl HostHeap {
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
-                .CreateConstantBufferView(Some(&desc), self.at(index))
+                .CreateConstantBufferView(Some(&desc), self.fresh_at(index, fresh))
         };
-        self.put(index);
+        self.fresh_put(index, fresh);
         // A program that reads it as raw bytes reads its twin.
-        let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
+        let twin = self.fresh_twin(index, fresh).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
             // SAFETY: a live buffer that holds the range.
             let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
@@ -3263,7 +3368,7 @@ impl HostHeap {
             // SAFETY: as above, and a slot of our heaps.
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
         }
-        self.twin_made(index, twin.is_some());
+        self.fresh_twin_made(index, twin.is_some(), fresh);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -3275,10 +3380,11 @@ impl HostHeap {
     /// of those bytes, which translated shaders read; the slot itself a
     /// constant buffer view of them where that can be (on 256 bytes), else a
     /// null one. Whether the twin was made (`false`: the caller copies the
-    /// bytes as before).
-    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+    /// bytes as before). `fresh`: where the descriptors are written
+    /// ([`Fresh`]).
+    pub(crate) fn constant_raw_fresh(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, fresh: Fresh) -> bool {
         let Some(host) = host() else { return false };
-        let Some(twin) = self.twin(index) else { return false };
+        let Some(twin) = self.fresh_twin(index, fresh) else { return false };
         // SAFETY: a live buffer.
         let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
         let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
@@ -3309,11 +3415,11 @@ impl HostHeap {
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).
         unsafe {
-            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
-            self.put(index);
+            host.device.CreateConstantBufferView(Some(&cbv), self.fresh_at(index, fresh));
+            self.fresh_put(index, fresh);
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
         }
-        self.twin_made(index, true);
+        self.fresh_twin_made(index, true, fresh);
         self.keep(index, Some(buffer.clone()));
         true
     }
@@ -3746,6 +3852,195 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     Some(D3D12_CPU_DESCRIPTOR_HANDLE {
         ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
     })
+}
+
+/// Whether a table made afresh for a draw is written into a heap of the
+/// recording thread that the card does not see and copied into its dynamic
+/// slots at once ([`TableStage`], [`HostHeap::unstage`];
+/// `VICTORY_STAGED_TABLES=1`, off by default: each slot is copied in as it
+/// is made, as before; A/B-able with `VICTORY_AB` in diagnostics builds).
+///
+/// A shader-visible heap lies in memory the processor writes through
+/// write-combining buffers, and an instruction with a lock waits until
+/// what those buffers hold has gone out. PalmVI measured it (7dba396f3; its
+/// `wc_bench` is `tests::wc_bench` here): a descriptor copied into such a
+/// heap costs 24 ns alone, 262 ns with an atomic add after it and 345 ns
+/// with a mutex; into a heap the card does not see 28 and 52 ns. Here each
+/// slot of a fresh table was copied into the visible heap ([`staged`],
+/// [`HostHeap::copy_to`]) and followed, before the next slot's copy, by the
+/// lock of what the slot holds and a reference count ([`HostHeap::keep`]),
+/// for a slot that had a raw twin the exchange in [`HostHeap::clear_twin`],
+/// and whatever bringing the view up to date takes (`crate::draw`
+/// `readable`). Staged, those follow writes into ordinary memory, and the
+/// table goes out in one run.
+///
+/// What the slots hold in the end is the same, and nothing reads them
+/// before the table is bound; it is a switch until a run in the title has
+/// shown the time it saves.
+pub(crate) fn staged_tables() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_STAGED_TABLES") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGED_TABLES").is_some_and(|v| v == "1"))
+}
+
+/// (`VICTORY_STAGED_TABLES`) A recording thread's heap, which the card does
+/// not see, for the table it is making afresh: [`TableStage::SLOTS`] places
+/// for the table's descriptors, and as many for their raw twins.
+///
+/// A twin's place holds a null buffer view except between the making of a
+/// twin there and the table's going out ([`HostHeap::unstage`]): the
+/// twins go out in one copy too, and a slot without one gets what
+/// [`HostHeap::clear_twin`] would have written.
+pub(crate) struct TableStage {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    /// The twins' places handed out for the table being made, and those of
+    /// them a twin was made in, a bit each.
+    handed: [std::cell::Cell<u64>; (Self::SLOTS / 64) as usize],
+    made: [std::cell::Cell<u64>; (Self::SLOTS / 64) as usize],
+}
+
+impl TableStage {
+    /// A longer table is written into its slots one by one, as before.
+    pub(crate) const SLOTS: u32 = 4096;
+
+    fn new() -> Option<TableStage> {
+        let host = host()?;
+        // SAFETY: plain heap creation and queries; copies inside the heap.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2 * Self::SLOTS,
+                    ..Default::default()
+                })
+                .inspect_err(|e| tracing::warn!(error = %e, "no heap to stage fresh tables in: they are written slot by slot"))
+                .ok()?;
+            let stage = TableStage {
+                start: heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                step: host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+                _heap: heap,
+                handed: std::array::from_fn(|_| std::cell::Cell::new(0)),
+                made: std::array::from_fn(|_| std::cell::Cell::new(0)),
+            };
+            // Every twin's place a null buffer view: one made, then doubled.
+            null_buffer_view(stage.twin(0));
+            let mut filled = 1;
+            while filled < Self::SLOTS {
+                let n = filled.min(Self::SLOTS - filled);
+                host.device
+                    .CopyDescriptorsSimple(n, stage.twin(filled), stage.twin(0), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                filled += n;
+            }
+            Some(stage)
+        }
+    }
+
+    /// This thread's staging heap (made at its first use), if a table of `n`
+    /// slots fits it.
+    pub(crate) fn get(n: u32) -> Option<std::rc::Rc<TableStage>> {
+        thread_local! {
+            static STAGE: std::cell::OnceCell<Option<std::rc::Rc<TableStage>>> = const { std::cell::OnceCell::new() };
+        }
+        if n == 0 || n > Self::SLOTS {
+            return None;
+        }
+        // (A thread that is ending has none any more.)
+        STAGE.try_with(|stage| stage.get_or_init(|| TableStage::new().map(std::rc::Rc::new)).clone()).ok().flatten()
+    }
+
+    /// Slot `k` of the table being made: written here.
+    pub(crate) fn slot(&self, k: u32) -> Fresh<'_> {
+        debug_assert!(k < Self::SLOTS);
+        Fresh { stage: Some(self), k }
+    }
+
+    /// The place of the table's slot `k`.
+    fn at(&self, k: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + k as usize * self.step }
+    }
+
+    /// The place of the raw twin of the table's slot `k`.
+    fn twin(&self, k: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        self.at(Self::SLOTS + k)
+    }
+
+    fn bit(bits: &[std::cell::Cell<u64>], k: u32) -> bool {
+        bits[(k / 64) as usize].get() >> (k % 64) & 1 != 0
+    }
+
+    fn set_bit(bits: &[std::cell::Cell<u64>], k: u32, on: bool) {
+        let word = &bits[(k / 64) as usize];
+        word.set(if on { word.get() | 1 << (k % 64) } else { word.get() & !(1 << (k % 64)) });
+    }
+
+    /// The place of the raw twin of slot `k`, for a twin to be made in:
+    /// [`TableStage::twin_is`] says then whether one was.
+    fn hand_twin(&self, k: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        Self::set_bit(&self.handed, k, true);
+        self.twin(k)
+    }
+
+    /// Slot `k` has a raw twin, made in its place, or has none: its place,
+    /// if something may have been written there, is a null buffer view
+    /// again.
+    fn twin_is(&self, k: u32, made: bool) {
+        if !made && (Self::bit(&self.handed, k) || Self::bit(&self.made, k)) {
+            null_buffer_view(self.twin(k));
+            Self::set_bit(&self.handed, k, false);
+        }
+        Self::set_bit(&self.made, k, made);
+    }
+
+    /// Whether slot `k` has a raw twin, made in its place.
+    fn twin_made(&self, k: u32) -> bool {
+        Self::bit(&self.made, k)
+    }
+
+    /// One descriptor copied from `from` (a heap the card does not see) to
+    /// a place of this heap.
+    fn copy_in(&self, to: D3D12_CPU_DESCRIPTOR_HANDLE, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of this heap and one of another of this thread's.
+        unsafe { host.device.CopyDescriptorsSimple(1, to, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    }
+
+    /// The table of `n` slots has gone out: the twins' places are null
+    /// buffer views again, for the next.
+    fn done(&self, n: u32) {
+        for k in 0..n.min(Self::SLOTS) {
+            if Self::bit(&self.made, k) {
+                null_buffer_view(self.twin(k));
+            }
+        }
+        for word in 0..(n.min(Self::SLOTS) as usize).div_ceil(64) {
+            self.handed[word].set(0);
+            self.made[word].set(0);
+        }
+    }
+}
+
+/// Where the descriptor of a dynamic slot is written when it is made: into
+/// the slot ([`Fresh::SLOT`]: by way of the thread's one place beside the
+/// heap, [`staged`]), or into the place of the slot in the staging heap of
+/// the table it belongs to (`VICTORY_STAGED_TABLES`, [`TableStage::slot`]),
+/// from where the whole table goes into its slots at once
+/// ([`HostHeap::unstage`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Fresh<'a> {
+    stage: Option<&'a TableStage>,
+    /// The slot's number in its table.
+    k: u32,
+}
+
+impl Fresh<'_> {
+    /// Into the slot itself, as before.
+    pub(crate) const SLOT: Fresh<'static> = Fresh { stage: None, k: 0 };
 }
 
 /// Logs `what` the first time it happens.
@@ -6121,6 +6416,183 @@ mod tests {
         assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// (`VICTORY_STAGED_TABLES`) A table written into the thread's staging
+    /// heap and copied into its slots at once holds what one written slot
+    /// by slot holds: the descriptors, their raw twins (a null buffer view
+    /// where a slot has none, also over a twin an earlier table left
+    /// there), and what the slots keep alive. (After PalmVI 7dba396f3, whose
+    /// test compares a staged slot's bytes with a direct one's.)
+    #[test]
+    fn a_staged_table_holds_what_one_written_slot_by_slot_holds() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(stage) = TableStage::get(3) else {
+            return;
+        };
+        assert!(TableStage::get(TableStage::SLOTS + 1).is_none(), "a longer table is not staged");
+        let (buffer, _) = host.upload_buffer(1 << 16).expect("an upload buffer");
+        // SAFETY: a live upload buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let bytes = |index: u32| {
+            let mut bytes = vec![0u8; heap.step as usize];
+            crate::host::read_into(heap.cpu(index).ptr as *const u8, &mut bytes).then_some(bytes)
+        };
+        let (direct, staged) = (heap.dynamic(3).unwrap(), heap.dynamic(3).unwrap());
+        let same = |what: &str| {
+            for k in 0..3 {
+                assert_eq!(bytes(staged + k), bytes(direct + k), "{what}: slot {k}");
+                if heap.raw != 0 {
+                    assert_eq!(bytes(heap.raw + staged + k), bytes(heap.raw + direct + k), "{what}: the raw twin of slot {k}");
+                    assert_eq!(
+                        heap.twins[(staged + k) as usize].load(Relaxed),
+                        heap.twins[(direct + k) as usize].load(Relaxed),
+                        "{what}: whether slot {k} has a raw twin"
+                    );
+                }
+                assert_eq!(
+                    heap.kept_in(staged + k).map(|r| r.as_raw() as usize),
+                    heap.kept_in(direct + k).map(|r| r.as_raw() as usize),
+                    "{what}: what slot {k} keeps"
+                );
+            }
+        };
+        // Two constant buffers with nothing between them.
+        for (first, stage) in [(direct, None), (staged, Some(&*stage))] {
+            let fresh = |k: u32| stage.map_or(Fresh::SLOT, |stage| stage.slot(k));
+            heap.constant_fresh(first, &buffer, gpu, 256, fresh(0));
+            heap.null_fresh(first + 1, fresh(1));
+            heap.constant_fresh(first + 2, &buffer, gpu + 256, 512, fresh(2));
+            if let Some(stage) = stage {
+                heap.unstage(first, 3, stage);
+            }
+        }
+        same("constants");
+        if heap.raw != 0 {
+            assert!(heap.twins[staged as usize].load(Relaxed) && !heap.twins[(staged + 1) as usize].load(Relaxed));
+        }
+        // Then nothing in the same slots: the twins are null again.
+        for (first, stage) in [(direct, None), (staged, Some(&*stage))] {
+            for k in 0..3 {
+                heap.null_fresh(first + k, stage.map_or(Fresh::SLOT, |stage| stage.slot(k)));
+            }
+            if let Some(stage) = stage {
+                heap.unstage(first, 3, stage);
+            }
+        }
+        same("nothing");
+        assert_eq!(bytes(staged), bytes(staged + 1));
+        if heap.raw != 0 {
+            assert!((0..3).all(|k| !heap.twins[(staged + k) as usize].load(Relaxed)));
+            assert_eq!(bytes(heap.raw + staged), bytes(heap.raw + staged + 1));
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        heap.release(direct, 3);
+        heap.release(staged, 3);
+    }
+
+    /// What a locked instruction after a descriptor write into a
+    /// shader-visible heap costs (the reason for `VICTORY_STAGED_TABLES`,
+    /// [`staged_tables`]): prints the nanoseconds per copy of each pattern
+    /// and asserts nothing.
+    /// `cargo test -p victory-gpu --lib wc_bench -- --ignored --nocapture`.
+    /// From PalmVI 7dba396f3, where on a 5700X with a 2070 SUPER (debug
+    /// build) a copy into a shader-visible heap took 24 ns alone, 262 ns
+    /// with an atomic add after it, 345 ns with a mutex and 38 ns with a
+    /// mutex every 16; into a heap the card does not see 28, 28 and 52 ns;
+    /// staged 16 at a time with a mutex after each, 64 ns.
+    #[test]
+    #[ignore]
+    fn wc_bench() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        const N: usize = 1 << 16;
+        const KIND: D3D12_DESCRIPTOR_HEAP_TYPE = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        let make = |flags: D3D12_DESCRIPTOR_HEAP_FLAGS| -> ID3D12DescriptorHeap {
+            // SAFETY: plain heap creation.
+            unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: KIND,
+                    NumDescriptors: N as u32,
+                    Flags: flags,
+                    NodeMask: 0,
+                })
+            }
+            .unwrap()
+        };
+        let visible = make(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+        let beside = make(D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
+        let source = make(D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
+        // SAFETY: plain queries of live objects.
+        let step = unsafe { host.device.GetDescriptorHandleIncrementSize(KIND) } as usize;
+        let at = |heap: &ID3D12DescriptorHeap, i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            // SAFETY: as above.
+            ptr: unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr } + i * step,
+        };
+        let from = at(&source, 0);
+        null_view(from);
+        // SAFETY (all copies below): slots inside live heaps of this kind.
+        let copy = |n: u32, to: D3D12_CPU_DESCRIPTOR_HANDLE, from: D3D12_CPU_DESCRIPTOR_HANDLE| unsafe {
+            host.device.CopyDescriptorsSimple(n, to, from, KIND)
+        };
+        let count = std::sync::atomic::AtomicU64::new(0);
+        let lock = Mutex::new(0u64);
+        for round in 0..3 {
+            let say = |name: &str, started: std::time::Instant| {
+                if round == 2 {
+                    println!("{name}: {:.1} ns per copy", started.elapsed().as_nanos() as f64 / N as f64);
+                }
+            };
+            for (name, to, locked) in [
+                ("visible, no lock", &visible, 0),
+                ("visible, atomic after", &visible, 1),
+                ("visible, mutex after", &visible, 2),
+                ("beside, no lock", &beside, 0),
+                ("beside, atomic after", &beside, 1),
+                ("beside, mutex after", &beside, 2),
+            ] {
+                let started = std::time::Instant::now();
+                for i in 0..N {
+                    copy(1, at(to, i), from);
+                    match locked {
+                        1 => {
+                            count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        }
+                        2 => *lock.lock().unwrap() += 1,
+                        _ => {}
+                    }
+                }
+                say(name, started);
+            }
+            // A table at a time: 16 copies, then one lock.
+            let started = std::time::Instant::now();
+            for i in 0..N {
+                copy(1, at(&visible, i), from);
+                if i % 16 == 15 {
+                    *lock.lock().unwrap() += 1;
+                }
+            }
+            say("visible, mutex every 16", started);
+            // Staged: beside the heap, then 16 at once into it.
+            let started = std::time::Instant::now();
+            for i in 0..N {
+                copy(1, at(&beside, i % 16), from);
+                *lock.lock().unwrap() += 1;
+                if i % 16 == 15 {
+                    copy(16, at(&visible, i - 15), at(&beside, 0));
+                }
+            }
+            say("staged 16, mutex after each", started);
+        }
     }
 
     /// A raw view moved on by some dwords says so in its descriptor, on a

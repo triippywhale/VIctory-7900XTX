@@ -2844,7 +2844,7 @@ struct Deferred {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// By host texture (a view placed in the memory of a texture the card
     /// writes): the last card-written source the list copied into it.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: ByCopy<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3265,7 +3265,8 @@ fn lists_with_room(most: usize, room: bool) -> usize {
 /// [`settle_room`]. Each run is a copy of its own to a copy in the card's
 /// memory, at about 1.5 us a run. Another tree's run 218 had 500 to 5,400
 /// changed runs a frame of a few bytes each, and the cap of 512 settled the
-/// flights twice a frame, 50 ms of the submitting thread.
+/// flights twice a frame, 50 ms of the submitting thread. How often the cap
+/// still settles them is on the frame line ([`masked::line`]).
 /// (The name and the bound after PalmVI b7bbf59f4 / fxceless 06702fe.)
 fn merge_runs() -> usize {
     static GIVEN: OnceLock<Option<usize>> = OnceLock::new();
@@ -3809,9 +3810,13 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         // ([`merge_runs`]: `VICTORY_MERGE_RUNS`, `VICTORY_SETTLE_ROOM`.)
+        // With `VICTORY_MASKED_PATCH` a page past it goes up by mask and
+        // is no reason to settle ([`masked`]).
         let mut runs_left = merge_runs();
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let marks = masked::marks();
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        masked::merged(marks, !spans.is_empty());
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
@@ -4449,6 +4454,7 @@ fn late_line(frames: f64) {
             ms(4),
             u[8],
         );
+        masked::line(frames);
     }
 }
 
@@ -4458,6 +4464,7 @@ mod card_steps;
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) mod indirects;
 pub(crate) mod leftq;
+pub(crate) mod masked;
 mod panel;
 mod place;
 pub(crate) mod rec;
@@ -5083,6 +5090,14 @@ impl Host {
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
+        // (`crate::left`, `VICTORY_SKIP_WC_BACK=3`) The copies on the card
+        // asked for since the last submission, of what shaders wrote and
+        // was left there to the copies of the same pages at other
+        // addresses: their holders' CPU sides are brought in line now,
+        // before the sends are taken (what the title stored since goes up
+        // with them, behind the copies), and with no lock of the queue's
+        // order held (a fetch under way is waited for).
+        let forwards = crate::left::forward_step();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5096,11 +5111,24 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && forwards.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        // A holder with hashes of its pieces has those of the pieces given
+        // it hashed again, with what is sent up: the bytes are another
+        // copy's shaders', and its own compare is not to take them for its
+        // own shaders'.
+        let mut given: Vec<(usize, (usize, usize))> = Vec::new();
+        for forward in &forwards {
+            if forward.to.card_sides().is_some_and(|(_, before, _)| before.is_some()) {
+                given.push((Arc::as_ptr(&forward.to) as usize, (forward.at, forward.at + forward.bytes)));
+                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, &forward.to)) {
+                    dirty.push((forward.to.clone(), Vec::new()));
+                }
+            }
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -5123,6 +5151,64 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        if !forwards.is_empty() {
+            // In a list of their own, run ahead of the sends: what the
+            // title stored since the shaders wrote goes up behind them, to
+            // writer and holder alike. On the queue that draws, in the
+            // order of everything else: behind every flight sent so far
+            // (whose shaders wrote the bytes, or may still), ahead of this
+            // submission's lists. Nothing waits for it.
+            let Some(copies) = work.sync.pop().or_else(|| self.make_prelude()) else {
+                fail(format_args!("no host list for the copies on the card to other addresses (VICTORY_SKIP_WC_BACK=3)"));
+            };
+            let (allocator, list) = &copies;
+            // SAFETY: the list's last run finished (it ran ahead of a
+            // submission that was waited for, and came back after that);
+            // live buffers (held by `forwards`, which the plan keeps), and
+            // the ranges lie in them (`Shadow::forwarded_from`).
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    // A buffer comes to a list in the common state and
+                    // takes the first state asked of it by itself; another
+                    // one after that is asked for (a copy that is one
+                    // piece's writer and another's holder). All of them
+                    // are common again when the list has run.
+                    let mut states: Vec<(*mut std::ffi::c_void, D3D12_RESOURCE_STATES)> = Vec::new();
+                    for forward in &forwards {
+                        for (buffer, state) in [
+                            (&forward.from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            (&forward.to.buffer, D3D12_RESOURCE_STATE_COPY_DEST),
+                        ] {
+                            let raw = buffer.as_raw();
+                            match states.iter_mut().find(|s| s.0 == raw) {
+                                Some(known) if known.1 != state => {
+                                    list.ResourceBarrier(&[transition(buffer, known.1, state)]);
+                                    known.1 = state;
+                                }
+                                Some(_) => {}
+                                None => states.push((raw, state)),
+                            }
+                        }
+                        list.CopyBufferRegion(
+                            &forward.to.buffer,
+                            forward.at as u64,
+                            &forward.from.buffer,
+                            forward.lo as u64,
+                            forward.bytes as u64,
+                        );
+                    }
+                    list.Close()?;
+                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("the copies on the card to other addresses could not be sent ({e}, VICTORY_SKIP_WC_BACK=3)"));
+            }
+            used.push((false, copies));
+        }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -5224,7 +5310,9 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            // (And the pieces a copy on the card just gave it.)
+                            let given = given.iter().filter(|g| g.0 == Arc::as_ptr(shadow) as usize).map(|g| g.1);
+                            for run in ranges.iter().copied().chain(given).map(|(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -5254,7 +5342,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty.into_iter().map(|(shadow, _)| shadow).chain(forwards.into_iter().flat_map(|f| [f.from, f.to])).collect(),
             lists: used,
             sent_as,
             looks,
@@ -5474,7 +5562,7 @@ impl Host {
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = Pieces::default();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
@@ -5861,7 +5949,7 @@ impl Host {
         &self,
         plan: &CardPlan,
         submitted: &mut u64,
-        seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        seen: &mut Pieces,
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -6238,7 +6326,7 @@ impl Host {
                 release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = Pieces::default();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
@@ -6776,7 +6864,7 @@ impl Host {
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            self.card_back(card, &mut submitted, &mut Pieces::default());
         }
         let back = crate::picked::with(declared, &picked.written);
         hand_back(&back);
@@ -8592,6 +8680,10 @@ fn next_epoch() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The pieces of copies fetched from the card since it was last waited for:
+/// copy, first byte, end ([`Host::card_back`]).
+type Pieces = std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>;
+
 /// A table by a copy's address.
 pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
 
@@ -8605,9 +8697,20 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
+    /// Eight bytes at a time, and what is left of them with its length: the
+    /// words of a record or of a description are a key's bytes here (a
+    /// multiplication for every byte made such keys slower than the
+    /// standard library's hash).
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_le_bytes(word));
+        }
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            last[7] = rest.len() as u8;
+            self.write_u64(u64::from_le_bytes(last));
         }
     }
     fn write_usize(&mut self, n: usize) {
@@ -8619,6 +8722,45 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod address_hash_tests {
+    use super::AddressHash;
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    /// Keys of bytes (a record's words, a resource description) that differ
+    /// in one bit anywhere, in their length or in zeros at their end hash
+    /// apart: whole words and what is left of them.
+    #[test]
+    fn keys_of_bytes_that_differ_hash_apart() {
+        let hash = BuildHasherDefault::<AddressHash>::default();
+        let mut seen = std::collections::HashSet::new();
+        let description: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        assert!(seen.insert(hash.hash_one(description)));
+        for word in 0..14 {
+            for bit in 0..32 {
+                let mut other = description;
+                other[word] ^= 1 << bit;
+                assert!(seen.insert(hash.hash_one(other)), "word {word} bit {bit}");
+            }
+        }
+        let record: [u32; 3] = [0x4549_5676, 7, 1];
+        assert!(seen.insert(hash.hash_one(record)));
+        for word in 0..3 {
+            for bit in 0..32 {
+                let mut other = record;
+                other[word] ^= 1 << bit;
+                assert!(seen.insert(hash.hash_one(other)), "word {word} bit {bit}");
+            }
+        }
+        // Zeros of every length up to three words.
+        for len in 0..=24 {
+            assert!(seen.insert(hash.hash_one(&[0u8; 24][..len])), "{len} zeros");
+        }
+        // The same key hashes the same.
+        assert_eq!(hash.hash_one(description), hash.hash_one(description));
     }
 }
 
