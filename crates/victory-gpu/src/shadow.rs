@@ -2009,6 +2009,41 @@ mod wide_tests {
         }
     }
 
+    /// A refresh that holds the gate of pieces left on the card
+    /// (`crate::left`) takes a megabyte or more of pages without running a
+    /// job of `wide`'s queue on its thread: such a job may be another
+    /// refresh, which asks for the gate, and the thread would wait for
+    /// itself (the hang of `VICTORY_SKIP_WC_BACK=2`).
+    #[test]
+    fn a_refresh_that_holds_the_left_gate_runs_no_job_of_another() {
+        const LEN: usize = 2 << 20;
+        let title: Vec<u8> = (0..LEN).map(|i| (i * 7 + i / 4099) as u8).collect();
+        let mut data = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let copy = super::Shadow::unbacked(start as u64, data.as_mut_ptr(), LEN as u64, false);
+        // A job of another's in the queue, for which no helper is woken:
+        // the thread that waits in `wide` next takes it.
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        {
+            let ran_on = ran_on.clone();
+            let workers = super::workers();
+            workers.there.fetch_add(1, Ordering::AcqRel);
+            workers.jobs.lock().unwrap().push_back(Box::new(move || {
+                *ran_on.lock().unwrap() = Some(std::thread::current().id());
+            }));
+        }
+        {
+            let _gate = crate::left::hold_gate();
+            assert_eq!(copy.take_all(vec![(start, start + LEN, false)]), LEN);
+        }
+        assert_ne!(*ran_on.lock().unwrap(), Some(std::thread::current().id()), "a job of another's ran under the gate");
+        assert!(data == title);
+        // With the gate let go the queue is this thread's to take from
+        // again: the job is not left behind.
+        wide(vec![Box::new(|| {}) as Job, Box::new(|| {}) as Job]);
+        assert!(ran_on.lock().unwrap().is_some());
+    }
+
     /// Copies cut into jobs copy every byte once: long ones, short ones
     /// and empty ones.
     #[test]
@@ -4549,6 +4584,19 @@ impl Shadow {
                 parts.push((at, next, known));
                 at = next;
             }
+        }
+        if crate::left::gate_held() {
+            // This refresh holds the gate of pieces left on the card
+            // (`crate::left`, "Locks"): the thread that waits in `wide`
+            // takes whatever job is in its queue, and another refresh
+            // taken so asks for the gate on this thread, which then stands
+            // for ever. On threads that run nothing but these parts.
+            crate::land::each_under(parts.len(), &|i| {
+                let _taking = crate::left::Taking::new(self.id);
+                let (from, to, known) = parts[i];
+                self.take(from, to, known);
+            });
+            return bytes;
         }
         let this = std::ptr::from_ref(self) as usize;
         wide_each(parts.len(), move |i| {
