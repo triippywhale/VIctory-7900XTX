@@ -155,12 +155,15 @@ dispatches, faults and what came.
   A/B from the same save (rtcheck4, 69a62cc, against rtcheck5, b1ebafd):
   pages without a copy 1.5 against 4.3 a frame, 2 cycles against 93, 2,963
   against 5,357 nodes outside.
-- Small packed bottom levels left empty after unpacking: some 300 a dump
-  (rtcheck4: 331, rtcheck5: 281) have marks 0x8102 (packed, rehydrated),
-  tens to hundreds of KB, yet the walk finds one box node and one triangle:
-  the root's children are all zero, and each counts 3 to 35 nodes reached
-  twice. They lie close together (0x107d680100 to 0x107daf0100, one to a
-  64 KiB page mostly). Open: under investigation.
+- Not a fault: the some 300 bottom levels a dump with marks 0x8102 (rtcheck4:
+  331, rtcheck5: 281) whose root seemed to have empty children are still
+  packed. Their root node is in the packed form (word 0 = count << 24 | mask,
+  then child pointers, no boxes: 0x107d680100's root at +0x67c0 is
+  04000000 cd4 cf4 ce4 cec), the card's copy and title memory agree byte for
+  byte, and no top level instances one of them (the instanced bottoms are
+  0x8002, one 0x8004). Walked as unpacked, they read as boxes of 0 and
+  nodes reached twice. `bvh_dump --all` now leaves bottoms marked 0x100 out
+  of its totals and counts them apart ("still packed, not walked").
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame

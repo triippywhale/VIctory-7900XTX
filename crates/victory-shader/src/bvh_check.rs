@@ -36,6 +36,9 @@ pub const PAGE: u64 = 1 << 16;
 const VERSION: u32 = 6;
 /// A header's mark of a bottom level (dword 0).
 pub const BOTTOM: u32 = 0x8000_0000;
+/// Of [`Header::marks`]: still packed (its nodes hold children without
+/// bounds, as the title streamed it in, not unpacked yet).
+pub const PACKED: u32 = 0x0100_0000;
 /// An instance root pointer's mark of a static structure.
 const STATIC_ROOT: u32 = 1 << 30;
 
@@ -92,6 +95,12 @@ impl Header {
 
     pub fn bottom(&self) -> bool {
         self.marks & BOTTOM != 0
+    }
+
+    /// Still packed: walked as unpacked its nodes read as garbage (a root
+    /// whose children's boxes are all 0, nodes reached twice).
+    pub fn packed(&self) -> bool {
+        self.marks & PACKED != 0
     }
 }
 
@@ -633,6 +642,43 @@ mod tests {
         m.box32(base, 3, [(at(5, 0), cube(0.0, 1.0)), EMPTY, EMPTY, EMPTY]);
         let r = check(&m.0, base, &mut HashMap::new(), &mut Vec::new()).unwrap();
         assert_eq!((r.shared, r.missing, r.cycles), (1, 1, 0));
+    }
+
+    #[test]
+    fn a_header_marked_0x100_reads_as_still_packed() {
+        // The header of 0x107d680100 in run rtcheck5's dump: marks 0x8102.
+        let w: [u32; 16] = [
+            0x8102_0006,
+            0x1a0,
+            0x73b7_d9bd,
+            0x127,
+            0xbfca_d000,
+            0xbfcb_3000,
+            0xbec3_4000,
+            0x3fee_b002,
+            0x3ff2_e002,
+            0x3ffc_8000,
+            0x4c80,
+            0,
+            0xcfc,
+            0x280,
+            0xffff_fbc0,
+            0x808e_8e8e,
+        ];
+        let mut page = vec![0u8; 1 << 16];
+        for (i, d) in w.iter().enumerate() {
+            page[0x100 + 4 * i..0x104 + 4 * i].copy_from_slice(&d.to_le_bytes());
+        }
+        let m: HashMap<u64, Vec<u8>> = [(0x107d68, page)].into();
+        let h = Header::read(&m, 0x0010_7d68_0100).unwrap();
+        assert!(h.bottom() && h.packed());
+        assert_eq!(h.bytes, 0x1a0 * NODE);
+        // Unpacked (0x8002, the instanced ones): not.
+        let h = Header {
+            marks: 0x8002_0000,
+            ..h
+        };
+        assert!(h.bottom() && !h.packed());
     }
 
     #[test]

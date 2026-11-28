@@ -239,7 +239,10 @@ fn main() {
     if all {
         let mut sum = Report::default();
         let mut n = 0u64;
-        for h in &bottoms {
+        // Still packed (run rtcheck5: 281, none of them instanced): their
+        // nodes are not in the walk's form, so they are counted apart.
+        let packed = bottoms.iter().filter(|h| h.packed()).count();
+        for h in bottoms.iter().filter(|h| !h.packed()) {
             let r = match checked.get(&h.address) {
                 Some(r) => r.clone(),
                 None => bvh_check::check(&d, h.address, &mut HashMap::new(), &mut Vec::new()),
@@ -257,7 +260,8 @@ fn main() {
             sum.escapes += r.escapes;
         }
         println!(
-            "all {n} bottom levels: {} cycles, {} reached twice, {} outside, {} not in the dump; loose mean {:.2}, {} over 2, {} escaping",
+            "all {n} bottom levels: {} cycles, {} reached twice, {} outside, {} not in the dump; loose mean {:.2}, {} over 2, {} escaping; \
+             {packed} more still packed (marks 0x100), not walked",
             sum.cycles,
             sum.shared,
             sum.outside,
