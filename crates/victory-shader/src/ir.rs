@@ -182,11 +182,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
-            && let Fields::Sop {
-                dst: Some(Operand::Scalar { code: to, .. }),
-                src,
-                ..
-            } = &mut fields
+            && let Fields::Sop { dst: Some(Operand::Scalar { code: to, .. }), src, .. } = &mut fields
             && let Some(Operand::Scalar { code: from, .. }) = src.first_mut()
         {
             (*to, *from) = (parked[k].1, parked[k].2);
@@ -281,14 +277,7 @@ fn unspill(
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
     fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
         let Fields::Valu(v) = fields else { return None };
-        if v.abs != 0
-            || v.neg != 0
-            || v.opsel != 0
-            || v.clamp
-            || v.omod != 0
-            || v.sdwa.is_some()
-            || v.dpp.is_some()
-        {
+        if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return None;
         }
         let lane = |op: &Operand| match *op {
@@ -296,14 +285,10 @@ fn unspill(
             _ => None,
         };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k])
-                if *code < 105 =>
-            {
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
                 Some((true, reg, *code, lane(k)?))
             }
-            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k])
-                if code < 105 =>
-            {
+            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
                 Some((false, *reg, code, lane(k)?))
             }
             _ => None,
@@ -318,9 +303,7 @@ fn unspill(
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
-        let Some(name) = inst.name() else {
-            return Vec::new();
-        };
+        let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
@@ -371,21 +354,14 @@ fn unspill(
             let mut saved = Vec::new();
             last < first
                 && !(first + 1..=end).any(leader)
-                && parks[first..=end]
-                    .iter()
-                    .filter_map(of)
-                    .all(|(save, _, _, lane)| {
-                        if save {
-                            saved.push(lane);
-                        }
-                        saved.contains(&lane)
-                    })
+                && parks[first..=end].iter().filter_map(of).all(|(save, _, _, lane)| {
+                    if save {
+                        saved.push(lane);
+                    }
+                    saved.contains(&lane)
+                })
         });
-        let from = if late {
-            first.unwrap_or(0)
-        } else {
-            parks.len()
-        };
+        let from = if late { first.unwrap_or(0) } else { parks.len() };
         for park in &mut parks[..from] {
             if of(park).is_some() {
                 *park = None;
@@ -540,10 +516,7 @@ fn unspill(
         }
         // Lives of one lane that move alike share a code, as they share the lane.
         let role = |n: usize| {
-            let (lower, upper) = (
-                pairs.iter().any(|p| p.0 == n),
-                pairs.iter().any(|p| p.1 == n),
-            );
+            let (lower, upper) = (pairs.iter().any(|p| p.0 == n), pairs.iter().any(|p| p.1 == n));
             (stores[n], u8::from(lower) + 2 * u8::from(upper))
         };
         let mut shared: Vec<_> = (0..stores.len()).map(role).collect();
@@ -551,9 +524,7 @@ fn unspill(
             let all = shared.clone();
             shared.sort_unstable();
             shared.dedup();
-            all.iter()
-                .filter_map(|r| shared.binary_search(r).ok())
-                .collect()
+            all.iter().filter_map(|r| shared.binary_search(r).ok()).collect()
         };
         for o in of.iter_mut().filter(|o| **o != usize::MAX) {
             *o = place[*o];
@@ -576,10 +547,7 @@ fn unspill(
         free[past..255].fill(true);
         let mut codes: Vec<Option<u8>> = vec![None; shared.len()];
         for &(lower, upper) in &pairs {
-            let at = (108..123)
-                .chain((0..104).rev())
-                .chain(past..254)
-                .find(|&c| free[c] && free[c + 1]);
+            let at = (108..123).chain((0..104).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
             // Not enough spare codes: leave the program as it is.
             let c = at?;
             (free[c], free[c + 1]) = (false, false);
@@ -587,25 +555,18 @@ fn unspill(
             codes[upper] = Some(c as u8 + 1);
         }
         for code in codes.iter_mut().filter(|c| c.is_none()) {
-            let c = (108..=123)
-                .chain((0..105).rev())
-                .chain(past..255)
-                .find(|&c| free[c])?;
+            let c = (108..=123).chain((0..105).rev()).chain(past..255).find(|&c| free[c])?;
             free[c] = false;
             *code = Some(c as u8);
         }
         Some((of, pairs, codes.into_iter().flatten().collect()))
     };
-    let Some(mut chosen) = plan(false) else {
-        return Vec::new();
-    };
+    let Some(mut chosen) = plan(false) else { return Vec::new() };
     let lonely = |(of, pairs, _): &(Vec<usize>, Vec<(usize, usize)>, Vec<u8>)| {
         (0..list.len()).any(|i| {
             parks[i].is_some_and(|p| p.0)
                 && partner(i).is_some()
-                && !pairs
-                    .iter()
-                    .any(|&(lower, upper)| of[i] == lower || of[i] == upper)
+                && !pairs.iter().any(|&(lower, upper)| of[i] == lower || of[i] == upper)
         })
     };
     if wave64
@@ -622,9 +583,7 @@ fn unspill(
     // `s_mov_b32` / `s_mov_b64 dst, src` (SOP1, opcodes 3 and 4); `s_nop`. A code
     // from `PARKED` up does not fit the word: s0 stands in for it there.
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
-    let mov = |wide: bool, dst: u8, src: u8| {
-        0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src)
-    };
+    let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
     let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
     for i in 0..list.len() {
@@ -633,9 +592,7 @@ fn unspill(
         };
         let slot = codes[store[i]];
         if pairs.iter().any(|p| p.0 == store[i]) {
-            let Some(j) = partner(i) else {
-                return Vec::new();
-            };
+            let Some(j) = partner(i) else { return Vec::new() };
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
@@ -653,13 +610,7 @@ fn unspill(
     for (i, edit) in edits {
         match edit {
             Some((wide, dst, src)) => {
-                put(
-                    list,
-                    i,
-                    gfx10::Encoding::Sop1,
-                    3 + u16::from(wide),
-                    mov(wide, dst, src),
-                );
+                put(list, i, gfx10::Encoding::Sop1, 3 + u16::from(wide), mov(wide, dst, src));
                 moves.push((i, dst, src));
             }
             None => put(list, i, gfx10::Encoding::Sopp, 0, NOP),
@@ -805,10 +756,7 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// Whether block `b` only ends the program.
 fn ends_program(p: &Program, b: usize) -> bool {
     p.blocks[b].exit == Exit::End
-        && p.blocks[b]
-            .insts
-            .iter()
-            .all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+        && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
 }
 
 /// Whether block `b` is the far jump of a console branch whose target is too far for the
@@ -817,12 +765,10 @@ fn ends_program(p: &Program, b: usize) -> bool {
 fn far_jump_to_end(p: &Program, b: usize) -> bool {
     let block = &p.blocks[b];
     matches!(block.exit, Exit::Jump(target) if ends_program(p, target))
-        && block.insts.iter().all(|i| {
-            matches!(
-                i.name(),
-                "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64"
-            )
-        })
+        && block
+            .insts
+            .iter()
+            .all(|i| matches!(i.name(), "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64"))
 }
 
 /// Where the lanes that stay go when block `b` ends in an early-out: `s_cbranch_execz` to a
@@ -885,11 +831,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         for inst in &block.insts {
             if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
                 && inst.reads.len() == inst.writes.len()
-                && inst
-                    .reads
-                    .iter()
-                    .chain(&inst.writes)
-                    .all(|r| matches!(r.0, Reg::S(_)))
+                && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
             {
                 copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
             }
@@ -919,11 +861,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         copy_through_phis(p, &mut copy);
     }
     let root = |v: Value| if deep { follow(&copy, v) } else { v };
-    let op_nonzero =
-        |inst: &Inst, op: &Operand, d: u8, nonzero: &std::collections::HashSet<Value>| match *op {
-            Operand::Scalar {
-                code: gfx10::NULL, ..
-            }
+    let op_nonzero = |inst: &Inst, op: &Operand, d: u8, nonzero: &std::collections::HashSet<Value>| {
+        match *op {
+            Operand::Scalar { code: gfx10::NULL, .. }
             | Operand::Const(128)
             | Operand::Literal(0) => false,
             Operand::Scalar { code, dwords } => {
@@ -931,7 +871,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 inst.read(reg).is_none_or(|v| nonzero.contains(&v))
             }
             _ => true,
-        };
+        }
+    };
     let scalar_side_effect = |inst: &Inst| -> bool {
         let name = inst.name();
         match &inst.fields {
@@ -1005,8 +946,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 } if all.is_some_and(|k| src.first() == Some(&k)) => {
                     inst.write(Reg::S(*code)).and_then(|lo| {
                         if p.wave64 {
-                            inst.write(Reg::S(*code + 1))
-                                .map(|hi| (*code, lo, Some(hi)))
+                            inst.write(Reg::S(*code + 1)).map(|hi| (*code, lo, Some(hi)))
                         } else {
                             Some((*code, lo, None))
                         }
@@ -1139,8 +1079,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                     let inst = &insts[i];
                     if let Some(&(end, code)) = secs.get(&i) {
                         // Whole-wave section: saved scalar gets incoming EXEC; restore sets EXEC from saved.
-                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate()
-                        {
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
                             if let (Some(e_in), Some(sv)) =
                                 (inst.read(exec_r), inst.write(Reg::S(code + d as u8)))
                                 && nonzero.contains(&e_in)
@@ -1154,8 +1093,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                             }
                         }
                         let rest = &insts[end];
-                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate()
-                        {
+                        for (d, exec_r) in [Reg::S(EXEC), Reg::S(EXEC + 1)].into_iter().enumerate() {
                             if let Some(e_out) = rest.write(exec_r)
                                 && rest
                                     .read(Reg::S(code + d as u8))
@@ -1169,7 +1107,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                     }
                     let name = inst.name();
                     let exec_in_nz = [
-                        inst.read(Reg::S(EXEC)).is_none_or(|v| nonzero.contains(&v)),
+                        inst.read(Reg::S(EXEC))
+                            .is_none_or(|v| nonzero.contains(&v)),
                         inst.read(Reg::S(EXEC + 1))
                             .is_none_or(|v| nonzero.contains(&v)),
                     ];
@@ -1293,8 +1232,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                     continue;
                 }
                 for &(r, w) in &insts[i].writes {
-                    if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) && nonzero.contains(&w)
-                    {
+                    if matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1) && nonzero.contains(&w) {
                         return None;
                     }
                 }
@@ -1331,19 +1269,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             if deep && !live.contains(&phi.value) {
                 continue;
             }
-            let before: Vec<Value> = join
-                .preds
-                .iter()
-                .zip(&phi.args)
-                .filter(|(q, _)| **q == b)
-                .map(|(_, a)| root(*a))
-                .collect();
-            let within = join
-                .preds
-                .iter()
-                .zip(&phi.args)
-                .filter(|(q, _)| inside[**q])
-                .map(|(_, a)| root(*a));
+            let before: Vec<Value> =
+                join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
+            let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
             if within.into_iter().any(|a| !before.contains(&a)) {
                 return None;
             }
@@ -1363,10 +1291,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             continue;
         };
         let next = early_out_continuation(p, b).or_else(|| {
-            let skip = p.blocks[b]
-                .insts
-                .last()
-                .is_some_and(|i| i.name() == "s_cbranch_execz");
+            let skip = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
             (skip && skipped(b, taken, not_taken).is_some()).then_some(not_taken)
         });
         if let Some(next) = next {
@@ -1398,12 +1323,7 @@ fn follow(copy: &std::collections::HashMap<Value, Value>, mut v: Value) -> Value
 /// aside, as a loop's back edge brings it), if there is one.
 fn single_source(copy: &std::collections::HashMap<Value, Value>, phi: &Phi) -> Option<Value> {
     let mut one = None;
-    for x in phi
-        .args
-        .iter()
-        .map(|&a| follow(copy, a))
-        .filter(|&x| x != phi.value)
-    {
+    for x in phi.args.iter().map(|&a| follow(copy, a)).filter(|&x| x != phi.value) {
         if *one.get_or_insert(x) != x {
             return None;
         }
@@ -1466,19 +1386,17 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
     let (mut word, mut bits) = (0, set[0]);
-    std::iter::from_fn(move || {
-        loop {
-            if bits != 0 {
-                let b = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                return Some(reg_at(word * 64 + b));
-            }
-            word += 1;
-            if word >= set.len() {
-                return None;
-            }
-            bits = set[word];
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return Some(reg_at(word * 64 + b));
         }
+        word += 1;
+        if word >= set.len() {
+            return None;
+        }
+        bits = set[word];
     })
 }
 
@@ -2363,11 +2281,7 @@ mod tests {
     fn skips(p: &Program) -> usize {
         p.blocks
             .iter()
-            .filter(|b| {
-                b.insts
-                    .last()
-                    .is_some_and(|i| i.name() == "s_cbranch_execz")
-            })
+            .filter(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
             .count()
     }
 
@@ -2423,10 +2337,7 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(
-            skips(&without_skips(&inner_narrow, false).expect("left out")),
-            0
-        );
+        assert_eq!(skips(&without_skips(&inner_narrow, false).expect("left out")), 0);
 
         // EXEC-independent scalar side effects (s_sendmsg, s_barrier, s_buffer_store_dword)
         // must keep the skip.
@@ -2844,11 +2755,7 @@ mod tests {
             ],
             false,
         );
-        let target = p
-            .blocks
-            .iter()
-            .find(|b| b.offset == 8)
-            .expect("live target block");
+        let target = p.blocks.iter().find(|b| b.offset == 8).expect("live target block");
         assert_eq!(target.preds, [0]);
         assert!(target.phis.is_empty());
         assert_eq!(p.inputs.len(), 1);

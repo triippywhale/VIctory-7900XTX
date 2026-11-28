@@ -186,10 +186,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
-        for later in insts[end + 1..]
-            .iter()
-            .filter(|i| i.name() == "v_readlane_b32")
-        {
+        for later in insts[end + 1..].iter().filter(|i| i.name() == "v_readlane_b32") {
             if let Fields::Valu(v) = &later.fields
                 && let (Some(Operand::Scalar { code, .. }), [Operand::Vector { reg, .. }, lane]) =
                     (v.dst, &v.src[..])
@@ -358,11 +355,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
                 && let Some(w) = inst.write(Reg::S(*dc))
             {
                 let sym = match *s0 {
-                    Operand::Scalar { code, .. } if code != NULL => {
-                        inst.read(Reg::S(code)).map_or(Sym::Unknown, |x| {
-                            uni.get(&x).copied().unwrap_or(Sym::Uni(x))
-                        })
-                    }
+                    Operand::Scalar { code, .. } if code != NULL => inst
+                        .read(Reg::S(code))
+                        .map_or(Sym::Unknown, |x| uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     Operand::Const(c) => crate::resource::inline(c).map_or(Sym::Unknown, Sym::K),
                     Operand::Literal(x) => Sym::K(x),
                     _ => Sym::Unknown,
@@ -1142,17 +1137,10 @@ mod tests {
             let p = build(&words(lane), true);
             let insts = &p.blocks[0].insts;
             let saved = insts[0].write(Reg::S(4)).unwrap();
-            let v7 = p
-                .inputs
-                .iter()
-                .find_map(|&(r, v)| (r == Reg::V(7)).then_some(v))
-                .unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
             let got = insts[insts.len() - 2].write(Reg::S(6)).unwrap();
             let sec = &sections(&p, 0)[&0];
-            (
-                sec.reads.get(&got).copied(),
-                Shape::Active(Op::Or, v7, saved, 0),
-            )
+            (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
         };
         let (found, whole) = read(63);
         assert_eq!(found, Some(whole));
@@ -1195,17 +1183,10 @@ mod tests {
             let p = build(w, true);
             let insts = &p.blocks[0].insts;
             let saved = insts[0].write(Reg::S(4)).unwrap();
-            let v7 = p
-                .inputs
-                .iter()
-                .find_map(|&(r, v)| (r == Reg::V(7)).then_some(v))
-                .unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
             // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
             let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
-            (
-                sections(&p, 0)[&0].shapes.get(&total).copied(),
-                Shape::Active(Op::AddH, v7, saved, 0),
-            )
+            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
         };
         let (found, want) = shape(&words(pairs, quads));
         assert_eq!(found, Some(want));

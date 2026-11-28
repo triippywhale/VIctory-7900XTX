@@ -152,20 +152,13 @@ fn pipeline(
     rs: &str,
     entry: windows::core::PCSTR,
 ) -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
-    let code = crate::host::compile(
-        &format!("#define {part}\n#define RS \"{rs}\"\n{SOURCE}"),
-        entry,
-        s!("cs_5_1"),
-    )?;
+    let code = crate::host::compile(&format!("#define {part}\n#define RS \"{rs}\"\n{SOURCE}"), entry, s!("cs_5_1"))?;
     // SAFETY: the root signature is inside the shader; plain creations.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: code.as_ptr().cast(),
-                BytecodeLength: code.len(),
-            },
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
             ..Default::default()
         };
         let pso = device.CreateComputePipelineState(&desc)?;
@@ -180,21 +173,12 @@ fn pass() -> Option<&'static Pass> {
         let made = || -> windows::core::Result<Pass> {
             let exposure = pipeline(&host.device, "EXPOSURE", RS_EXPOSURE, s!("exposure"))?;
             let lux = pipeline(&host.device, "LUX", RS_LUX, s!("lux"))?;
-            let (ring, data) = host
-                .shared_buffer(RECORD * RING * 4)
-                .ok_or_else(windows::core::Error::empty)?;
+            let (ring, data) = host.shared_buffer(RECORD * RING * 4).ok_or_else(windows::core::Error::empty)?;
             // SAFETY: the mapping holds the whole buffer.
             unsafe { std::ptr::write_bytes(data, 0, (RECORD * RING * 4) as usize) };
-            Ok(Pass {
-                exposure,
-                lux,
-                ring,
-                data: data as usize,
-            })
+            Ok(Pass { exposure, lux, ring, data: data as usize })
         };
-        made()
-            .inspect_err(|e| tracing::warn!(error = %e, "no light probe"))
-            .ok()
+        made().inspect_err(|e| tracing::warn!(error = %e, "no light probe")).ok()
     })
     .as_ref()
 }
@@ -205,10 +189,7 @@ static ASKED: AtomicU64 = AtomicU64::new(0);
 static WHEN: [AtomicU64; RING as usize] = [const { AtomicU64::new(0) }; RING as usize];
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        ..Default::default()
-    };
+    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
@@ -220,50 +201,21 @@ fn write_old(pass: &Pass, now: u64) {
     };
     let slot = old % RING;
     // SAFETY: the ring's mapping; the card wrote this record frames ago.
-    let words: [u32; RECORD as usize] = unsafe {
-        ((pass.data + (slot * RECORD * 4) as usize) as *const [u32; RECORD as usize])
-            .read_volatile()
-    };
+    let words: [u32; RECORD as usize] = unsafe { ((pass.data + (slot * RECORD * 4) as usize) as *const [u32; RECORD as usize]).read_volatile() };
     if u64::from(words[63]) != slot + 1 {
         return;
     }
     let f = |i: usize| f32::from_bits(words[i]);
     let ms = WHEN[slot as usize].load(Relaxed);
     let samples = words[16];
-    let mean = |i: usize| {
-        if samples == 0 {
-            0.0
-        } else {
-            f64::from(words[i]) / 256.0 / f64::from(samples)
-        }
-    };
+    let mean = |i: usize| if samples == 0 { 0.0 } else { f64::from(words[i]) / 256.0 / f64::from(samples) };
     if let Some(file) = file() {
         let mut file = file.lock().unwrap_or_else(|e| e.into_inner());
         let _ = writeln!(
             file,
             "{old},{ms},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4},{:.4},{:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{samples},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}",
-            f(0),
-            f(1),
-            f(2),
-            f(3),
-            f(4),
-            f(5),
-            f(6),
-            f(7),
-            f(8),
-            f(9),
-            f(10),
-            f(11),
-            f(12),
-            f(13),
-            f(14),
-            f(15),
-            mean(17),
-            mean(18),
-            mean(19),
-            f(20),
-            f(21),
-            f(22)
+            f(0), f(1), f(2), f(3), f(4), f(5), f(6), f(7), f(8), f(9), f(10), f(11), f(12), f(13), f(14), f(15),
+            mean(17), mean(18), mean(19), f(20), f(21), f(22)
         );
         if old % 64 == 0 {
             let _ = file.flush();
@@ -276,11 +228,7 @@ fn write_old(pass: &Pass, now: u64) {
 
 /// After the exposure program's draw, in `list` with its heap set: its two
 /// inputs. Replaces the list's compute root signature and pipeline.
-pub(crate) fn after_exposure(
-    list: &HostList,
-    average: D3D12_GPU_DESCRIPTOR_HANDLE,
-    before: D3D12_GPU_DESCRIPTOR_HANDLE,
-) -> bool {
+pub(crate) fn after_exposure(list: &HostList, average: D3D12_GPU_DESCRIPTOR_HANDLE, before: D3D12_GPU_DESCRIPTOR_HANDLE) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
@@ -288,12 +236,7 @@ pub(crate) fn after_exposure(
     WHEN[(n % RING) as usize].store(crate::host::now_ms(), Relaxed);
     write_old(pass, n);
     let stats = crate::ambient::probe_buffers();
-    let words = [
-        (n % RING) as u32,
-        crate::ambient::CELLS_AT,
-        u32::from(stats.is_some()),
-        0,
-    ];
+    let words = [(n % RING) as u32, crate::ambient::CELLS_AT, u32::from(stats.is_some()), 0];
     list.keep(&pass.ring);
     let l = &list.list;
     // SAFETY: an open list with the views' heap set; buffers kept.
@@ -311,10 +254,7 @@ pub(crate) fn after_exposure(
                 list.keep(cells);
                 (stats.GetGPUVirtualAddress(), cells.GetGPUVirtualAddress())
             }
-            None => (
-                pass.ring.GetGPUVirtualAddress(),
-                pass.ring.GetGPUVirtualAddress(),
-            ),
+            None => (pass.ring.GetGPUVirtualAddress(), pass.ring.GetGPUVirtualAddress()),
         };
         l.SetComputeRootUnorderedAccessView(4, a);
         l.SetComputeRootUnorderedAccessView(5, b);
@@ -325,11 +265,7 @@ pub(crate) fn after_exposure(
 }
 
 /// After the lux program's dispatch: its input and output.
-pub(crate) fn after_lux(
-    list: &HostList,
-    input: D3D12_GPU_DESCRIPTOR_HANDLE,
-    output: D3D12_GPU_DESCRIPTOR_HANDLE,
-) -> bool {
+pub(crate) fn after_lux(list: &HostList, input: D3D12_GPU_DESCRIPTOR_HANDLE, output: D3D12_GPU_DESCRIPTOR_HANDLE) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
@@ -358,14 +294,8 @@ mod tests {
 
     #[test]
     fn roles_by_name() {
-        assert_eq!(
-            role(b"..PS_CalculateExposure_396dfccc_Wrapped.."),
-            Some(Role::Exposure)
-        );
-        assert_eq!(
-            role(b"avgLuminanceCompute:ComputeLuxCompressionInfoSmooth_5b8554dd"),
-            lux_on().then_some(Role::Lux)
-        );
+        assert_eq!(role(b"..PS_CalculateExposure_396dfccc_Wrapped.."), Some(Role::Exposure));
+        assert_eq!(role(b"avgLuminanceCompute:ComputeLuxCompressionInfoSmooth_5b8554dd"), lux_on().then_some(Role::Lux));
         assert_eq!(role(b"PS_SetExposurePrevious"), None);
     }
 

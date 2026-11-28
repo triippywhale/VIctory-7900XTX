@@ -149,12 +149,7 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(
-        graphics
-            .map(|g| g.describe())
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
     key.finalize().to_hex()[..32].to_owned()
 }
 
@@ -314,10 +309,7 @@ unsafe extern "system" fn compiler_crashed(
     const CONTINUE_SEARCH: i32 = 0;
     // SAFETY: the system passes a live record.
     let record = unsafe { &*(*info).ExceptionRecord };
-    if record.ExceptionCode != ACCESS_VIOLATION
-        || record.NumberParameters < 2
-        || record.ExceptionInformation[1] >= 0x10000
-    {
+    if record.ExceptionCode != ACCESS_VIOLATION || record.NumberParameters < 2 || record.ExceptionInformation[1] >= 0x10000 {
         return CONTINUE_SEARCH;
     }
     if !COMPILING.try_with(|c| c.get()).unwrap_or(false) {
@@ -378,18 +370,9 @@ fn lost(slot: usize) {
     let known = bad_keys(|keys| !keys.insert(p.key.clone()));
     if !known && let Some(dir) = super::library::folder() {
         use std::io::Write;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("warm-bad.txt"));
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(
-                f,
-                "{} {} ended the compiler in a run: {:?}",
-                bad_under(),
-                p.key,
-                p.shaders
-            );
+            let _ = writeln!(f, "{} {} ended the compiler in a run: {:?}", bad_under(), p.key, p.shaders);
         }
     }
     let _ = p.made.set(None);
@@ -466,10 +449,7 @@ fn wait_budget() -> Duration {
 fn screen_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(10_000);
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
         Duration::from_millis(millis)
     })
 }
@@ -547,10 +527,7 @@ fn wait_until_made(p: &Pending) {
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
         // (timed: a notification may come between the test and the wait)
-        held = done
-            .wait_timeout(held, Duration::from_millis(50))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        held = done.wait_timeout(held, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     waiting.end();
@@ -564,10 +541,7 @@ fn wait_until_made(p: &Pending) {
         );
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::PipelineWaitUs,
-        waited.as_micros() as u64,
-    );
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Without waiting: `Some(true)` if `p` has a host pipeline, `Some(false)`
@@ -601,9 +575,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
 /// old behaviour), not only in the first one that had budget for it.
 fn wait_every_frame() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1")
-    })
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
 }
 
 /// Claims frame `frame` as the one in which `p` is waited for; whether
@@ -612,10 +584,7 @@ fn claim_wait(p: &Pending, frame: u64) -> bool {
     if wait_every_frame() {
         return true;
     }
-    match p
-        .waited_frame
-        .compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire)
-    {
+    match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => true,
         Err(first) => first == frame,
     }
@@ -629,18 +598,13 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen {
-        screen_budget()
-    } else {
-        wait_budget()
-    };
+    let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] =
-        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
@@ -670,10 +634,7 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done
-            .wait_timeout(held, rest)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
@@ -770,10 +731,7 @@ fn low_memory() -> bool {
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_PIPELINE_LOW_MEMORY").is_some_and(|v| v == "1");
         if on {
-            tracing::info!(
-                slow_limit = slow_limit(),
-                "pipelines known to take long are limited at first use too"
-            );
+            tracing::info!(slow_limit = slow_limit(), "pipelines known to take long are limited at first use too");
         }
         on
     })
@@ -847,13 +805,7 @@ impl Queue {
 
     /// As [`Queue::push`]: `slow`, whether `p` is known to take long;
     /// `low_memory`, whether it is limited when requested too ([`low_memory`]).
-    fn push_in(
-        &mut self,
-        p: &Arc<Pending>,
-        priority: u8,
-        slow: bool,
-        low_memory: bool,
-    ) -> Option<bool> {
+    fn push_in(&mut self, p: &Arc<Pending>, priority: u8, slow: bool, low_memory: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
@@ -889,17 +841,11 @@ impl Queue {
     /// one known to take long only while fewer than `slow_limit` such are
     /// being made. Workers that make passes over the screen alone
     /// (`screens_only`) take nothing else.
-    fn pop_in(
-        &mut self,
-        screens_only: bool,
-        slow_limit: usize,
-        resolve_limit: usize,
-    ) -> Option<Arc<Pending>> {
+    fn pop_in(&mut self, screens_only: bool, slow_limit: usize, resolve_limit: usize) -> Option<Arc<Pending>> {
         // An entry can have been promoted and claimed already: an early one
         // is then in a requested list too.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state: u8| {
-            std::iter::from_fn(|| list.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == state)
+            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
         let free = self.slow_now < slow_limit;
         let mut slow = false;
@@ -957,10 +903,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(
-                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -1030,16 +973,11 @@ fn spawn_worker(screens_only: bool) -> bool {
             // Below the title's own threads (loading, recording),
             // and the streaming one, which is below normal itself
             // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-            let lowest = !screens_only
-                && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
             // SAFETY: a plain call on our own thread.
             unsafe {
                 use windows::Win32::System::Threading::*;
-                let priority = if lowest {
-                    THREAD_PRIORITY_LOWEST
-                } else {
-                    THREAD_PRIORITY_BELOW_NORMAL
-                };
+                let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
                 let _ = SetThreadPriority(GetCurrentThread(), priority);
             }
             loop {
@@ -1113,9 +1051,7 @@ mod low_memory_tests {
     }
 
     fn pops(queue: &mut Queue, screens_only: bool, limit: usize, p: &Arc<Pending>) -> bool {
-        queue
-            .pop(screens_only, limit)
-            .is_some_and(|got| Arc::ptr_eq(&got, p))
+        queue.pop(screens_only, limit).is_some_and(|got| Arc::ptr_eq(&got, p))
     }
 
     /// One slot, held by an early long one: a long first use and a long pass
@@ -1133,10 +1069,7 @@ mod low_memory_tests {
 
         assert_eq!(queue.push_in(&first_use, REQUESTED, true, true), Some(true));
         assert_eq!(queue.push_in(&screen, REQUESTED, true, true), Some(true));
-        assert_eq!(
-            queue.push_in(&quick_use, REQUESTED, false, true),
-            Some(true)
-        );
+        assert_eq!(queue.push_in(&quick_use, REQUESTED, false, true), Some(true));
         assert_eq!(queue.push_in(&quick_early, EARLY, false, true), Some(true));
 
         assert!(pops(&mut queue, false, 1, &quick_use));
@@ -1312,14 +1245,8 @@ mod tests {
                       1111 dddd\n\
                       1111\n";
         let keys = |of| bad_listed(listed, of);
-        assert_eq!(
-            keys("1111"),
-            std::collections::HashSet::from(["aaaa".to_owned(), "dddd".to_owned()])
-        );
-        assert_eq!(
-            keys("2222"),
-            std::collections::HashSet::from(["bbbb".to_owned()])
-        );
+        assert_eq!(keys("1111"), std::collections::HashSet::from(["aaaa".to_owned(), "dddd".to_owned()]));
+        assert_eq!(keys("2222"), std::collections::HashSet::from(["bbbb".to_owned()]));
         assert!(keys("3333").is_empty());
     }
 
@@ -1443,16 +1370,11 @@ mod tests {
         let frame = crate::frame::current();
         // Another frame than this one, and never `u64::MAX` (none yet): with
         // the frame counter still at 0, `0 - 1` would be that.
-        p.waited_frame
-            .store(frame.wrapping_add(1), Ordering::Relaxed);
+        p.waited_frame.store(frame.wrapping_add(1), Ordering::Relaxed);
         let p = Arc::new(p);
         let started = Instant::now();
         assert!(ready(&p).is_none());
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "waited {:?}",
-            started.elapsed()
-        );
+        assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
     }
 
     /// A ray-tracing resolve still being made is not waited for at all, and
@@ -1467,11 +1389,7 @@ mod tests {
         let before = NOT_WAITED.load(Ordering::Relaxed);
         let started = Instant::now();
         assert!(ready(&p).is_none());
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "waited {:?}",
-            started.elapsed()
-        );
+        assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
         assert!(NOT_WAITED.load(Ordering::Relaxed) > before);
         // No frame's wait is claimed for it.
         assert_eq!(p.waited_frame.load(Ordering::Relaxed), u64::MAX);
@@ -1499,9 +1417,7 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &asked));
         assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &first));
         assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &second));
-        assert!(
-            first.as_resolve.load(Ordering::Relaxed) && !asked.as_resolve.load(Ordering::Relaxed)
-        );
+        assert!(first.as_resolve.load(Ordering::Relaxed) && !asked.as_resolve.load(Ordering::Relaxed));
         assert_eq!(queue.resolves_now, 2);
         // At the limit the next worker takes an early one, not the third.
         assert!(Arc::ptr_eq(&queue.pop_in(false, 1, 2).unwrap(), &early));

@@ -262,10 +262,7 @@ fn gs_lane_count(code: &[u8]) -> Option<usize> {
         match (name, &src[..]) {
             (
                 "s_bfe_i32" | "s_bfe_u32",
-                [
-                    Operand::Scalar { code: 3, .. },
-                    Operand::Literal(0x0008_0008),
-                ],
+                [Operand::Scalar { code: 3, .. }, Operand::Literal(0x0008_0008)],
             ) => count = dst,
             ("s_bfm_b64", [Operand::Scalar { code, .. }, Operand::Const(128)])
                 if dst == Some(126) && count == Some(*code) && i.words.len() == 1 =>

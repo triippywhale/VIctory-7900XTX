@@ -555,22 +555,14 @@ impl Shader {
         props: (u32, u32),
         bounded: bool,
     ) -> V {
-        self.heap_handle_inner(
-            block, index, sampler, nonuniform, props, bounded, nonuniform,
-        )
+        self.heap_handle_inner(block, index, sampler, nonuniform, props, bounded, nonuniform)
     }
 
     /// A buffer `getDimensions` handle emitted with `nonUniformIndex = true`
     /// to avoid an AMD DXIL compiler crash (`amdxc64.dll+0x861b9f`), without
     /// counting toward `nonuniform_handles` when the index itself is uniform
     /// (from MalfoyDraco99 f80fd266).
-    pub fn heap_handle_for_buffer_dim(
-        &mut self,
-        block: usize,
-        index: V,
-        props: (u32, u32),
-        bounded: bool,
-    ) -> V {
+    pub fn heap_handle_for_buffer_dim(&mut self, block: usize, index: V, props: (u32, u32), bounded: bool) -> V {
         self.heap_handle_inner(block, index, false, true, props, bounded, false)
     }
 
@@ -587,23 +579,12 @@ impl Shader {
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
-        let limit = if bounded {
-            0
-        } else {
-            VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
-        };
+        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
-            let v = self.op(
-                block,
-                "binary.i32",
-                Attr::ReadNone,
-                i32t,
-                40,
-                &[index, null],
-            );
+            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else if sampler {
@@ -614,14 +595,7 @@ impl Shader {
             // heap smaller than 2,048 would need.
             let last = self.m.i32(2047);
             let i32t = self.t.i32;
-            let v = self.op(
-                block,
-                "binary.i32",
-                Attr::ReadNone,
-                i32t,
-                40,
-                &[index, last],
-            );
+            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
             self.m.tag(v, super::bitcode::Tag::Clamp);
             v
         } else {
@@ -657,9 +631,7 @@ impl Shader {
                 if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
                     continue;
                 }
-                let mut modes = self
-                    .inputs
-                    .iter()
+                let mut modes = self.inputs.iter()
                     .filter(|e| e.row == unused.row && e.usage != 0)
                     .map(|e| e.interp);
                 if let Some(mode) = modes.next()

@@ -39,10 +39,7 @@ static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
-        RETRY_UPLOAD_AT.fetch_max(
-            crate::host::coarse_ms().saturating_add(500),
-            Ordering::Relaxed,
-        );
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
     }
 }
 
@@ -66,12 +63,7 @@ fn sample_commit(now: u64) -> u64 {
     let next = NEXT_COMMIT_SAMPLE.load(Ordering::Relaxed);
     if now >= next
         && NEXT_COMMIT_SAMPLE
-            .compare_exchange(
-                next,
-                now.saturating_add(32),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         && let Some(status) = memory_status()
     {
@@ -142,9 +134,7 @@ pub(crate) fn refresh() {
     if !on() {
         return;
     }
-    let Some(status) = memory_status() else {
-        return;
-    };
+    let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
@@ -160,16 +150,11 @@ pub(crate) fn refresh() {
                 buffer_mirror_span_mib = crate::shadow::live_span_bytes() >> 20,
                 texture_staging_mib = crate::texture::live_staging_bytes() >> 20,
                 spare_scratch_mib = crate::host::ALIVE[4].load(Ordering::Relaxed) >> 20,
-                game_filled_gpu_texture_mib =
-                    crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
+                game_filled_gpu_texture_mib = crate::resource::KINDS[1].load(Ordering::Relaxed) >> 20,
                 "host memory pressure: limiting texture prefetch and idle upload storage"
             );
         } else {
-            tracing::info!(
-                physical_free_mib = physical >> 20,
-                available_commit_mib = commit >> 20,
-                "host memory pressure cleared"
-            );
+            tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
         }
     }
 }
@@ -195,13 +180,7 @@ pub(crate) fn critical_commit() -> bool {
 
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
-pub(crate) fn prefetch_limit(
-    bytes: u64,
-    pressure: bool,
-    critical: bool,
-    limited: bool,
-    staging: u64,
-) -> u64 {
+pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
     if critical {
         bytes.min(16 << 20)
     } else if pressure || (limited && staging >= GIB) {
@@ -243,14 +222,8 @@ mod tests {
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
         assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
-        assert_eq!(
-            prefetch_limit(512 << 20, false, false, true, GIB - 1),
-            512 << 20
-        );
-        assert_eq!(
-            prefetch_limit(512 << 20, false, false, false, 2 * GIB),
-            512 << 20
-        );
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
         assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
         assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);

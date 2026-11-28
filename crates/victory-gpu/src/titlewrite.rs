@@ -138,20 +138,13 @@ unsafe extern "system-unwind" fn shift(to: *mut u8, from: *const u8, n: usize) -
 unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8 {
     // SAFETY: the host's function, noted by `import` before the title ran.
     let real: Copy = unsafe { std::mem::transmute(real) };
-    if n == 0
-        || !crate::watch::guards_any(to as usize, n)
-        || !copies_on()
-        || overlap(to as usize, from as usize, n)
-    {
+    if n == 0 || !crate::watch::guards_any(to as usize, n) || !copies_on() || overlap(to as usize, from as usize, n) {
         // SAFETY: by the caller.
         return unsafe { real(to, from, n) };
     }
     let same = |at: usize, offset: usize, len: usize| {
         // SAFETY: both are the title's, the one read-only by our hand, the other read by it next.
-        unsafe {
-            std::slice::from_raw_parts(at as *const u8, len)
-                == std::slice::from_raw_parts(from.add(offset), len)
-        }
+        unsafe { std::slice::from_raw_parts(at as *const u8, len) == std::slice::from_raw_parts(from.add(offset), len) }
     };
     in_pieces(to as usize, n, same, |at, offset, len| {
         // SAFETY: a part of what the title asked for; or the same bytes at
@@ -170,9 +163,7 @@ unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u
     }
     let same = |at: usize, _: usize, len: usize| {
         // SAFETY: the title's, read-only by our hand.
-        unsafe { std::slice::from_raw_parts(at as *const u8, len) }
-            .iter()
-            .all(|&there| there == byte as u8)
+        unsafe { std::slice::from_raw_parts(at as *const u8, len) }.iter().all(|&there| there == byte as u8)
     };
     in_pieces(to as usize, n, same, |at, _, len| {
         // SAFETY: as in `copied`.
@@ -190,27 +181,16 @@ unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u
 pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
     // SAFETY: by the caller.
     unsafe {
-        let there = || {
-            std::slice::from_raw_parts(to.cast_const(), n) == std::slice::from_raw_parts(from, n)
-        };
+        let there = || std::slice::from_raw_parts(to.cast_const(), n) == std::slice::from_raw_parts(from, n);
         if crate::toggled!("VICTORY_SAME_RECORDS") && there() {
             add(8);
             return;
         }
-        if n == 0
-            || !copies_on()
-            || !crate::watch::guards_any(to as usize, n)
-            || overlap(to as usize, from as usize, n)
-        {
+        if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
             std::ptr::copy(from, to, n);
             return;
         }
-        in_pieces(
-            to as usize,
-            n,
-            |_, _, _| false,
-            |at, offset, len| std::ptr::copy_nonoverlapping(from.add(offset), at as *mut u8, len),
-        );
+        in_pieces(to as usize, n, |_, _, _| false, |at, offset, len| std::ptr::copy_nonoverlapping(from.add(offset), at as *mut u8, len));
     }
 }
 
@@ -218,10 +198,7 @@ pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
 /// be written at another address).
 fn overlap(to: usize, from: usize, n: usize) -> bool {
     const BLOCK: usize = crate::watch::PAGE;
-    let (first, last) = (
-        to / BLOCK * BLOCK,
-        to.saturating_add(n).next_multiple_of(BLOCK),
-    );
+    let (first, last) = (to / BLOCK * BLOCK, to.saturating_add(n).next_multiple_of(BLOCK));
     from < last && first < from.saturating_add(n)
 }
 
@@ -230,12 +207,7 @@ fn overlap(to: usize, from: usize, n: usize) -> bool {
 ///
 /// What is there already (`same`, of a part in one guarded block) is not
 /// written.
-fn in_pieces(
-    to: usize,
-    n: usize,
-    same: impl Fn(usize, usize, usize) -> bool,
-    put: impl Fn(usize, usize, usize),
-) {
+fn in_pieces(to: usize, n: usize, same: impl Fn(usize, usize, usize) -> bool, put: impl Fn(usize, usize, usize)) {
     const BLOCK: usize = crate::watch::PAGE;
     add(0);
     let mut offset = 0;
@@ -248,9 +220,7 @@ fn in_pieces(
                 offset += len;
                 continue;
             }
-            match crate::watch::put_beside(at / BLOCK, 1, |delta| {
-                put(at.wrapping_add(delta), offset, len)
-            }) {
+            match crate::watch::put_beside(at / BLOCK, 1, |delta| put(at.wrapping_add(delta), offset, len)) {
                 Beside::Done => {
                     add(1);
                     offset += len;
@@ -283,8 +253,7 @@ fn sparse(counts: u64) -> bool {
 
 /// Faulting stores by their place in the title's code: the place, and how
 /// many left the memory as it was (the low half) or did not (the high one).
-static LEARNED: [(AtomicUsize, AtomicU64); 1 << 9] =
-    [const { (AtomicUsize::new(0), AtomicU64::new(0)) }; 1 << 9];
+static LEARNED: [(AtomicUsize, AtomicU64); 1 << 9] = [const { (AtomicUsize::new(0), AtomicU64::new(0)) }; 1 << 9];
 
 /// A store at `rip` would leave the memory as it is, or not. With
 /// `VICTORY_WRITE_SITES=<file>`, a place that can be made to look first
@@ -292,10 +261,7 @@ static LEARNED: [(AtomicUsize, AtomicU64); 1 << 9] =
 /// start (`victory_loader::write_sites`).
 fn learn(rip: usize, same: bool, can_look: bool) {
     let slot = &LEARNED[(rip as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize >> 55 & 511];
-    let there = slot
-        .0
-        .compare_exchange(0, rip, Relaxed, Relaxed)
-        .unwrap_or_else(|there| there);
+    let there = slot.0.compare_exchange(0, rip, Relaxed, Relaxed).unwrap_or_else(|there| there);
     if there != 0 && there != rip {
         return;
     }
@@ -326,20 +292,10 @@ fn learn(rip: usize, same: bool, can_look: bool) {
         if known.lines().any(|l| l.starts_with(line.trim_end())) {
             return;
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(file)
-        {
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(file) {
             let _ = file.write_all(line.as_bytes());
         }
-        tracing::info!(
-            image,
-            offset = format_args!("{offset:#x}"),
-            stayed,
-            changed,
-            "a write of the title's that mostly changes nothing, noted"
-        );
+        tracing::info!(image, offset = format_args!("{offset:#x}"), stayed, changed, "a write of the title's that mostly changes nothing, noted");
     });
 }
 
@@ -362,11 +318,9 @@ fn outside_repo(file: std::path::PathBuf) -> Option<std::path::PathBuf> {
 /// The file name of the image `address` is in, and where in it.
 fn place(address: usize) -> Option<(String, usize)> {
     use windows_sys::Win32::System::LibraryLoader::{
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        GetModuleFileNameW, GetModuleHandleExW,
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
     };
-    const FLAGS: u32 =
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    const FLAGS: u32 = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
     let mut module = std::ptr::null_mut();
     let mut name = [0u16; 1024];
     // SAFETY: an address, and room for the answers.
@@ -394,20 +348,14 @@ pub(crate) fn busiest() -> String {
     all.sort_unstable_by_key(|s| std::cmp::Reverse(s.0 + s.1));
     let of = |&(stayed, changed, rip): &(u64, u64, usize)| {
         let (image, offset) = place(rip).unwrap_or_default();
-        format!(
-            "{}+{offset:x} {stayed}/{changed}",
-            image.chars().skip(14).take(4).collect::<String>()
-        )
+        format!("{}+{offset:x} {stayed}/{changed}", image.chars().skip(14).take(4).collect::<String>())
     };
     all.iter().take(16).map(of).collect::<Vec<_>>().join(", ")
 }
 
 /// Does the store that faulted at `at`, a byte of a guarded block, beside the
 /// guards; `false` if it is to open the block (and nothing was done).
-pub(crate) fn store(
-    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    at: usize,
-) -> bool {
+pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, at: usize) -> bool {
     if !stores_on() {
         return false;
     }

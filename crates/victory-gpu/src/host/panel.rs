@@ -142,9 +142,7 @@ fn scale(height: u32) -> u32 {
 /// Bytes per pixel for a supported swap-chain format.
 fn bpp(format: DXGI_FORMAT) -> Option<usize> {
     match format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => {
-            Some(4)
-        }
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM => Some(4),
         DXGI_FORMAT_R16G16B16A16_FLOAT => Some(8),
         _ => None,
     }
@@ -199,11 +197,7 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: u32, h: u32, fill: [u8; 3]) -> Canvas {
-        Canvas {
-            w: w as usize,
-            h: h as usize,
-            rgb: vec![fill; (w * h) as usize],
-        }
+        Canvas { w: w as usize, h: h as usize, rgb: vec![fill; (w * h) as usize] }
     }
 
     fn rect(&mut self, x: u32, y: u32, w: u32, h: u32, color: [u8; 3]) {
@@ -282,9 +276,7 @@ impl Canvas {
 
 /// Private committed bytes of the current process.
 fn process_private_bytes() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
         cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
@@ -337,22 +329,9 @@ fn gpu_info(host: &Host) -> &'static (String, u64) {
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
             return ("GPU".to_owned(), 0);
         };
-        let end = desc
-            .Description
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(desc.Description.len());
-        let name = String::from_utf16_lossy(&desc.Description[..end])
-            .trim()
-            .to_owned();
-        (
-            if name.is_empty() {
-                "GPU".to_owned()
-            } else {
-                name
-            },
-            desc.DedicatedVideoMemory as u64,
-        )
+        let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]).trim().to_owned();
+        (if name.is_empty() { "GPU".to_owned() } else { name }, desc.DedicatedVideoMemory as u64)
     })
 }
 
@@ -404,25 +383,15 @@ impl CpuMeter {
                 return None;
             }
             let p = GetProcAddress(ntdll, c"NtQuerySystemInformation".as_ptr().cast())?;
-            Some(std::mem::transmute::<
-                unsafe extern "system" fn() -> isize,
-                NtQuery,
-            >(p))
+            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQuery>(p))
         });
         let Some(query) = query else { return };
-        let n = std::thread::available_parallelism()
-            .map_or(8, |n| n.get())
-            .min(64);
+        let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(64);
         let mut buf = vec![SysProcPerfInfo::default(); n];
         let mut ret = 0u32;
         // SystemProcessorPerformanceInformation = 8.
         let status = unsafe {
-            query(
-                8,
-                buf.as_mut_ptr().cast(),
-                (buf.len() * size_of::<SysProcPerfInfo>()) as u32,
-                &mut ret,
-            )
+            query(8, buf.as_mut_ptr().cast(), (buf.len() * size_of::<SysProcPerfInfo>()) as u32, &mut ret)
         };
         if status < 0 {
             return;
@@ -431,10 +400,7 @@ impl CpuMeter {
         if count == 0 {
             return;
         }
-        let now: Vec<(i64, i64)> = buf[..count]
-            .iter()
-            .map(|p| (p.idle, p.kernel + p.user))
-            .collect();
+        let now: Vec<(i64, i64)> = buf[..count].iter().map(|p| (p.idle, p.kernel + p.user)).collect();
         if self.prev.len() == count {
             self.cores_pct.clear();
             let mut sum = 0.0f32;
@@ -547,11 +513,7 @@ fn frametime_color(ms: f32) -> [u8; 3] {
 }
 
 fn trunc(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_owned()
-    } else {
-        s[..max].to_owned()
-    }
+    if s.len() <= max { s.to_owned() } else { s[..max].to_owned() }
 }
 
 /// Paints the full colour HUD canvas.
@@ -567,10 +529,7 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c.text(BASE_W - 14 - badge.len() as u32 * 12, 24, 2, MUTED, &badge);
 
     // 2. Resolution | draws | GPU ms.
-    let row2 = format!(
-        "{}X{} | {} DRAWS | GPU {:.1}MS",
-        s.width, s.height, s.draws, s.gpu_ms
-    );
+    let row2 = format!("{}X{} | {} DRAWS | GPU {:.1}MS", s.width, s.height, s.draws, s.gpu_ms);
     c.text_sep(14, 48, 2, WHITE, &trunc(&row2, 43));
 
     // 3. Frame | submit | 1% low | max.
@@ -586,32 +545,15 @@ fn paint_hud(s: &Snapshot) -> Canvas {
     c.border(gx, gy, gw, gh, BORDER);
 
     // Scale graph ceiling dynamically (min 100 ms, up to 200 ms if spikes exist).
-    let peak = s
-        .history_ms
-        .iter()
-        .copied()
-        .fold(100.0f32, f32::max)
-        .min(220.0);
-    let max_scale = if peak > 140.0 {
-        200.0
-    } else if peak > 90.0 {
-        133.0
-    } else {
-        100.0
-    };
+    let peak = s.history_ms.iter().copied().fold(100.0f32, f32::max).min(220.0);
+    let max_scale = if peak > 140.0 { 200.0 } else if peak > 90.0 { 133.0 } else { 100.0 };
 
     // Reference lines at 33 ms (30 FPS) and 66 ms (15 FPS).
     for &ref_ms in &[33.3f32, 66.7f32] {
         if ref_ms < max_scale {
             let ly = gy + gh - 2 - ((ref_ms / max_scale) * (gh - 4) as f32) as u32;
             c.rect(gx + 1, ly, gw - 2, 1, GRAPH_GRID);
-            c.text(
-                gx + 4,
-                ly.saturating_sub(8),
-                1,
-                MUTED,
-                &format!("{:.0}", ref_ms),
-            );
+            c.text(gx + 4, ly.saturating_sub(8), 1, MUTED, &format!("{:.0}", ref_ms));
         }
     }
 
@@ -640,11 +582,7 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 
     // GPU
     c.text(14, 176, 2, LABEL, "GPU");
-    let gpu_line = format!(
-        "{} {}%",
-        trunc(&s.gpu_name, max_chars.saturating_sub(5)),
-        s.gpu_pct
-    );
+    let gpu_line = format!("{} {}%", trunc(&s.gpu_name, max_chars.saturating_sub(5)), s.gpu_pct);
     c.text(val_x, 176, 2, WHITE, &trunc(&gpu_line, max_chars));
 
     // VRAM
@@ -669,11 +607,7 @@ fn paint_hud(s: &Snapshot) -> Canvas {
 
     // CPU + per-core bars
     c.text(14, 236, 2, LABEL, "CPU");
-    let cpu_line = format!(
-        "{} {:.0}%",
-        trunc(&s.cpu_name, max_chars.saturating_sub(5)),
-        s.cpu_pct
-    );
+    let cpu_line = format!("{} {:.0}%", trunc(&s.cpu_name, max_chars.saturating_sub(5)), s.cpu_pct);
     c.text(val_x, 236, 2, WHITE, &trunc(&cpu_line, max_chars));
 
     let cores = s.cores_pct.len().clamp(1, 32);
@@ -688,11 +622,7 @@ fn paint_hud(s: &Snapshot) -> Canvas {
         let fh = ((pct / 100.0) * bar_h as f32).round() as u32;
         if fh > 0 {
             let fh = fh.min(bar_h);
-            let col = if pct >= 85.0 {
-                BAR_FILL_HI
-            } else {
-                BAR_FILL_LO
-            };
+            let col = if pct >= 85.0 { BAR_FILL_HI } else { BAR_FILL_LO };
             c.rect(bx, bar_y + bar_h - fh, cw, fh, col);
         }
     }
@@ -736,9 +666,7 @@ impl Buffers {
         let (width, height) = size(scale);
         let pitch = (width * bpp(format)? as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
-        let uploads = (0..UPLOADS)
-            .map(|_| host.upload_buffer(bytes))
-            .collect::<Option<Vec<_>>>()?;
+        let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -749,10 +677,7 @@ impl Buffers {
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         };
@@ -760,39 +685,17 @@ impl Buffers {
         // SAFETY: plain creation of a buffer.
         unsafe {
             host.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut card,
-                )
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers {
-            format,
-            scale,
-            pitch,
-            uploads,
-            card: card?,
-            turn: 0,
-            fresh: false,
-            uploaded: false,
-        })
+        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false, uploaded: false })
     }
 
     fn write(&mut self, snap: &Snapshot) {
         let picture = paint_hud(snap).pack(self.scale, self.format, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                picture.as_ptr(),
-                self.uploads[self.turn].1,
-                picture.len(),
-            )
-        };
+        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
         self.fresh = true;
     }
 }
@@ -959,18 +862,12 @@ impl Panel {
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
-        if self
-            .buffers
-            .as_ref()
-            .is_none_or(|b| (b.format, b.scale) != (format, scale))
-        {
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             self.buffers = Buffers::new(host, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
-        let Some(buffers) = &mut self.buffers else {
-            return;
-        };
+        let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
             buffers.write(snap);
         }
@@ -1019,9 +916,7 @@ impl Panel {
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(back),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
             };
             let part = D3D12_BOX {
                 left: 0,
@@ -1044,10 +939,7 @@ mod tests {
     /// Every character the HUD uses has its own picture, and no two look alike.
     #[test]
     fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9')
-            .chain(b'A'..=b'Z')
-            .chain(*b"./-|%: ")
-            .collect();
+        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./-|%: ").collect();
         for (i, a) in used.iter().enumerate() {
             assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
             assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));

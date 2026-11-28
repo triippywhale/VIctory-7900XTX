@@ -1398,11 +1398,7 @@ impl Scene {
             // The card writes memory the CPU sees.
             l.ResourceBarrier(&[
                 moved(&self.sum, UAV, FROM),
-                moved(
-                    &self.shared.0,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                    TO,
-                ),
+                moved(&self.shared.0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, TO),
             ]);
             l.CopyBufferRegion(&self.shared.0, 30_000, &self.sum, 0, 1024);
             l.ResourceBarrier(&[moved(&self.target, TARGET, FROM)]);
@@ -1553,18 +1549,11 @@ fn check(player: &mut Player, options: &Options, expected: &Outcome, what: &str)
     println!("{}", report.text(what));
     // Combining original submissions removes implicit resource state decay.
     // Track that separate experiment's existing barrier mismatch separately.
-    let errors: Vec<_> = report
-        .notes
-        .iter()
-        .filter(|note| {
-            note.starts_with("debug layer:")
-                && !(options.one_submit && note.contains("errors 527, first:"))
-        })
-        .collect();
-    assert!(
-        errors.is_empty(),
-        "{what}: D3D12 validation errors: {errors:?}"
-    );
+    let errors: Vec<_> = report.notes.iter().filter(|note| {
+        note.starts_with("debug layer:")
+            && !(options.one_submit && note.contains("errors 527, first:"))
+    }).collect();
+    assert!(errors.is_empty(), "{what}: D3D12 validation errors: {errors:?}");
     assert_eq!(report.frame_ms.len(), options.loops as usize);
     assert!(report.median_ms() > 0.0);
     let (db, same) = report.picture.unwrap();
@@ -1740,10 +1729,7 @@ fn a_frame_is_recorded_and_replayed() {
                 }
             }
         }
-        assert!(
-            errors.is_empty(),
-            "source frame D3D12 validation errors: {errors:?}"
-        );
+        assert!(errors.is_empty(), "source frame D3D12 validation errors: {errors:?}");
     }
     for name in [
         "frame.bin",

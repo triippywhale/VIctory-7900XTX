@@ -59,12 +59,7 @@ const LEAST: u64 = 4 << 20;
 /// of its budget, where frames take 220 ms; a frame sends 40-50 MB this way.
 fn most_bytes() -> u64 {
     static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| {
-        std::env::var("VICTORY_UP_QUEUE_MB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(128u64)
-    }) << 20
+    *MB.get_or_init(|| std::env::var("VICTORY_UP_QUEUE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128u64)) << 20
 }
 
 /// The bytes of all slots' buffers.
@@ -109,19 +104,13 @@ fn make_queue(device: &ID3D12Device) -> Option<Queue> {
     // SAFETY: plain object creation.
     let made = unsafe {
         (|| -> windows::core::Result<Queue> {
-            let queue: ID3D12CommandQueue =
-                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                    Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
-                    ..Default::default()
-                })?;
+            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                ..Default::default()
+            })?;
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-            Ok(Queue {
-                queue,
-                fence,
-                sent: 0,
-                free: Vec::new(),
-            })
+            Ok(Queue { queue, fence, sent: 0, free: Vec::new() })
         })()
     };
     match made {
@@ -140,16 +129,10 @@ fn make_slot(device: &ID3D12Device) -> Option<Slot> {
     // SAFETY: plain object creation.
     unsafe {
         (|| -> windows::core::Result<Slot> {
-            let allocator: ID3D12CommandAllocator =
-                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-            let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Slot {
-                allocator,
-                list,
-                bounce: None,
-            })
+            Ok(Slot { allocator, list, bounce: None })
         })()
         .ok()
     }
@@ -180,23 +163,13 @@ pub(super) unsafe fn send(
         return None;
     }
     let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(q) = guard
-        .get_or_insert_with(|| make_queue(&host.device))
-        .as_mut()
-    else {
+    let Some(q) = guard.get_or_insert_with(|| make_queue(&host.device)).as_mut() else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
     // A free slot whose buffer holds it all, else any free slot, else a new one.
-    let fits = q
-        .free
-        .iter()
-        .position(|s| s.bounce.as_ref().is_some_and(|b| b.1 >= total));
-    let Some(mut slot) = fits
-        .map(|i| q.free.swap_remove(i))
-        .or_else(|| q.free.pop())
-        .or_else(|| make_slot(&host.device))
-    else {
+    let fits = q.free.iter().position(|s| s.bounce.as_ref().is_some_and(|b| b.1 >= total));
+    let Some(mut slot) = fits.map(|i| q.free.swap_remove(i)).or_else(|| q.free.pop()).or_else(|| make_slot(&host.device)) else {
         STATS[3].fetch_add(1, Relaxed);
         return None;
     };
@@ -217,12 +190,7 @@ pub(super) unsafe fn send(
             return None;
         };
         BOUNCE_BYTES.fetch_add(size, Relaxed);
-        super::name(&made, || {
-            format!(
-                "copies in the card's memory: what goes up, {} MB",
-                size >> 20
-            )
-        });
+        super::name(&made, || format!("copies in the card's memory: what goes up, {} MB", size >> 20));
         slot.bounce = Some((made, size));
     }
     let (bounce, _) = slot.bounce.clone()?;
@@ -238,8 +206,7 @@ pub(super) unsafe fn send(
                 at += bytes.next_multiple_of(256);
             }
             slot.list.Close()?;
-            q.queue
-                .ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
+            q.queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&slot.list)?)]);
             q.sent += 1;
             q.queue.Signal(&q.fence, q.sent)?;
             Ok(())
@@ -258,10 +225,7 @@ pub(super) unsafe fn send(
         // what follows still finds the bytes.
         tracing::warn!(error = %e, "the drawing queue could not wait for the up queue: waited on the CPU");
         // SAFETY: as above; a null event waits until the value is reached.
-        let _ = unsafe {
-            q.fence
-                .SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default())
-        };
+        let _ = unsafe { q.fence.SetEventOnCompletion(q.sent, windows::Win32::Foundation::HANDLE::default()) };
     }
     let mut at = 0u64;
     for (i, r) in ranges.iter().enumerate() {
@@ -284,8 +248,7 @@ pub(super) fn give_back(slot: Slot) {
 
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
-    let [subs, bytes, copies, before] =
-        [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
+    let [subs, bytes, copies, before] = [0, 1, 2, 3].map(|i| STATS[i].swap(0, Relaxed) as f64 / frames);
     if subs + before > 0.0 {
         tracing::info!(
             "copies in the card's memory brought up on a copy queue per frame (VICTORY_UP_QUEUE): {subs:.1} submissions, \

@@ -290,27 +290,23 @@ impl Module {
     /// memory, group-shared memory): stores, atomics, compare-exchanges.
     fn writes_memory(&self) -> bool {
         let reached = self.reached();
-        self.blocks
-            .iter()
-            .enumerate()
-            .filter(|(b, _)| reached[*b])
-            .any(|(_, blk)| {
-                blk.body.iter().any(|&i| match &self.insts[i as usize].op {
-                    Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
-                    Op::Call(f, _) => {
-                        let func = &self.funcs[*f as usize];
-                        let name = func.name.strip_prefix("dx.op.").unwrap_or(&func.name);
-                        effect(func) == Effect::Writes
-                            && (name.contains("tomic")
-                                || name.contains("Exchange")
-                                || name.starts_with("rawBufferStore")
-                                || name.starts_with("bufferStore")
-                                || name.starts_with("textureStore")
-                                || name.contains("Feedback"))
-                    }
-                    _ => false,
-                })
+        self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]).any(|(_, blk)| {
+            blk.body.iter().any(|&i| match &self.insts[i as usize].op {
+                Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
+                Op::Call(f, _) => {
+                    let func = &self.funcs[*f as usize];
+                    let name = func.name.strip_prefix("dx.op.").unwrap_or(&func.name);
+                    effect(func) == Effect::Writes
+                        && (name.contains("tomic")
+                            || name.contains("Exchange")
+                            || name.starts_with("rawBufferStore")
+                            || name.starts_with("bufferStore")
+                            || name.starts_with("textureStore")
+                            || name.contains("Feedback"))
+                }
+                _ => false,
             })
+        })
     }
 
     /// [`HOIST`]: whether instruction `i` may be computed earlier than where it
@@ -420,11 +416,7 @@ impl Module {
         loops.sort_by_key(|(_, l)| l.iter().filter(|x| **x).count());
         let mut moved = false;
         for (h, inside) in &loops {
-            let outside: Vec<usize> = tree.preds[*h]
-                .iter()
-                .copied()
-                .filter(|&p| !inside[p])
-                .collect();
+            let outside: Vec<usize> = tree.preds[*h].iter().copied().filter(|&p| !inside[p]).collect();
             let [pre] = outside[..] else { continue };
             if !matches!(self.blocks[pre].term, Some(Term::Br(t)) if t == *h) {
                 continue;
@@ -683,16 +675,10 @@ impl Module {
                         (Some(x), Some(y)) => Some(x.max(y)),
                         _ => {
                             let other = if code == 35 { 36 } else { 35 };
-                            let (inner, k) = if self.float_k(*b).is_some() {
-                                (*a, *b)
-                            } else {
-                                (*b, *a)
-                            };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
                             let k = self.float_k(k).and_then(|_| of(k))?;
                             let V::Inst(j) = inner else { return None };
-                            let Op::Call(_, inner) = &self.insts[j as usize].op else {
-                                return None;
-                            };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
                             let (_, code) = self.int_k(*inner.first()?)?;
                             let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
                             (code == other).then_some(())?;
@@ -920,8 +906,7 @@ impl Module {
                 if !matches!(name, "dx.op.unaryBits.i32" | "dx.op.unary.i32") || args.len() != 2 {
                     return None;
                 }
-                let (Some((32, opcode)), Some((32, x))) =
-                    (self.int_k(args[0]), self.int_k(args[1]))
+                let (Some((32, opcode)), Some((32, x))) = (self.int_k(args[0]), self.int_k(args[1]))
                 else {
                     return None;
                 };
@@ -1958,13 +1943,7 @@ mod tests {
     #[test]
     fn invariant_reads_leave_their_loop_only_where_nothing_writes_memory() {
         for store in [false, true] {
-            let Kit {
-                mut m,
-                b,
-                reads,
-                writes,
-                ..
-            } = kit();
+            let Kit { mut m, b, reads, writes, .. } = kit();
             let i32t = m.int(32);
             let void = m.void();
             let oty = m.func_ty(void, vec![i32t, i32t]);
@@ -1992,16 +1971,9 @@ mod tests {
             let in_entry = m.blocks[b].body.contains(&xi);
             assert_eq!(in_entry, !store, "store {store}: the read before the loop");
             let used = |m: &Module, blk: usize| {
-                m.blocks[blk]
-                    .body
-                    .iter()
-                    .any(|&k| matches!(&m.insts[k as usize].op, Op::Call(_, a) if a.contains(&x)))
+                m.blocks[blk].body.iter().any(|&k| matches!(&m.insts[k as usize].op, Op::Call(_, a) if a.contains(&x)))
             };
-            assert_eq!(
-                used(&m, exit),
-                !store,
-                "store {store}: the read below is the first one"
-            );
+            assert_eq!(used(&m, exit), !store, "store {store}: the read below is the first one");
             m.write();
         }
     }
@@ -2065,9 +2037,7 @@ mod tests {
     #[test]
     fn an_annotated_handle_is_not_reused_across_blocks() {
         let Diamond {
-            k: Kit {
-                mut m, b, writes, ..
-            },
+            k: Kit { mut m, b, writes, .. },
             then,
             ..
         } = diamond();

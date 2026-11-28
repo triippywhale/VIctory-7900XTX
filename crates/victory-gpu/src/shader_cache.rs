@@ -75,11 +75,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// Since the start: entries of an earlier build of the translator met,
 /// those of them translated again, and those that came out different.
 pub fn stale_counts() -> (u64, u64, u64) {
-    (
-        STALE.load(Ordering::Relaxed),
-        REFRESHED.load(Ordering::Relaxed),
-        CHANGED.load(Ordering::Relaxed),
-    )
+    (STALE.load(Ordering::Relaxed), REFRESHED.load(Ordering::Relaxed), CHANGED.load(Ordering::Relaxed))
 }
 
 /// What identifies a translation beside its container: the translator's
@@ -280,9 +276,7 @@ fn cached_by(
                 }
                 static SAID: AtomicBool = AtomicBool::new(false);
                 if !SAID.swap(true, Ordering::Relaxed) {
-                    tracing::info!(
-                        "shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again"
-                    );
+                    tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
                 }
             }
             if let Some(old) = old.take() {
@@ -473,15 +467,15 @@ fn decode(bytes: &[u8]) -> Option<(HostShader, Vec<u8>)> {
     }
     r.0.is_empty().then_some((
         HostShader {
-            stage,
-            dxil,
-            user_data,
-            samplers,
-            static_samplers,
-            root_cbvs,
-            root_srvs,
-            root_uavs,
-            root_indexed_views,
+        stage,
+        dxil,
+        user_data,
+        samplers,
+        static_samplers,
+        root_cbvs,
+        root_srvs,
+        root_uavs,
+        root_indexed_views,
         },
         made_by,
     ))
@@ -532,36 +526,21 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
-        assert_eq!(
-            cached(&cache, &build, container, translate, false),
-            Ok(shader())
-        );
-        assert_eq!(
-            cached(&cache, &build, container, translate, false),
-            Ok(shader())
-        );
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 1, "the second came from disk");
 
         // Another build translates again.
-        assert_eq!(
-            cached(&cache, &[8; 32], container, translate, false),
-            Ok(shader())
-        );
+        assert_eq!(cached(&cache, &[8; 32], container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
             std::fs::write(e, b"VSH2 broken").unwrap();
         }
-        assert_eq!(
-            cached(&cache, &build, container, translate, false),
-            Ok(shader())
-        );
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
-        assert_eq!(
-            cached(&cache, &build, container, translate, false),
-            Ok(shader())
-        );
+        assert_eq!(cached(&cache, &build, container, translate, false), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
 
         // Failures are not stored.
@@ -613,38 +592,23 @@ mod tests {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(old())
         };
-        assert_eq!(
-            cached_by(&cache, &build, "build a", container, first, false),
-            Ok(old())
-        );
+        assert_eq!(cached_by(&cache, &build, "build a", container, first, false), Ok(old()));
         let now = |_: &[u8]| {
             runs.fetch_add(1, Ordering::Relaxed);
             Ok(shader())
         };
         let (stale, refreshed, changed) = stale_counts();
         // The next build, same version: the old translation, not translated.
-        assert_eq!(
-            cached_by(&cache, &build, "build b", container, now, false),
-            Ok(old())
-        );
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, false), Ok(old()));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         // Refreshing: translated again and kept.
-        assert_eq!(
-            cached_by(&cache, &build, "build b", container, now, true),
-            Ok(shader())
-        );
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // Now the entry is this build's: served when refreshing too.
-        assert_eq!(
-            cached_by(&cache, &build, "build b", container, now, true),
-            Ok(shader())
-        );
+        assert_eq!(cached_by(&cache, &build, "build b", container, now, true), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 2);
         // (Other tests count too; these at least.)
         let (s, r, c) = stale_counts();
-        assert!(
-            s >= stale + 2 && r > refreshed && c > changed,
-            "{s} {r} {c}"
-        );
+        assert!(s >= stale + 2 && r > refreshed && c > changed, "{s} {r} {c}");
     }
 }

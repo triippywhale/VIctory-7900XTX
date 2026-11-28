@@ -48,8 +48,7 @@ const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
 /// out of a host copy, and texture copies out of one.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -125,24 +124,14 @@ pub(super) enum Waits {
 /// before.)
 pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
     static ALL: OnceLock<bool> = OnceLock::new();
-    let all =
-        *ALL.get_or_init(|| std::env::var_os("VICTORY_PLACED_READERS").is_some_and(|v| v == "0"));
+    let all = *ALL.get_or_init(|| std::env::var_os("VICTORY_PLACED_READERS").is_some_and(|v| v == "0"));
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let waits = |p: &Placed| matches!(p.waits(written), Waits::ForReaders);
     if all {
         for list in runs {
             let steps = &list.deferred().copies;
-            let placed = steps.iter().filter_map(|s| {
-                if let Step::Placed(p) = s {
-                    Some(p)
-                } else {
-                    None
-                }
-            });
-            let placed: Vec<_> = placed
-                .filter(|p| waits(p))
-                .map(|p| (p.dst, p.dst + p.len))
-                .collect();
+            let placed = steps.iter().filter_map(|s| if let Step::Placed(p) = s { Some(p) } else { None });
+            let placed: Vec<_> = placed.filter(|p| waits(p)).map(|p| (p.dst, p.dst + p.len)).collect();
             join_ranges(&mut ranges, placed);
         }
     }
@@ -181,8 +170,7 @@ pub(super) fn read_by(runs: &[&HostList], written: &[(usize, usize)]) -> bool {
 /// ([`read_by`]) since the last frame line: another such copy, a buffer copy,
 /// a fill, a texture, a step of ours.
 #[cfg(feature = "diagnostics")]
-pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(super) static READERS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Everything recorded so far is done, and seen, before what follows.
 ///
@@ -277,12 +265,7 @@ impl HostList {
         let Some(to) = to.filter(|s| !s.in_place()) else {
             #[cfg(feature = "diagnostics")]
             if builder {
-                crate::memory::trace_results_copy(
-                    dst,
-                    src,
-                    len,
-                    "not placed (no copy of the destination)",
-                );
+                crate::memory::trace_results_copy(dst, src, len, "not placed (no copy of the destination)");
             }
             return false;
         };
@@ -313,28 +296,18 @@ impl HostList {
                         return false;
                     };
                     unsafe {
-                        self.list
-                            .CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
-                        self.list.ResourceBarrier(&[transition(
-                            &between,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        )]);
+                        self.list.CopyBufferRegion(&between, 0, &from.buffer, offset, len as u64);
+                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                         wait_for_all(host, &self.list);
-                        self.list
-                            .CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
+                        self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
                     }
                 } else {
-                    unsafe {
-                        self.list
-                            .CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64)
-                    };
+                    unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
             (None, Some((from, offset, _))) => unsafe {
-                self.list
-                    .CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
+                self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
             },
             (None, None) => return false,
         }
@@ -360,14 +333,7 @@ impl HostList {
     /// into the host copy `to` at its address `dst`: what shaders wrote into
     /// a title buffer's own copy, for the by-address copy of a page the
     /// buffer shares. `false` if nothing was recorded.
-    pub(crate) fn mirror_copy(
-        &self,
-        from: &std::sync::Arc<Shadow>,
-        src: u64,
-        to: &std::sync::Arc<Shadow>,
-        dst: u64,
-        len: u64,
-    ) -> bool {
+    pub(crate) fn mirror_copy(&self, from: &std::sync::Arc<Shadow>, src: u64, to: &std::sync::Arc<Shadow>, dst: u64, len: u64) -> bool {
         let Some(host) = host() else {
             return false;
         };
@@ -388,13 +354,7 @@ impl HostList {
         // them (checked above).
         unsafe {
             wait_for_all(host, &self.list);
-            self.list.CopyBufferRegion(
-                &to.buffer,
-                to.offset(dst),
-                &from.buffer,
-                from.offset(src),
-                len,
-            );
+            self.list.CopyBufferRegion(&to.buffer, to.offset(dst), &from.buffer, from.offset(src), len);
             wait_for_all(host, &self.list);
         }
         self.changed_something();
@@ -416,18 +376,8 @@ impl HostList {
         // SAFETY: an open list; live buffers, ranges inside them.
         unsafe {
             wait_for_all(host, &self.list);
-            self.list.CopyBufferRegion(
-                &between,
-                0,
-                &from.buffer,
-                from.offset(src as u64),
-                len as u64,
-            );
-            self.list.ResourceBarrier(&[transition(
-                &between,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
+            self.list.CopyBufferRegion(&between, 0, &from.buffer, from.offset(src as u64), len as u64);
+            self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
             wait_for_all(host, &self.list);
         }
         Some(between)
@@ -478,13 +428,7 @@ impl HostList {
         // promoted by the copy.
         unsafe {
             wait_for_all(host, &self.list);
-            self.list.CopyBufferRegion(
-                &buffer,
-                0,
-                &shadow.buffer,
-                shadow.offset(src as u64),
-                len as u64,
-            );
+            self.list.CopyBufferRegion(&buffer, 0, &shadow.buffer, shadow.offset(src as u64), len as u64);
             self.list.ResourceBarrier(&[transition(
                 &buffer,
                 D3D12_RESOURCE_STATE_COPY_DEST,

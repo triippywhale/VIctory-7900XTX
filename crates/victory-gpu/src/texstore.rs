@@ -70,47 +70,26 @@ pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 fn line_of(key: &Key, entry: &Entry) -> String {
     format!(
         "{} {} {} {} {} {:032x} {:032x} {}",
-        key.shape[0],
-        key.shape[1],
-        key.shape[2],
-        key.shape[3],
-        key.level,
-        key.digest,
-        entry.blob,
-        entry.levels
+        key.shape[0], key.shape[1], key.shape[2], key.shape[3], key.level, key.digest, entry.blob, entry.levels
     )
 }
 
 fn parse_line(line: &str) -> Option<(Key, Entry)> {
     let mut p = line.split_whitespace();
     let mut n = || p.next();
-    let shape = [
-        n()?.parse().ok()?,
-        n()?.parse().ok()?,
-        n()?.parse().ok()?,
-        n()?.parse().ok()?,
-    ];
+    let shape = [n()?.parse().ok()?, n()?.parse().ok()?, n()?.parse().ok()?, n()?.parse().ok()?];
     let level = n()?.parse().ok()?;
     let digest = u128::from_str_radix(n()?, 16).ok()?;
     let blob = u128::from_str_radix(n()?, 16).ok()?;
     let levels = n()?.parse().ok()?;
-    Some((
-        Key {
-            shape,
-            level,
-            digest,
-        },
-        Entry { blob, levels },
-    ))
+    Some((Key { shape, level, digest }, Entry { blob, levels }))
 }
 
 fn store() -> Option<&'static Store> {
     static STORE: OnceLock<Option<Store>> = OnceLock::new();
     STORE
         .get_or_init(|| {
-            let folder = PathBuf::from(
-                std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?,
-            );
+            let folder = PathBuf::from(std::env::var_os("VICTORY_TEXTURE_STORE").filter(|v| !v.is_empty() && v != "0")?);
             std::fs::create_dir_all(&folder).ok()?;
             let mut index = HashMap::new();
             if let Ok(text) = std::fs::read_to_string(folder.join("index.txt")) {
@@ -130,10 +109,8 @@ fn store() -> Option<&'static Store> {
             std::thread::Builder::new()
                 .name("texture store".into())
                 .spawn(move || {
-                    let Ok(mut index) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(to.join("index.txt"))
+                    let Ok(mut index) =
+                        std::fs::OpenOptions::new().create(true).append(true).open(to.join("index.txt"))
                     else {
                         return;
                     };
@@ -148,9 +125,7 @@ fn store() -> Option<&'static Store> {
                         let path = to.join(format!("{blob:032x}.lv"));
                         if !path.exists() {
                             let part = to.join(format!("{blob:032x}.part"));
-                            if std::fs::write(&part, &bytes[..]).is_err()
-                                || std::fs::rename(&part, &path).is_err()
-                            {
+                            if std::fs::write(&part, &bytes[..]).is_err() || std::fs::rename(&part, &path).is_err() {
                                 continue;
                             }
                             STATS[5].fetch_add(bytes.len() as u64, Relaxed);
@@ -196,36 +171,16 @@ pub(crate) fn key_levels(layout: &victory_formats::texture::Layout, mips: u32) -
 /// `parts` where the host lays out each of its levels (offset, row pitch,
 /// rows). Detiled and kept on the store's thread, unless that content is
 /// known.
-pub(crate) fn keep(
-    shape: Shape,
-    layout: &victory_formats::texture::Layout,
-    tiled: &[u8],
-    parts: Vec<(u64, u32, u32)>,
-) {
+pub(crate) fn keep(shape: Shape, layout: &victory_formats::texture::Layout, tiled: &[u8], parts: Vec<(u64, u32, u32)>) {
     let Some(store) = store() else {
         return;
     };
     let blob = crate::texture::digest(tiled).0;
-    if !store
-        .seen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(blob)
-    {
+    if !store.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(blob) {
         return;
     }
-    let job = Job {
-        shape,
-        layout: layout.clone(),
-        tiled: tiled.to_vec(),
-        parts,
-        blob,
-    };
-    let _ = store
-        .jobs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .send(job);
+    let job = Job { shape, layout: layout.clone(), tiled: tiled.to_vec(), parts, blob };
+    let _ = store.jobs.lock().unwrap_or_else(|e| e.into_inner()).send(job);
 }
 
 /// A texture to keep ([`keep`]).
@@ -240,24 +195,14 @@ struct Job {
 /// [`keep`]'s work, on the store's thread: the levels detiled as the host
 /// lays them out, the keys, memory, and what goes to the folder.
 fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)>)> {
-    let Job {
-        shape,
-        layout,
-        tiled,
-        parts,
-        blob,
-    } = job;
+    let Job { shape, layout, tiled, parts, blob } = job;
     let keys = key_levels(&layout, shape[3]);
     let &(top, _) = keys.iter().max_by_key(|(k, _)| *k)?;
     let end = parts.get(top as usize)?.0 as usize;
     let made: Vec<Key> = keys
         .iter()
         .filter(|&&(_, bytes)| bytes as usize <= tiled.len())
-        .map(|&(level, bytes)| Key {
-            shape,
-            level,
-            digest: crate::texture::digest(&tiled[..bytes as usize]).0,
-        })
+        .map(|&(level, bytes)| Key { shape, level, digest: crate::texture::digest(&tiled[..bytes as usize]).0 })
         .collect();
     {
         let index = store.index.lock().unwrap_or_else(|e| e.into_inner());
@@ -270,23 +215,10 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
     for (i, &(at, pitch, rows)) in parts.iter().take(top as usize).enumerate() {
         let (at, pitch, rows) = (at as usize, pitch as usize, rows as usize);
         let len = (pitch * rows).min(end.saturating_sub(at));
-        layout
-            .detile(&tiled, i as u32, 0, &mut levels[at..at + len], pitch, len)
-            .ok()?;
+        layout.detile(&tiled, i as u32, 0, &mut levels[at..at + len], pitch, len).ok()?;
     }
     let bytes = Arc::new(levels);
-    let entries: Vec<(Key, Entry)> = made
-        .into_iter()
-        .map(|k| {
-            (
-                k,
-                Entry {
-                    blob,
-                    levels: k.level,
-                },
-            )
-        })
-        .collect();
+    let entries: Vec<(Key, Entry)> = made.into_iter().map(|k| (k, Entry { blob, levels: k.level })).collect();
     {
         let mut index = store.index.lock().unwrap_or_else(|e| e.into_inner());
         for (k, e) in &entries {
@@ -295,11 +227,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
     }
     if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
         store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-        store
-            .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(blob, bytes.clone());
+        store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
     }
     STATS[1].fetch_add(1, Relaxed);
     Some((blob, bytes, entries))
@@ -311,38 +239,20 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
 pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u8>>> {
     let store = store()?;
     STATS[2].fetch_add(1, Relaxed);
-    let key = Key {
-        shape,
-        level,
-        digest: crate::texture::digest(smaller).0,
-    };
-    let entry = *store
-        .index
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)?;
+    let key = Key { shape, level, digest: crate::texture::digest(smaller).0 };
+    let entry = *store.index.lock().unwrap_or_else(|e| e.into_inner()).get(&key)?;
     if entry.levels != level {
         return None;
     }
-    let kept = store
-        .kept
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&entry.blob)
-        .cloned();
+    let kept = store.kept.lock().unwrap_or_else(|e| e.into_inner()).get(&entry.blob).cloned();
     let bytes = match kept {
         Some(bytes) => bytes,
         None => {
-            let bytes =
-                Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
+            let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
             if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
                 store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-                store
-                    .kept
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(entry.blob, bytes.clone());
+                store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
             }
             bytes
         }
@@ -354,8 +264,7 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
 /// The line for the memory lines.
 pub(crate) fn line() -> Option<String> {
     let store = store()?;
-    let [at_start, kept, asked, found, read, written] =
-        [0, 1, 2, 3, 4, 5].map(|i| STATS[i].load(Relaxed));
+    let [at_start, kept, asked, found, read, written] = [0, 1, 2, 3, 4, 5].map(|i| STATS[i].load(Relaxed));
     Some(format!(
         "texture store (VICTORY_TEXTURE_STORE), since the start: {at_start} keys from earlier runs, {kept} textures kept \
          ({} MB written, {} MB held in memory), {asked} first views from a smaller level asked, {found} found ({read} read \
@@ -375,15 +284,8 @@ mod tests {
 
     #[test]
     fn index_lines_read_back() {
-        let key = Key {
-            shape: [1024, 512, 71, 11],
-            level: 3,
-            digest: 0x0123_4567_89ab_cdef_0011_2233_4455_6677,
-        };
-        let entry = Entry {
-            blob: 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100,
-            levels: 3,
-        };
+        let key = Key { shape: [1024, 512, 71, 11], level: 3, digest: 0x0123_4567_89ab_cdef_0011_2233_4455_6677 };
+        let entry = Entry { blob: 0xffee_ddcc_bbaa_9988_7766_5544_3322_1100, levels: 3 };
         let (k, e) = parse_line(&line_of(&key, &entry)).expect("a line");
         assert_eq!(k, key);
         assert_eq!((e.blob, e.levels), (entry.blob, entry.levels));

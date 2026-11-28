@@ -43,9 +43,7 @@ const JOB: usize = 256 << 10;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_LAND").is_none_or(|v| v != "0")
-            && crate::safecopy::on()
-            && crate::shadow::exact_back()
+        std::env::var_os("VICTORY_LAND").is_none_or(|v| v != "0") && crate::safecopy::on() && crate::shadow::exact_back()
     })
 }
 
@@ -53,16 +51,8 @@ pub(crate) fn on() -> bool {
 fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
-        let asked = std::env::var("VICTORY_LAND_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok());
-        asked
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(2, |n| n.get() / 4)
-                    .clamp(1, 4)
-            })
-            .clamp(1, 16)
+        let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
+        asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
     })
 }
 
@@ -143,10 +133,7 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
-    let t: Vec<f64> = TAKEN
-        .iter()
-        .map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames)
-        .collect();
+    let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(
             "blocks landed in beside the guards per frame: {:.0}, {:.0} of them held by the copy they were landed through, which takes \
@@ -156,10 +143,7 @@ pub(crate) fn log(frames: f64) {
             u8::from(taken()),
         );
     }
-    let s: Vec<f64> = STATS
-        .iter()
-        .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames)
-        .collect();
+    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
     }
@@ -245,13 +229,7 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State {
-                work: None,
-                next: 0,
-                count: 0,
-                running: 0,
-                panicked: false,
-            }),
+            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
             idle: Condvar::new(),
             turn: Mutex::new(()),
@@ -259,18 +237,16 @@ impl Pool {
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
-            let _ = std::thread::Builder::new()
-                .name(format!("{name}-{i}"))
-                .spawn(move || {
-                    if name == "victory-land" {
-                        crate::cores::keep_helper_on_fast_cores(name);
-                        crate::cores::ahead(name);
-                    } else {
-                        crate::cores::keep_many_on_fast_cores(name);
-                        crate::cores::many_ahead(name);
-                    }
-                    pool.help()
-                });
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                if name == "victory-land" {
+                    crate::cores::keep_helper_on_fast_cores(name);
+                    crate::cores::ahead(name);
+                } else {
+                    crate::cores::keep_many_on_fast_cores(name);
+                    crate::cores::many_ahead(name);
+                }
+                pool.help()
+            });
         }
         pool
     }
@@ -286,8 +262,7 @@ impl Pool {
             drop(state);
             let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
-            let ran =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
             working.end();
             state = self.state();
             state.running -= 1;
@@ -309,12 +284,7 @@ impl Pool {
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.
-        let work = Work(unsafe {
-            std::mem::transmute::<
-                *const (dyn Fn(usize) + Sync + '_),
-                *const (dyn Fn(usize) + Sync + 'static),
-            >(f)
-        });
+        let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
         let mut state = self.state();
         (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
         drop(state);
@@ -325,9 +295,7 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else {
-                    break;
-                };
+                let Some((_, i)) = take(&mut self.state()) else { break };
                 f(i);
             }
         }));
@@ -359,8 +327,7 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new("victory-land", threads()))
-        .each(count, f);
+    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
@@ -368,10 +335,7 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(6usize);
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
@@ -386,18 +350,8 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let threads = std::env::var("VICTORY_VIEW_THREADS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(if records { 6usize } else { 4 });
-            Pool::new(
-                if records {
-                    "victory-records"
-                } else {
-                    "victory-views"
-                },
-                threads.clamp(1, 16),
-            )
+            let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(if records { 6usize } else { 4 });
+            Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))
         })
         .each(count, f);
 }
@@ -498,10 +452,7 @@ impl Had {
     /// piece.
     pub(crate) fn holds(&self, fence: u64, (copy, at, len): Piece) -> bool {
         self.0.iter().any(|(behind, all)| {
-            *behind >= fence
-                && all
-                    .get(&(copy, at / BLOCK))
-                    .is_some_and(|had| had.0 <= at && at + len <= had.1)
+            *behind >= fence && all.get(&(copy, at / BLOCK)).is_some_and(|had| had.0 <= at && at + len <= had.1)
         })
     }
 }
@@ -584,10 +535,7 @@ impl Notes {
                 if !copy.is_null() && through.all(|other| other == copy) {
                     // SAFETY: the job holds its copies until this is done.
                     let copy = unsafe { &*copy };
-                    TAKEN[1].fetch_add(
-                        u64::from(copy.landed(block, before, now)),
-                        Ordering::Relaxed,
-                    );
+                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
                 }
             }
         }
@@ -641,23 +589,10 @@ unsafe fn piece_at(
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
-    let reading = beside
-        .then(crate::watch::title_memory_reading_now)
-        .flatten();
-    let beside = if reading.is_some() || beside && anytime() {
-        crate::inplace::beside(title, end)
-    } else {
-        None
-    };
+    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
     count(stat::PIECES, 1);
-    count(
-        if beside.is_some() {
-            stat::BESIDE
-        } else {
-            stat::DIRECT
-        },
-        1,
-    );
+    count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
@@ -676,10 +611,7 @@ unsafe fn piece_at(
             return 0;
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
-        let (from, to) = (
-            ((base + first) * PAGE).max(title),
-            ((base + last + 1) * PAGE).min(title + end),
-        );
+        let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
@@ -695,15 +627,7 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let merge = |take| unsafe {
-            crate::safecopy::merge(
-                into.wrapping_add(from) as *mut u8,
-                now.add(from),
-                held.add(from),
-                n,
-                take,
-            )
-        };
+        let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
         let mut done = merge(take && beside.is_some());
         if !done.there && beside.is_none() {
             // Away only while the runtime changes a mapping beside it: the

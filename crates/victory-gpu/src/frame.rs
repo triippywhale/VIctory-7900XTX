@@ -49,11 +49,7 @@ fn asked() -> Option<Duration> {
 /// `16.667` → 16,667 us; 0 → zero; negative, more than a second or not a
 /// number → `None`.
 fn parse_ms(spec: &str) -> Option<Duration> {
-    let ms = spec
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
+    let ms = spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
     Some(Duration::from_nanos((ms * 1e6).round() as u64))
 }
 
@@ -273,10 +269,7 @@ mod pace {
         });
         if let Some(last) = s.last.replace(now) {
             let ms = (now - last).as_secs_f64() * 1e3;
-            let band = BANDS
-                .iter()
-                .position(|&edge| ms < edge)
-                .unwrap_or(BANDS.len());
+            let band = BANDS.iter().position(|&edge| ms < edge).unwrap_or(BANDS.len());
             s.bands[band] += 1;
             s.sum_ms += ms;
             s.max_ms = s.max_ms.max(ms);

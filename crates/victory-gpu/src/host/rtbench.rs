@@ -86,17 +86,9 @@ fn dxc() -> Option<std::path::PathBuf> {
         return Some(p.into());
     }
     let bin = std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin");
-    let mut versions: Vec<_> = std::fs::read_dir(bin)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .collect();
+    let mut versions: Vec<_> = std::fs::read_dir(bin).ok()?.filter_map(Result::ok).map(|e| e.path()).collect();
     versions.sort();
-    versions
-        .into_iter()
-        .rev()
-        .map(|v| v.join(r"x64\dxc.exe"))
-        .find(|p| p.exists())
+    versions.into_iter().rev().map(|v| v.join(r"x64\dxc.exe")).find(|p| p.exists())
 }
 
 #[test]
@@ -119,11 +111,7 @@ fn bench_title_memory_reads() {
         .arg(dir.join("b.hlsl"))
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let code = std::fs::read(dir.join("b.cso")).unwrap();
     let device = &host.device;
     // SAFETY: plain object creation with valid descriptions; everything
@@ -146,12 +134,9 @@ fn bench_title_memory_reads() {
                 ..Default::default()
             })
             .unwrap();
-        let allocator: ID3D12CommandAllocator = device
-            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .unwrap();
-        let list: ID3D12GraphicsCommandList = device
-            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-            .unwrap();
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
         let event = CreateEventW(None, false, false, None).unwrap();
         let frequency = queue.GetTimestampFrequency().unwrap() as f64;
@@ -185,26 +170,14 @@ fn bench_title_memory_reads() {
             *words.add((dir_bytes / 4) as usize + i) = x;
         }
         let directory = host.uav_buffer(dir_bytes).unwrap();
-        let copies: Vec<ID3D12Resource> = (0..COPIES)
-            .map(|_| host.uav_buffer(node_bytes).unwrap())
-            .collect();
+        let copies: Vec<ID3D12Resource> = (0..COPIES).map(|_| host.uav_buffer(node_bytes).unwrap()).collect();
         let outb = host.uav_buffer(u64::from(THREADS) * 4).unwrap();
         list.CopyBufferRegion(&directory, 0, &up, 0, dir_bytes);
         for c in &copies {
             list.CopyBufferRegion(c, 0, &up, dir_bytes, node_bytes);
         }
-        let mut barriers = vec![transition(
-            &directory,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-        )];
-        barriers.extend(copies.iter().map(|c| {
-            transition(
-                c,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            )
-        }));
+        let mut barriers = vec![transition(&directory, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)];
+        barriers.extend(copies.iter().map(|c| transition(c, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)));
         list.ResourceBarrier(&barriers);
         run(&list, &mut done);
         let heap: ID3D12DescriptorHeap = device
@@ -215,13 +188,9 @@ fn bench_title_memory_reads() {
                 NodeMask: 0,
             })
             .unwrap();
-        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
-            as usize;
+        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
         let start = heap.GetCPUDescriptorHandleForHeapStart();
-        for (i, (buffer, bytes)) in std::iter::once((&directory, dir_bytes))
-            .chain(copies.iter().map(|c| (c, node_bytes)))
-            .enumerate()
-        {
+        for (i, (buffer, bytes)) in std::iter::once((&directory, dir_bytes)).chain(copies.iter().map(|c| (c, node_bytes))).enumerate() {
             device.CreateShaderResourceView(
                 buffer,
                 Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -237,21 +206,12 @@ fn bench_title_memory_reads() {
                         },
                     },
                 }),
-                D3D12_CPU_DESCRIPTOR_HANDLE {
-                    ptr: start.ptr + i * step,
-                },
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + i * step },
             );
         }
         let mut stamps: Option<ID3D12QueryHeap> = None;
         device
-            .CreateQueryHeap(
-                &D3D12_QUERY_HEAP_DESC {
-                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-                    Count: 2,
-                    NodeMask: 0,
-                },
-                &mut stamps,
-            )
+            .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut stamps)
             .unwrap();
         let stamps = stamps.unwrap();
         let back = host.read_back_buffer(16).unwrap();
@@ -259,12 +219,7 @@ fn bench_title_memory_reads() {
             list.SetComputeRootSignature(&root);
             list.SetPipelineState(&pso);
             list.SetDescriptorHeaps(&[Some(heap.clone())]);
-            list.SetComputeRoot32BitConstants(
-                0,
-                4,
-                [mode, STEPS, NODES - 1, spread].as_ptr().cast(),
-                0,
-            );
+            list.SetComputeRoot32BitConstants(0, 4, [mode, STEPS, NODES - 1, spread].as_ptr().cast(), 0);
             list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
             list.SetComputeRootUnorderedAccessView(2, outb.GetGPUVirtualAddress());
             list.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -295,10 +250,7 @@ fn bench_title_memory_reads() {
         for (name, mode, spread) in cases {
             let mut t: Vec<f64> = (0..5).map(|_| time(mode, spread)).collect();
             t.sort_by(f64::total_cmp);
-            println!(
-                "{name}: {:.2} ms (median of 5; {STEPS} nodes a thread, {THREADS} threads)",
-                t[2]
-            );
+            println!("{name}: {:.2} ms (median of 5; {STEPS} nodes a thread, {THREADS} threads)", t[2]);
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

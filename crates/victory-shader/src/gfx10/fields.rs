@@ -871,7 +871,13 @@ mod tests {
         let Fields::Image { addr, .. } = inst.fields(false) else {
             panic!("expected Fields::Image");
         };
-        assert_eq!(addr, vec![Operand::Vector { reg: 10, dwords: 4 }]);
+        assert_eq!(
+            addr,
+            vec![Operand::Vector {
+                reg: 10,
+                dwords: 4
+            }]
+        );
 
         // NSA mode (nsaddr=1 -> 1 extra dword w2 carrying VGPRs 11, 12, 13):
         // Must decode exactly 4 VGPRs (v10, v11, v12, v13) without reading past words.len() into v0.

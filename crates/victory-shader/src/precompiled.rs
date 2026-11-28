@@ -109,10 +109,7 @@ fn layout(used: &[[u8; 20]]) -> Vec<[u8; 20]> {
             // Immediate samplers are in the code; heaps by index.
             _ => continue,
         };
-        if out
-            .iter()
-            .any(|e| e[17] == slot && e[0..4] == root.to_le_bytes())
-        {
+        if out.iter().any(|e| e[17] == slot && e[0..4] == root.to_le_bytes()) {
             continue;
         }
         let mut e = [0u8; 20];
@@ -131,15 +128,9 @@ fn layout(used: &[[u8; 20]]) -> Vec<[u8; 20]> {
 /// as the console's compute programs seen do (one reads lane 36).
 fn wave64(code: &[u8]) -> bool {
     use crate::gfx10::{Fields, Operand};
-    let Ok(insts) = crate::gfx10::decode(code) else {
-        return true;
-    };
+    let Ok(insts) = crate::gfx10::decode(code) else { return true };
     for i in &insts {
-        let Fields::Sop {
-            dst: Some(Operand::Scalar { code: 126, .. }),
-            ..
-        } = i.fields(true)
-        else {
+        let Fields::Sop { dst: Some(Operand::Scalar { code: 126, .. }), .. } = i.fields(true) else {
             continue;
         };
         let name = i.name().unwrap_or("");
@@ -167,11 +158,7 @@ const KIND_NATIVE: u32 = 0x0d;
 
 /// A container holding the compute program `code`, with its settings
 /// (the 0x1c-byte part) and binding table, for the translator.
-pub fn compute_container(
-    settings: &[u8],
-    code: &[u8],
-    table: &[u8],
-) -> Result<Vec<u8>, ShaderError> {
+pub fn compute_container(settings: &[u8], code: &[u8], table: &[u8]) -> Result<Vec<u8>, ShaderError> {
     if settings.len() < 0x1c {
         return Err(Malformed("compute settings too short"));
     }
@@ -256,11 +243,7 @@ fn fssm(slot: usize, p: &Program) -> Vec<u8> {
 fn container(fssm: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; zlib_rs::compress_bound(fssm.len())];
     let (stream, rc) = zlib_rs::compress_slice(&mut buf, fssm, zlib_rs::DeflateConfig::new(1));
-    assert_eq!(
-        rc,
-        zlib_rs::ReturnCode::Ok,
-        "deflating into a buffer of the bound"
-    );
+    assert_eq!(rc, zlib_rs::ReturnCode::Ok, "deflating into a buffer of the bound");
     let mut blob = b"XBCH".to_vec();
     blob.extend_from_slice(&XBCH_VERSION.to_le_bytes());
     blob.extend_from_slice(&(stream.len() as u64).to_le_bytes());

@@ -117,9 +117,9 @@ fn program_rounds(wide: bool, descriptor: Descriptor, rounds: Option<u32>) -> Ve
     if let Some(rounds) = rounds {
         assert!((1..=64).contains(&rounds));
         w.extend([
-            0x8115_8115,                        // s_add_i32 s21, s21, 1
+            0x8115_8115,                  // s_add_i32 s21, s21, 1
             0xBF0A_0015 | (0x80 + rounds) << 8, // s_cmp_lt_u32 s21, rounds
-            0xBF85_FFF8,                        // s_cbranch_scc1 back to the instruction
+            0xBF85_FFF8,                  // s_cbranch_scc1 back to the instruction
         ]);
     }
     w.extend([
@@ -322,14 +322,7 @@ fn scene() -> (Scene, Vec<Vec<Case>>) {
     // A child that is not there with inverted infinite bounds (the title's
     // builder leaves such slots): every ray "enters" it at minus infinity.
     let mut empty = lined;
-    empty[1] = [
-        f32::INFINITY,
-        f32::INFINITY,
-        f32::INFINITY,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-        f32::NEG_INFINITY,
-    ];
+    empty[1] = [f32::INFINITY, f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     let ids3 = [0x105, bvh::NONE, 0x304, 0x400];
     box_nodes.push((s.add(nodes::box32(ids3, empty), 32), 5));
     // Partial-axis NaN and inverted/empty boxes alongside a zero-thickness box.
@@ -661,11 +654,7 @@ fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
 /// else. Lanes masked out keep what they had.
 fn run_limited(rounds: u32, limit: u32) {
     super::TEST_WALK_LIMIT.set(Some(limit));
-    let built = build_compute_shader(&native(&program_rounds(
-        true,
-        Descriptor::Table,
-        Some(rounds),
-    )));
+    let built = build_compute_shader(&native(&program_rounds(true, Descriptor::Table, Some(rounds))));
     super::TEST_WALK_LIMIT.set(None);
     let (shader, res) = built.expect("the program lowers");
     assert_eq!(res.bvh.len(), 1);
@@ -712,8 +701,7 @@ fn run_limited(rounds: u32, limit: u32) {
                 let want = batch.get(t).map_or(BEFORE, &want);
                 let got = &out[0][4 * t..4 * t + 4];
                 assert_eq!(
-                    got,
-                    want,
+                    got, want,
                     "{label}, {rounds} rounds, limit {limit}, batch {b} thread {t}: {:x?}",
                     batch.get(t)
                 );
@@ -747,8 +735,7 @@ fn the_walk_limit_leaves_a_program_without_a_loop_and_one_without_the_switch_alo
     assert_eq!(limited.unwrap(), plain, "no loop: nothing to count");
     let looped = |limit| {
         super::TEST_WALK_LIMIT.set(limit);
-        let built =
-            build_compute_shader(&native(&program_rounds(true, Descriptor::Table, Some(3))));
+        let built = build_compute_shader(&native(&program_rounds(true, Descriptor::Table, Some(3))));
         super::TEST_WALK_LIMIT.set(None);
         built.unwrap().0.dxil
     };
@@ -765,8 +752,7 @@ fn the_meter_counts_children_entered_and_pages_with_no_copy_in_every_form() {
             for rounds in [None, Some(3)] {
                 let built = |walk| {
                     super::TEST_WALK.set(walk);
-                    let b =
-                        build_compute_shader(&native(&program_rounds(wide, descriptor, rounds)));
+                    let b = build_compute_shader(&native(&program_rounds(wide, descriptor, rounds)));
                     super::TEST_WALK.set(false);
                     b.unwrap().0
                 };
@@ -892,16 +878,9 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
         0xBF81_0000, // s_endpgm
     ];
     let (shader, _) = build_compute_shader(&native(&words)).expect("the program lowers");
+    assert!(shader.root_srvs.contains(&SLOT_STRIDES), "{:?}", shader.root_srvs);
     assert!(
-        shader.root_srvs.contains(&SLOT_STRIDES),
-        "{:?}",
-        shader.root_srvs
-    );
-    assert!(
-        !shader
-            .user_data
-            .iter()
-            .any(|u| u.root == RootType::Other(super::USER_VIEW_ADDRESS)),
+        !shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_VIEW_ADDRESS)),
         "no host word for a fixed place"
     );
     let mut table = vec![0u32; SLOT_STRIDES_BYTES as usize / 4];
@@ -930,24 +909,12 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
                     // s0: the picked view's place in the table (slot 2).
                     roots: vec![
                         (0, Root::Constants(vec![2, 0, 0, 0, 0])),
-                        (
-                            1,
-                            Root::View {
-                                srv: true,
-                                data: table.clone(),
-                            },
-                        ),
+                        (1, Root::View { srv: true, data: table.clone() }),
                     ],
                     views: &[
-                        View::Buffer {
-                            data: &decoy,
-                            stride: Stride::Raw,
-                        },
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
                         View::RawUav(8 * THREADS),
-                        View::Buffer {
-                            data: &decoy,
-                            stride: Stride::Raw,
-                        },
+                        View::Buffer { data: &decoy, stride: Stride::Raw },
                     ],
                     samplers: &[],
                     groups: [1, 1, 1],
@@ -955,11 +922,7 @@ fn a_picked_views_address_comes_from_the_hosts_table() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         for t in 0..THREADS as usize {
-            assert_eq!(
-                out[0][2 * t..2 * t + 2],
-                [0x1234_5600, 0x42],
-                "{label} thread {t}"
-            );
+            assert_eq!(out[0][2 * t..2 * t + 2], [0x1234_5600, 0x42], "{label} thread {t}");
         }
         ran += 1;
     }
@@ -1015,9 +978,7 @@ fn mask_operations_on_a_joined_number_give_the_number() {
         let (root, pso) = match host.compute_pipeline(&shader) {
             Ok(x) => x,
             Err(e) => {
-                eprintln!(
-                    "the {label} device does not take this program (waves of 64?): {e}; not run"
-                );
+                eprintln!("the {label} device does not take this program (waves of 64?): {e}; not run");
                 continue;
             }
         };
@@ -1034,13 +995,7 @@ fn mask_operations_on_a_joined_number_give_the_number() {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants([&constants[..], &[0, 0]].concat()))],
-                        views: &[
-                            View::Buffer {
-                                data: &unused,
-                                stride: Stride::Raw,
-                            },
-                            View::RawUav(4 * THREADS),
-                        ],
+                        views: &[View::Buffer { data: &unused, stride: Stride::Raw }, View::RawUav(4 * THREADS)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },

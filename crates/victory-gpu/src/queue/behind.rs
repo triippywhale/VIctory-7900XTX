@@ -186,22 +186,13 @@ impl<W: Work> Lane<W> {
         state.runs += usize::from(what.runs());
         let number = state.next;
         state.next += 1;
-        state.items.push_back(Entry {
-            number,
-            queue,
-            what,
-            mark,
-        });
+        state.items.push_back(Entry { number, queue, what, mark });
     }
 
     /// Adds to the end of the line, and has it looked at.
     pub(super) fn push(&self, queue: usize, what: impl IntoIterator<Item = W>) {
         let what: Vec<W> = what.into_iter().collect();
-        let mark = if what.iter().any(W::runs) {
-            W::mark_now()
-        } else {
-            0
-        };
+        let mark = if what.iter().any(W::runs) { W::mark_now() } else { 0 };
         let mut state = self.lock();
         for what in what {
             Self::put(&mut state, queue, what, mark);
@@ -240,13 +231,8 @@ impl<W: Work> Lane<W> {
     /// Waits until everything in the line that is free to run has been done
     /// (what comes in after this call may not be).
     pub(super) fn drain(&self) {
-        let folded: Vec<W::Ask> = self
-            .lock()
-            .items
-            .iter()
-            .filter(|e| e.what.folded())
-            .filter_map(|e| e.what.ask())
-            .collect();
+        let folded: Vec<W::Ask> =
+            self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
         folded.iter().for_each(W::settle);
         let mut state = self.lock();
         if state.items.is_empty() && state.running.is_none() {
@@ -288,10 +274,8 @@ impl<W: Work> Lane<W> {
                     } else {
                         // It stands at something the CPU may write without
                         // a call of ours.
-                        let (back, out) = self
-                            .work
-                            .wait_timeout(state, Duration::from_millis(1))
-                            .unwrap_or_else(|e| e.into_inner());
+                        let (back, out) =
+                            self.work.wait_timeout(state, Duration::from_millis(1)).unwrap_or_else(|e| e.into_inner());
                         state = back;
                         if out.timed_out() {
                             break;
@@ -315,25 +299,12 @@ impl<W: Work> Lane<W> {
 
     /// The parts of `entry`, which stands for them, in place `at`.
     fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
-        let (number, queue, runs, mark) = (
-            entry.number,
-            entry.queue,
-            usize::from(entry.what.runs()),
-            entry.mark,
-        );
+        let (number, queue, runs, mark) = (entry.number, entry.queue, usize::from(entry.what.runs()), entry.mark);
         let parts = entry.what.unfold();
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
-            state.items.insert(
-                at + i,
-                Entry {
-                    number,
-                    queue,
-                    what,
-                    mark,
-                },
-            );
+            state.items.insert(at + i, Entry { number, queue, what, mark });
         }
     }
 
@@ -376,12 +347,7 @@ impl<W: Work> Lane<W> {
                     return false;
                 }
                 let state = self.lock();
-                if !super::forces()
-                    || !state
-                        .items
-                        .iter()
-                        .any(|e| e.number < limit && e.what.shows())
-                {
+                if !super::forces() || !state.items.iter().any(|e| e.number < limit && e.what.shows()) {
                     return false;
                 }
                 (first, true)
@@ -414,11 +380,7 @@ impl<W: Work> Lane<W> {
             // is found first).
             let mut state = self.lock();
             state.running = None;
-            let at = state
-                .items
-                .iter()
-                .position(|e| e.number > entry.number)
-                .unwrap_or(state.items.len());
+            let at = state.items.iter().position(|e| e.number > entry.number).unwrap_or(state.items.len());
             Self::unfold(&mut state, at, entry);
             drop(state);
             self.moved.notify_all();
@@ -430,10 +392,7 @@ impl<W: Work> Lane<W> {
         while runs > 0 && !forced {
             let next = {
                 let mut state = self.lock();
-                let at = state
-                    .items
-                    .iter()
-                    .position(|e| e.queue == entry.queue && e.number < limit);
+                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -450,12 +409,7 @@ impl<W: Work> Lane<W> {
                 state.items.insert(at, next);
                 break;
             }
-            let Entry {
-                number,
-                queue,
-                what,
-                mark: theirs,
-            } = next;
+            let Entry { number, queue, what, mark: theirs } = next;
             let waits = what.ask().is_some() && what.raises();
             match entry.what.take_along(what) {
                 Ok(run) => {
@@ -467,15 +421,7 @@ impl<W: Work> Lane<W> {
                     }
                 }
                 Err(what) => {
-                    self.lock().items.insert(
-                        at,
-                        Entry {
-                            number,
-                            queue,
-                            what,
-                            mark: theirs,
-                        },
-                    );
+                    self.lock().items.insert(at, Entry { number, queue, what, mark: theirs });
                     break;
                 }
             }
@@ -513,13 +459,7 @@ enum Job {
     Lists(usize, Recordings),
     /// Parts taken along with a submission ([`crate::host::joins`]): where they
     /// begin in the order, and the signals given behind them.
-    Joined(
-        usize,
-        Vec<crate::list::Detached>,
-        Vec<usize>,
-        Vec<usize>,
-        Vec<(crate::fence::FenceRef, u64)>,
-    ),
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(crate::fence::FenceRef, u64)>),
     /// A signal of the queue's (holding a reference on the fence until it
     /// is set).
     Signal(crate::fence::FenceRef, u64),
@@ -579,21 +519,13 @@ impl Work for Job {
     }
 
     fn mark_now() -> u64 {
-        if crate::port_journal::on() {
-            crate::descriptor::round_after_now()
-        } else {
-            0
-        }
+        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
     }
 
     fn mark_later() -> u64 {
         // (Asked for now: the round runs while the lane does what is before
         // the part behind the wait.)
-        if crate::port_journal::on() {
-            crate::descriptor::round_after_now()
-        } else {
-            0
-        }
+        if crate::port_journal::on() { crate::descriptor::round_after_now() } else { 0 }
     }
 
     fn raises(&self) -> bool {
@@ -635,9 +567,7 @@ impl Work for Job {
         // Nothing but waits and signals that a submission may follow.
         let (count, lists, signals) = match self {
             Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => {
-                (1 + parts.len(), (&*lists, &*order), &signals[..])
-            }
+            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
@@ -651,22 +581,14 @@ impl Work for Job {
                 }
             }
             &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value
-                    && !signals
-                        .iter()
-                        .any(|(f, v)| f.as_this() as usize == fence && *v >= value)
-                {
+                if crate::fence::completed(fence as This) < value && !signals.iter().any(|(f, v)| f.as_this() as usize == fence && *v >= value) {
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
-                let runs: Vec<&crate::host::HostList> =
-                    order.iter().map(|&i| more[i].host()).collect();
-                if count >= most
-                    || lists.1.len() + runs.len() > most_lists
-                    || !crate::host::joinable(hosts(), &runs)
-                {
+                let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
+                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
                     return Err(next);
                 }
             }
@@ -675,9 +597,7 @@ impl Work for Job {
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
             Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
-            Job::Joined(queue, lists, order, parts, signals) => {
-                (queue, lists, order, parts, signals)
-            }
+            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
             other => {
                 *self = other;
                 return Err(next);
@@ -712,9 +632,7 @@ impl Work for Job {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Forced, 1);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!("a queue still stood at a wait at a present: it was not met")
-            });
+            ONCE.call_once(|| tracing::warn!("a queue still stood at a wait at a present: it was not met"));
         }
         match self {
             // (A folded one is unfolded, never done.)
@@ -722,9 +640,7 @@ impl Work for Job {
             Job::Run(queue, lists, order) => {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
-                crate::capture::op(queue, || {
-                    format!("RUN submission of {} lists (its thread's)", order.len())
-                });
+                crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
                     Some(host) => host.execute_late(lists, order),
                     None => drop(lists),
@@ -735,11 +651,7 @@ impl Work for Job {
                 let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
-                    format!(
-                        "RUN {} parts of submissions in one, {} lists (its thread's)",
-                        1 + parts.len(),
-                        order.len()
-                    )
+                    format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
                 match crate::host::host() {
                     Some(host) => host.execute_parts(lists, order, &parts),
@@ -762,17 +674,9 @@ impl Work for Job {
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
-                    let state = if state == u32::MAX {
-                        texture.state.load(Relaxed)
-                    } else {
-                        state
-                    };
+                    let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
                     let over = overlay.as_ref().map(|(ov, ov_state)| {
-                        let st = if *ov_state == u32::MAX {
-                            ov.state.load(Relaxed)
-                        } else {
-                            *ov_state
-                        };
+                        let st = if *ov_state == u32::MAX { ov.state.load(Relaxed) } else { *ov_state };
                         (&ov.texture, st)
                     });
                     super::show_planes(&texture.texture, state, over, shown);
@@ -846,9 +750,7 @@ pub(super) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        (std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
-            || crate::list::thin::wanted())
-            && started()
+        (std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") || crate::list::thin::wanted()) && started()
     })
 }
 
@@ -967,10 +869,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
-    let first = lists
-        .iter()
-        .position(|&l| crate::list::cut_list(l))
-        .unwrap_or(lists.len());
+    let first = lists.iter().position(|&l| crate::list::cut_list(l)).unwrap_or(lists.len());
     #[cfg(feature = "diagnostics")]
     crate::capture::op(queue, || {
         let named: Vec<String> = lists
@@ -1014,12 +913,7 @@ pub(super) fn signal(this: This, fence: This, value: u64) {
 /// the fence is there already.
 pub(super) fn wait(this: This, fence: This, value: u64) {
     let always = crate::fence::completed(fence) < value;
-    LANE.push_behind(
-        this as usize,
-        always,
-        Job::Wait(fence as usize, value),
-        || {},
-    );
+    LANE.push_behind(this as usize, always, Job::Wait(fence as usize, value), || {});
 }
 
 /// A present on queue `this` of `texture`, in the state the lists recorded so
@@ -1108,11 +1002,7 @@ mod tests {
                     names.extend(more);
                     Ok(true)
                 }
-                T::Wait(f, v)
-                    if crate::fence::completed(f as This) >= v || signals.contains(&(f, v)) =>
-                {
-                    Ok(false)
-                }
+                T::Wait(f, v) if crate::fence::completed(f as This) >= v || signals.contains(&(f, v)) => Ok(false),
                 T::Signal(f, v, _) => {
                     signals.push((f, v));
                     Ok(false)
@@ -1217,10 +1107,7 @@ mod tests {
 
     fn fence() -> usize {
         let mut f = std::ptr::null();
-        assert_eq!(
-            crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f),
-            super::super::S_OK
-        );
+        assert_eq!(crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut f), super::super::S_OK);
         f as usize
     }
 
@@ -1244,15 +1131,10 @@ mod tests {
         // The compute queue waits for what the graphics queue signals later.
         lane.push(2, [T::Wait(f, 1), run("compute")]);
         lane.push(1, [run("draw 1")]);
-        lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || {
-            panic!("the queue is not empty")
-        });
+        lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || panic!("the queue is not empty"));
         lane.push(1, [run("draw 2")]);
         look(&lane);
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["draw 1", "signal 1", "compute", "draw 2"]
-        );
+        assert_eq!(*log.lock().unwrap(), ["draw 1", "signal 1", "compute", "draw 2"]);
         assert_eq!(value(f), 1);
         // Nothing in the line: a signal is at once.
         let mut done = false;
@@ -1269,46 +1151,16 @@ mod tests {
         let f = fence();
         let part = |name| T::Group(vec![name], log.clone(), Vec::new());
         lane.push(1, [part("a"), T::Wait(f, 0), part("b")]);
-        lane.push(
-            2,
-            [
-                part("other queue"),
-                T::Wait(f, 1),
-                part("behind a's signal"),
-            ],
-        );
-        lane.push(
-            1,
-            [
-                T::Signal(f, 1, log.clone()),
-                T::Wait(f, 1),
-                part("c"),
-                part("d"),
-            ],
-        );
-        lane.push(
-            1,
-            [
-                T::Wait(f, 9),
-                part("held"),
-                T::Present("present", log.clone()),
-                part("next frame"),
-            ],
-        );
+        lane.push(2, [part("other queue"), T::Wait(f, 1), part("behind a's signal")]);
+        lane.push(1, [T::Signal(f, 1, log.clone()), T::Wait(f, 1), part("c"), part("d")]);
+        lane.push(1, [T::Wait(f, 9), part("held"), T::Present("present", log.clone()), part("next frame")]);
         // What came after the look was asked for is not touched.
         let limit = lane.lock().next;
         lane.push(1, [part("later")]);
         lane.look(limit);
         assert_eq!(
             *log.lock().unwrap(),
-            [
-                "a+b+c",
-                "other queue+behind a's signal",
-                "d",
-                "held",
-                "present",
-                "next frame"
-            ],
+            ["a+b+c", "other queue+behind a's signal", "d", "held", "present", "next frame"],
             "{:?}",
             lane.lock().items.len()
         );
@@ -1329,19 +1181,12 @@ mod tests {
         lane.push(2, [T::Wait(f, 9), run("held")]);
         lane.push(1, [run("draw")]);
         look(&lane);
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["draw"],
-            "the wait holds its queue and no other"
-        );
+        assert_eq!(*log.lock().unwrap(), ["draw"], "the wait holds its queue and no other");
         lane.push(1, [T::Present("present", log.clone())]);
         lane.push(1, [run("next frame")]);
         lane.push(2, [T::Wait(f, 10), run("held again")]);
         look(&lane);
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["draw", "held", "present", "next frame"]
-        );
+        assert_eq!(*log.lock().unwrap(), ["draw", "held", "present", "next frame"]);
         assert_eq!(FORCED_HERE.get(), 1);
         // The second wait is met by a signal of the CPU.
         crate::fence::set(f as This, 10);
@@ -1363,9 +1208,7 @@ mod tests {
         let f = fence();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         lane.push(1, [T::Slow("slow", log.clone(), gate.clone())]);
-        lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || {
-            panic!("behind the submission")
-        });
+        lane.push_behind(1, false, T::Signal(f, 1, log.clone()), || panic!("behind the submission"));
         lane.push(1, [T::Present("present 1", log.clone())]);
         // One present may be in the line: this returns with it there.
         lane.wait_presents(1);
@@ -1388,10 +1231,7 @@ mod tests {
         lane.wait_presents(1);
         assert!(value(f) == 1, "the first frame was done");
         lane.drain();
-        assert_eq!(
-            *log.lock().unwrap(),
-            ["slow", "signal 1", "present 1", "second", "present 2"]
-        );
+        assert_eq!(*log.lock().unwrap(), ["slow", "signal 1", "present 1", "second", "present 2"]);
         opener.join().unwrap();
         // A wait the CPU meets without telling anybody; a drain does not
         // stand at it.

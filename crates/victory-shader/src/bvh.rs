@@ -301,17 +301,9 @@ pub(crate) mod tests {
     fn an_empty_slot_is_never_entered() {
         let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
         let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
-        let bounds = [
-            inside(30.0),
-            [up, up, up, down, down, down],
-            inside(10.0),
-            [up, up, up, down, down, down],
-        ];
+        let bounds = [inside(30.0), [up, up, up, down, down, down], inside(10.0), [up, up, up, down, down, down]];
         let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
-        assert_eq!(
-            boxes(&[8, NONE, 16, NONE], &bounds, &ray, true),
-            [16, 8, NONE, NONE]
-        );
+        assert_eq!(boxes(&[8, NONE, 16, NONE], &bounds, &ray, true), [16, 8, NONE, NONE]);
     }
 
     /// The smallest 16-bit float not below `x` (`up`) or not above it.
@@ -528,16 +520,8 @@ pub(crate) mod tests {
             bad[coord] = f32::NAN;
             let n32 = box32([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
             let n16 = box16([8, 16, 24, 32], [bad, OFF, OFF, OFF]);
-            assert_eq!(
-                intersect(&n32, 5, &ray, true),
-                [NONE; 4],
-                "box32 coord {coord}"
-            );
-            assert_eq!(
-                intersect(&n16, 4, &ray, true),
-                [NONE; 4],
-                "box16 coord {coord}"
-            );
+            assert_eq!(intersect(&n32, 5, &ray, true), [NONE; 4], "box32 coord {coord}");
+            assert_eq!(intersect(&n16, 4, &ray, true), [NONE; 4], "box16 coord {coord}");
         }
         // Empty/inverted boxes (min > max on one or all axes, +inf..-inf, or
         // BOX16 +65504..-65504) must miss rather than having low/high swapped.

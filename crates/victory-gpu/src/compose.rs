@@ -60,10 +60,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<Vec<u8>> {
 /// made for the presented format, at the first two-plane present.
 pub(crate) fn ahead() {
     if on() {
-        let _ = (
-            compile(s!("vs"), s!("vs_5_1")),
-            compile(s!("ps"), s!("ps_5_1")),
-        );
+        let _ = (compile(s!("vs"), s!("vs_5_1")), compile(s!("ps"), s!("ps_5_1")));
     }
 }
 

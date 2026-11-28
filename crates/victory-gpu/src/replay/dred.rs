@@ -8,8 +8,7 @@ use windows::core::{Interface, PCWSTR};
 
 /// What the commands of our recent setup lists were, by list name, one
 /// line a command: what a stopped list was at, in words.
-static OPS: std::sync::Mutex<(Vec<String>, Vec<(String, Vec<String>)>)> =
-    std::sync::Mutex::new((Vec::new(), Vec::new()));
+static OPS: std::sync::Mutex<(Vec<String>, Vec<(String, Vec<String>)>)> = std::sync::Mutex::new((Vec::new(), Vec::new()));
 
 /// The next command recorded into the list being recorded.
 pub(super) fn op(text: String) {
@@ -33,13 +32,7 @@ fn ops_of(name: &str, done: usize) -> Vec<String> {
         return Vec::new();
     };
     (done.saturating_sub(1)..(done + 2).min(all.len()))
-        .map(|i| {
-            format!(
-                "  command {i}{}: {}",
-                if i == done { " (where it stopped)" } else { "" },
-                all[i]
-            )
-        })
+        .map(|i| format!("  command {i}{}: {}", if i == done { " (where it stopped)" } else { "" }, all[i]))
         .collect()
 }
 

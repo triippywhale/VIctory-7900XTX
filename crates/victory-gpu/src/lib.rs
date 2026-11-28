@@ -15,12 +15,14 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
-#[cfg(all(windows, feature = "diagnostics"))]
-mod ab;
 #[cfg(windows)]
 mod ambient;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod book;
+#[cfg(windows)]
+mod lightprobe;
+#[cfg(windows)]
+mod texlate;
+#[cfg(windows)]
+mod texstore;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
@@ -28,6 +30,8 @@ mod compose;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
@@ -37,10 +41,10 @@ mod draw;
 pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod faultbook;
 pub mod fence;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod book;
 mod helpers;
 #[cfg(windows)]
 mod host;
@@ -48,23 +52,6 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
-#[cfg(windows)]
-mod land;
-#[cfg(windows)]
-mod left;
-#[cfg(windows)]
-mod lightprobe;
-pub mod list;
-#[cfg(windows)]
-mod memory;
-pub mod object;
-#[cfg(windows)]
-mod picked;
-pub mod pipeline;
-#[cfg(windows)]
-mod pool;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod popwatch;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
@@ -76,6 +63,19 @@ mod port_journal;
 #[cfg(windows)]
 mod port_rt;
 #[cfg(windows)]
+mod land;
+#[cfg(windows)]
+mod left;
+pub mod list;
+pub mod object;
+pub mod pipeline;
+#[cfg(windows)]
+mod picked;
+#[cfg(windows)]
+mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
@@ -84,8 +84,6 @@ pub mod replay;
 #[cfg(windows)]
 mod residency;
 pub mod resource;
-/// `VICTORY_RING_METER`: what the title reads from its read-back rings.
-pub mod ringmeter;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
@@ -94,21 +92,19 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
-mod texback;
-#[cfg(windows)]
-mod texlate;
-#[cfg(windows)]
-mod texstore;
-#[cfg(windows)]
 mod texture;
-#[cfg(windows)]
-mod tiles;
 pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
@@ -116,6 +112,10 @@ pub mod titlewrite;
 mod upload;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod texback;
+/// `VICTORY_RING_METER`: what the title reads from its read-back rings.
+pub mod ringmeter;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -138,14 +138,12 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 #[cfg(windows)]
-pub use inplace::{
-    title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view,
-};
-#[cfg(windows)]
 pub use left::title_memory_reserved;
 #[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+#[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading,
-    title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
-    title_memory_written, writing as kernel_will_write,
+    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    writing as kernel_will_write,
 };

@@ -125,8 +125,7 @@ pub fn create_preferred_device() -> windows::core::Result<ID3D12Device> {
                 };
                 let desc = adapter.GetDesc1()?;
                 let name = String::from_utf16_lossy(&desc.Description);
-                if !software(&desc)
-                    && adapter_matches(requested, index, name.trim_end_matches('\0'))
+                if !software(&desc) && adapter_matches(requested, index, name.trim_end_matches('\0'))
                 {
                     return create(Some(&adapter));
                 }
@@ -221,11 +220,7 @@ impl Host {
     /// The name of the adapter that actually created the device.
     pub fn adapter_name(&self) -> Option<String> {
         let desc = adapter_desc(&self.device).ok()?;
-        Some(
-            String::from_utf16_lossy(&desc.Description)
-                .trim_end_matches('\0')
-                .to_owned(),
-        )
+        Some(String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned())
     }
 
     /// The maximum wave size and whether the adapter is AMD RDNA, for
@@ -416,10 +411,7 @@ impl Host {
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                 if queue.GetMessage(i, Some(message), &mut len).is_ok() {
                     let m = &*message;
-                    let bytes = std::slice::from_raw_parts(
-                        m.pDescription,
-                        m.DescriptionByteLength.saturating_sub(1),
-                    );
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
                     text.push_str(" | ");
                     text.push_str(&String::from_utf8_lossy(bytes));
                 }
@@ -509,11 +501,9 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
-            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
             }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {

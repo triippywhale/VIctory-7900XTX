@@ -79,10 +79,7 @@ pub(crate) fn log(frames: f64) {
     if !on() {
         return;
     }
-    let s: Vec<f64> = STATS
-        .iter()
-        .map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9))
-        .collect();
+    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
          no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",

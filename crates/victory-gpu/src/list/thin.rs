@@ -120,11 +120,7 @@ impl Front {
             self.words.resize(from + blob.len().div_ceil(8), 0);
             // SAFETY: the words just made hold the bytes; plain data.
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    blob.as_ptr(),
-                    self.words.as_mut_ptr().add(from).cast(),
-                    blob.len(),
-                )
+                std::ptr::copy_nonoverlapping(blob.as_ptr(), self.words.as_mut_ptr().add(from).cast(), blob.len())
             };
         }
         let len = (self.words.len() - at - 1) as u64;
@@ -135,15 +131,11 @@ impl Front {
     }
 
     fn hand_over(&mut self) {
-        let Some(recording) = &self.recording else {
-            return;
-        };
+        let Some(recording) = &self.recording else { return };
         if self.words.is_empty() {
             return;
         }
-        let fresh = held(&WORDS)
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
+        let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
@@ -278,13 +270,7 @@ impl Recording {
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
-        give_back(
-            inner
-                .chunks
-                .drain(..)
-                .chain(std::mem::take(&mut inner.kept))
-                .collect(),
-        );
+        give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
                 // Left in the middle.
@@ -313,19 +299,13 @@ fn back_list(kind: u32) -> This {
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
-    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false))
-        .cast_const()
-        .cast();
+    let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(8usize)
-        .clamp(1, 32);
+    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -341,24 +321,16 @@ fn start() {
                         }
                     }
                 };
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run()))
-                    .is_err()
-                {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }
             }
         };
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("victory-list-{i}"))
-            .spawn(worker)
-        {
+        if let Err(e) = std::thread::Builder::new().name(format!("victory-list-{i}")).spawn(worker) {
             tracing::warn!(error = %e, "a thread less to translate lists");
         }
     }
-    tracing::info!(
-        threads,
-        "list calls are written down and translated by threads of ours (VICTORY_THIN=1)"
-    );
+    tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
 }
 
 /// The recordings of submitted lists, in order (one that was not begun is left
@@ -382,10 +354,7 @@ pub(crate) fn line(frames: f64) {
     if !wanted() || !on() {
         return;
     }
-    let s: Vec<f64> = STATS
-        .iter()
-        .map(|s| s.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
@@ -422,10 +391,7 @@ pub(crate) fn for_external(this: This) -> Option<This> {
     let mut inner = held(&recording.inner);
     if inner.scheduled {
         inner.waiting_for_back = true;
-        inner = recording
-            .moved
-            .wait_while(inner, |i| i.scheduled)
-            .unwrap_or_else(|e| e.into_inner());
+        inner = recording.moved.wait_while(inner, |i| i.scheduled).unwrap_or_else(|e| e.into_inner());
         inner.waiting_for_back = false;
     }
     (inner.back != 0).then_some(inner.back as This)
@@ -546,11 +512,7 @@ fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
 
 /// Where the things are in a stream (null for none).
 fn at<T>(w: &[u64], from: usize, count: usize) -> *const T {
-    if count == 0 || from >= w.len() {
-        std::ptr::null()
-    } else {
-        w[from..].as_ptr().cast()
-    }
+    if count == 0 || from >= w.len() { std::ptr::null() } else { w[from..].as_ptr().cast() }
 }
 
 /// [`at`] where an empty array is not null.
@@ -566,11 +528,7 @@ fn record(handle: u64) -> [u64; RECORD] {
     if handle != 0 {
         // SAFETY: a descriptor slot the title passes (they are larger).
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                handle as *const u8,
-                words.as_mut_ptr().cast(),
-                size_of::<RtvRecord>(),
-            )
+            std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), size_of::<RtvRecord>())
         };
     }
     words
@@ -590,20 +548,12 @@ extern "system" fn list_reset(this: This, allocator: This, pipeline: This) -> HR
     front(this).begin(kind, pipeline);
     S_OK
 }
-extern "system" fn list_reset_x(
-    this: This,
-    allocator: This,
-    pipeline: This,
-    _flags: u32,
-) -> HRESULT {
+extern "system" fn list_reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     list_reset(this, allocator, pipeline)
 }
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size)
-        .ok()
-        .and_then(|s| s.checked_add(align))
-    else {
+    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -624,11 +574,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 }
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     if !barriers.is_null() {
-        front(this).put_with(
-            BARRIER,
-            &[u64::from(count)],
-            &[bytes_of(barriers, count as usize)],
-        );
+        front(this).put_with(BARRIER, &[u64::from(count)], &[bytes_of(barriers, count as usize)]);
     }
     0
 }
@@ -637,35 +583,19 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
-    front(this).put_with(
-        VIEWPORTS,
-        &[u64::from(count)],
-        &[bytes_of(items, count as usize)],
-    );
+    front(this).put_with(VIEWPORTS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
 extern "system" fn scissors(this: This, count: u32, items: *const RECT) {
     let count = if items.is_null() { 0 } else { count };
-    front(this).put_with(
-        SCISSORS,
-        &[u64::from(count)],
-        &[bytes_of(items, count as usize)],
-    );
+    front(this).put_with(SCISSORS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
 extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
     let given = !factor.is_null();
-    front(this).put_with(
-        BLEND_FACTOR,
-        &[u64::from(given)],
-        &[bytes_of(factor, usize::from(given))],
-    );
+    front(this).put_with(BLEND_FACTOR, &[u64::from(given)], &[bytes_of(factor, usize::from(given))]);
 }
 extern "system" fn heaps(this: This, count: u32, items: *const This) {
     let count = if items.is_null() { 0 } else { count };
-    front(this).put_with(
-        HEAPS,
-        &[u64::from(count)],
-        &[bytes_of(items, count as usize)],
-    );
+    front(this).put_with(HEAPS, &[u64::from(count)], &[bytes_of(items, count as usize)]);
 }
 fn constants(this: This, op: u64, slot: u32, count: u32, values: *const u32, offset: u32) {
     let count = if values.is_null() { 0 } else { count };
@@ -675,31 +605,15 @@ fn constants(this: This, op: u64, slot: u32, count: u32, values: *const u32, off
         &[bytes_of(values, count as usize)],
     );
 }
-extern "system" fn compute_constants(
-    this: This,
-    slot: u32,
-    count: u32,
-    values: *const u32,
-    offset: u32,
-) {
+extern "system" fn compute_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
     constants(this, COMPUTE_CONSTANTS, slot, count, values, offset);
 }
-extern "system" fn graphics_constants(
-    this: This,
-    slot: u32,
-    count: u32,
-    values: *const u32,
-    offset: u32,
-) {
+extern "system" fn graphics_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
     constants(this, GRAPHICS_CONSTANTS, slot, count, values, offset);
 }
 extern "system" fn index_buffer(this: This, view: *const IndexView) {
     let given = !view.is_null();
-    front(this).put_with(
-        INDEX_BUFFER,
-        &[u64::from(given)],
-        &[bytes_of(view, usize::from(given))],
-    );
+    front(this).put_with(INDEX_BUFFER, &[u64::from(given)], &[bytes_of(view, usize::from(given))]);
 }
 extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *const VertexView) {
     let given = !views.is_null();
@@ -709,18 +623,8 @@ extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *co
         &[bytes_of(views, count as usize)],
     );
 }
-extern "system" fn targets(
-    this: This,
-    count: u32,
-    handles: *const u64,
-    one_range: i32,
-    depth: *const u64,
-) {
-    let count = if handles.is_null() {
-        0
-    } else {
-        (count as usize).min(8)
-    };
+extern "system" fn targets(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
+    let count = if handles.is_null() { 0 } else { (count as usize).min(8) };
     // SAFETY: the title passes a handle or null.
     let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
     let mut records = [0u64; RECORD * 9];
@@ -728,13 +632,7 @@ extern "system" fn targets(
     for i in 0..count {
         // SAFETY: the title passes `count` handles, or the first of a range
         // of views of 128 bytes.
-        let handle = unsafe {
-            if one_range != 0 {
-                *handles + 128 * i as u64
-            } else {
-                *handles.add(i)
-            }
-        };
+        let handle = unsafe { if one_range != 0 { *handles + 128 * i as u64 } else { *handles.add(i) } };
         present |= u64::from(handle != 0) << i;
         records[i * RECORD..(i + 1) * RECORD].copy_from_slice(&record(handle));
     }
@@ -746,13 +644,7 @@ extern "system" fn targets(
         &[bytes_of(records.as_ptr(), records.len())],
     );
 }
-extern "system" fn clear_rtv(
-    this: This,
-    handle: u64,
-    color: *const [f32; 4],
-    count: u32,
-    rects: *const Rect,
-) {
+extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], count: u32, rects: *const Rect) {
     if handle == 0 || color.is_null() {
         return;
     }
@@ -761,11 +653,7 @@ extern "system" fn clear_rtv(
     front(this).put_with(
         CLEAR_RTV,
         &[u64::from(count)],
-        &[
-            bytes_of(view.as_ptr(), RECORD),
-            bytes_of(color, 1),
-            bytes_of(rects, count as usize),
-        ],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(color, 1), bytes_of(rects, count as usize)],
     );
 }
 extern "system" fn clear_dsv(
@@ -784,15 +672,8 @@ extern "system" fn clear_dsv(
     let view = record(handle);
     front(this).put_with(
         CLEAR_DSV,
-        &[
-            u64::from(count),
-            u64::from(flags) | u64::from(stencil) << 32,
-            Word::word(depth),
-        ],
-        &[
-            bytes_of(view.as_ptr(), RECORD),
-            bytes_of(rects, count as usize),
-        ],
+        &[u64::from(count), u64::from(flags) | u64::from(stencil) << 32, Word::word(depth)],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
 extern "system" fn copy_texture_region(
@@ -810,15 +691,8 @@ extern "system" fn copy_texture_region(
     let boxed = !source_box.is_null();
     front(this).put_with(
         COPY_TEXTURE,
-        &[
-            u64::from(x) | u64::from(y) << 32,
-            u64::from(z) | u64::from(boxed) << 32,
-        ],
-        &[
-            bytes_of(dst, 1),
-            bytes_of(src, 1),
-            bytes_of(source_box, usize::from(boxed)),
-        ],
+        &[u64::from(x) | u64::from(y) << 32, u64::from(z) | u64::from(boxed) << 32],
+        &[bytes_of(dst, 1), bytes_of(src, 1), bytes_of(source_box, usize::from(boxed))],
     );
 }
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -866,10 +740,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         match op {
             RESET => {
                 // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<u64>::dangling()
-                    .as_ptr()
-                    .cast_const()
-                    .cast();
+                let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
                 super::reset(list, allocator, w[0] as This);
             }
             CLOSE => {
@@ -884,27 +755,15 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
             HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
-            COMPUTE_CONSTANTS => state::compute_constants(
-                list,
-                w[0] as u32,
-                w[1] as u32,
-                at(w, 2, w[1] as usize),
-                (w[0] >> 32) as u32,
-            ),
-            GRAPHICS_CONSTANTS => state::graphics_constants(
-                list,
-                w[0] as u32,
-                w[1] as u32,
-                at(w, 2, w[1] as usize),
-                (w[0] >> 32) as u32,
-            ),
+            COMPUTE_CONSTANTS => {
+                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+            }
+            GRAPHICS_CONSTANTS => {
+                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+            }
             INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
             VERTEX_BUFFERS => {
-                let views = if w[1] != 0 {
-                    at_or(w, 2)
-                } else {
-                    std::ptr::null()
-                };
+                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
                 state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
             }
             TARGETS => {
@@ -1042,10 +901,7 @@ mod tests {
         }
         for &slot in &mine {
             assert!(
-                METHODS
-                    .iter()
-                    .chain(MORE_METHODS.iter())
-                    .any(|m| m.0 == slot),
+                METHODS.iter().chain(MORE_METHODS.iter()).any(|m| m.0 == slot),
                 "slot {slot} is written down and not there"
             );
         }
@@ -1059,11 +915,7 @@ mod tests {
         f.put(Plain::DRAW_INDEXED as u64, &[3, 1, 0, Word::word(-7i32), 5]);
         let viewport = [1.0f32, 2.0, 3.0, 4.0, 0.0, 1.0];
         f.put_with(VIEWPORTS, &[1], &[bytes_of(viewport.as_ptr(), 6)]);
-        f.put_with(
-            COMPUTE_CONSTANTS,
-            &[4 | 2 << 32, 3],
-            &[bytes_of([7u32, 8, 9].as_ptr(), 3)],
-        );
+        f.put_with(COMPUTE_CONSTANTS, &[4 | 2 << 32, 3], &[bytes_of([7u32, 8, 9].as_ptr(), 3)]);
         let s = std::mem::take(&mut f.words);
         assert_eq!((s[0] & 0xffff, s[0] >> 16), (Plain::DRAW_INDEXED as u64, 5));
         assert_eq!(<i32 as Word>::unword(s[4]), -7);
@@ -1082,24 +934,7 @@ mod tests {
     /// again right after.
     #[test]
     fn a_target_is_the_one_at_the_call() {
-        let mut slot = [
-            0x5256_5476u64,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15,
-            16,
-        ];
+        let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);
         slot[1] = 99;
         assert_eq!(slot[1], 99);

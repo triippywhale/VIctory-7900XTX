@@ -85,12 +85,7 @@ enum Set {
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
-    let number = |t: &str| {
-        t.trim()
-            .parse::<f32>()
-            .ok()
-            .filter(|v| v.is_finite() && *v > 0.0)
-    };
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
@@ -99,13 +94,11 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(
-        || match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
-            // With the band asked for and no share, the band's level.
-            Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
-            set => set,
-        },
-    )
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        // With the band asked for and no share, the band's level.
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
 }
 
 /// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
@@ -131,23 +124,14 @@ pub(crate) struct Band {
 /// Its floor is the estimate itself (as without rays): at 0.7 of it the
 /// bad blocks were no longer black but still a darker patch on the wall
 /// (PR #45's run, 2026-11-27).
-const DEFAULT_BAND: Band = Band {
-    least: 1.0,
-    most: 1.5,
-    level: 0.8,
-};
+const DEFAULT_BAND: Band = Band { least: 1.0, most: 1.5, level: 0.8 };
 
 pub(crate) fn rt_band() -> Option<Band> {
     static SET: OnceLock<Option<Band>> = OnceLock::new();
     *SET.get_or_init(|| {
         let asked = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
         let band = band_from(std::env::var("VICTORY_AMBIENT_RT").ok().as_deref(), asked)?;
-        tracing::info!(
-            least = band.least,
-            most = band.most,
-            level = band.level,
-            "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)"
-        );
+        tracing::info!(least = band.least, most = band.most, level = band.level, "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)");
         Some(band)
     })
 }
@@ -163,12 +147,7 @@ fn band_from(set: Option<&str>, builder_asked: bool) -> Option<Band> {
 }
 
 fn parse_band(set: &str) -> Option<Band> {
-    let mut parts = set.split(',').map(|p| {
-        p.trim()
-            .parse::<f32>()
-            .ok()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-    });
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
     let least = parts.next().flatten()?;
     let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
     let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
@@ -197,11 +176,7 @@ fn air() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim()
-            .parse()
-            .ok()
-            .filter(|v: &f32| v.is_finite() && *v > 0.0)
-            .unwrap_or(0.0)
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
 }
 
@@ -228,20 +203,9 @@ fn settle() -> Option<Settle> {
         // gives the old 0.04 of the way a frame.
         let set = std::env::var("VICTORY_AMBIENT_SETTLE").unwrap_or_else(|_| "250,3".to_owned());
         let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok());
-        let ms = parts
-            .next()
-            .flatten()
-            .filter(|v| v.is_finite() && *v > 0.0)?;
-        let jump = parts
-            .next()
-            .flatten()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(3.0);
-        let fresh = parts
-            .next()
-            .flatten()
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0);
+        let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+        let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+        let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
         tracing::info!(
             ms,
             jump,
@@ -560,10 +524,7 @@ unsafe impl Send for Pass {}
 // SAFETY: as above.
 unsafe impl Sync for Pass {}
 
-fn make(
-    device: &ID3D12Device,
-    buffer: impl Fn(u64) -> Option<ID3D12Resource>,
-) -> windows::core::Result<Pass> {
+fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
@@ -574,10 +535,7 @@ fn make(
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: code.as_ptr().cast(),
-                    BytecodeLength: code.len(),
-                },
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
                 ..Default::default()
             };
             device.CreateComputePipelineState(&desc)
@@ -634,10 +592,7 @@ pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        ..Default::default()
-    };
+    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };
 }
@@ -728,23 +683,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(
-                &pass.air,
-                views.size[0].div_ceil(8),
-                views.size[1].div_ceil(8),
-                views.slices.div_ceil(2),
-            ),
+            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
-                run(
-                    &pass.raise,
-                    views.size[0].div_ceil(8),
-                    views.size[1].div_ceil(8),
-                    1,
-                );
+                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
@@ -767,39 +712,11 @@ mod tests {
 
     #[test]
     fn the_band_with_rays() {
-        assert_eq!(
-            parse_band("0.5,1.5"),
-            Some(Band {
-                least: 0.5,
-                most: 1.5,
-                level: 0.8
-            })
-        );
-        assert_eq!(
-            parse_band("1,1,0.6"),
-            Some(Band {
-                least: 1.0,
-                most: 1.0,
-                level: 0.6
-            })
-        );
+        assert_eq!(parse_band("0.5,1.5"), Some(Band { least: 0.5, most: 1.5, level: 0.8 }));
+        assert_eq!(parse_band("1,1,0.6"), Some(Band { least: 1.0, most: 1.0, level: 0.6 }));
         // The top is never under the floor; a missing top is four times.
-        assert_eq!(
-            parse_band("2,1"),
-            Some(Band {
-                least: 2.0,
-                most: 2.0,
-                level: 0.8
-            })
-        );
-        assert_eq!(
-            parse_band("0.7"),
-            Some(Band {
-                least: 0.7,
-                most: 4.0,
-                level: 0.8
-            })
-        );
+        assert_eq!(parse_band("2,1"), Some(Band { least: 2.0, most: 2.0, level: 0.8 }));
+        assert_eq!(parse_band("0.7"), Some(Band { least: 0.7, most: 4.0, level: 0.8 }));
         assert_eq!(parse_band(""), None);
         assert_eq!(parse_band("x,1"), None);
         // Unset: the default band with the builder asked for, none without.
@@ -808,30 +725,14 @@ mod tests {
         assert_eq!(band_from(None, false), None);
         assert_eq!(band_from(Some("off"), true), None);
         assert_eq!(band_from(Some("0"), true), None);
-        assert_eq!(
-            band_from(Some("0.5,4"), false),
-            Some(Band {
-                least: 0.5,
-                most: 4.0,
-                level: 0.8
-            })
-        );
+        assert_eq!(band_from(Some("0.5,4"), false), Some(Band { least: 0.5, most: 4.0, level: 0.8 }));
     }
 
     #[test]
     fn roles_by_name() {
-        assert_eq!(
-            role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."),
-            Some(Role::Resolve)
-        );
-        assert_eq!(
-            role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."),
-            Some(Role::Radiance)
-        );
-        assert_eq!(
-            role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"),
-            Some(Role::Air)
-        );
+        assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
+        assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
+        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
