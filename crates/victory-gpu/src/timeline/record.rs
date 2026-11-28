@@ -331,10 +331,12 @@ pub(crate) fn polled(at: usize, value: u64) {
     });
 }
 
-/// Threads of the title's that submit or present.
-static TITLES: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+/// Threads of the title's that submit or present, and those that give their
+/// turn away in a loop (`Sleep(0)`, `hooks`).
+static TITLES: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
-/// This thread is one of the title's that submit: what it does is sampled.
+/// This thread is one of the title's that submit, or one that loops: what
+/// it does is sampled.
 #[inline(always)]
 pub(crate) fn title_thread() {
     if !on() {

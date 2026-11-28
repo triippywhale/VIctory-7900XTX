@@ -113,6 +113,12 @@ wrapped! {
         wait("WaitForSingleObjectEx", object as u64, || unsafe { real(object, ms, alertable) })
     };
     2 Sleep(ms: u32) => |real: unsafe extern "system" fn(u32)| {
+        // A thread that gives its turn away is one that loops on something
+        // (run tl1: a title thread did so 200 times a frame and ran 35 ms
+        // of each 58 ms frame with no event of its own): it is sampled.
+        if ms == 0 {
+            crate::timeline::title_thread();
+        }
         wait("Sleep", 0, || unsafe { real(ms) })
     };
     3 SleepEx(ms: u32, alertable: i32) -> u32 => |real: unsafe extern "system" fn(u32, i32) -> u32| {
