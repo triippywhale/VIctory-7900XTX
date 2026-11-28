@@ -51,6 +51,43 @@
 //! `VICTORY_SKIP_WC_BACK=1` (every piece of such memory, no fetch) is not
 //! in this build: it gave a black world and lost room lighting on an RTX
 //! 5070 Ti in PalmVI.
+//!
+//! # Locks
+//!
+//! The locks a fetch, a refresh and a landing take, in the order each path
+//! takes them (a path never takes one to the left of one it holds):
+//!
+//! | path | thread | order |
+//! |---|---|---|
+//! | a reader, [`before_take`] | the submitting thread under the submission lock (`left_before_steps`, `merge_under_writes`, the sweep); threads of `crate::shadow::wide` (refreshes of copies and textures); whoever holds the arenas' lock (`crate::memory`) or reads a texture's memory | the caller's locks, then [`GATE`], [`BOOK`] shared, the views' (`crate::inplace`), [`BOOK`] alone, and with no lock of the book: the fetch's rig, the writer's `dirty` and `sent` notes, the order of the queue (let go before the wait), the card clock's state, **the wait for the card**, the writer's `merging` alone, its `before`, its notes again, and title memory written as a landing writes it (the guards and the journal of `crate::watch`) |
+//! | a refresh, `Shadow::update` | the submitting thread and the threads of `wide` | as a reader; with pieces of its own in the range [`GATE`] stays held, then the asking of `crate::watch` (its ranges, the guards, the journal), the copy's pages, [`BOOK`] shared, the copy's `dirty` notes |
+//! | a landing, [`skip_back`] | the thread that lands flights | the copies' and the arenas' registers and the views' (each let go), [`BOOK`] alone (let go), the journal. Later, per piece fetched as before: the copy's `merging` shared, its notes, title memory. Never [`GATE`] |
+//! | the runtime changes a mapping, the title frees memory ([`forget`]) | a thread of the title's | the mapping's lock alone (`crate::watch`), the write-combining reservations, [`BOOK`] alone, the guards. Never [`GATE`] |
+//! | a write of the title's to guarded memory | a thread of the title's | the guards and the journal only: nothing of `crate::watch` calls in here but [`forget`] |
+//! | a submission's sends to card copies, `Host::card_before` | the submitting thread | the order of the queue, the card's work, the copies' notes. Nothing of this file |
+//!
+//! Waits with locks held: the fetch waits for the card with [`GATE`] and
+//! its rig held (and the caller's: the submission lock, the arenas'). On
+//! the host's queue it stands behind every flight sent so far, which the
+//! card runs with no help of the CPU's (the title's own queue waits are
+//! kept on the CPU, `crate::queue`; `VICTORY_UP_QUEUE=1`'s wait is for a
+//! signal already on its queue), so that wait ends. [`BOOK`], the journal,
+//! the guards and the mapping's lock are never held across it, so the
+//! title's threads (a write fault, a change of mapping) do not wait for a
+//! fetch.
+//!
+//! What hung the process (two runs on an RX 7900 XT, seconds after the
+//! world's first pieces were left): a refresh of a copy with pieces of its
+//! own keeps [`GATE`] for all of `Shadow::update`, and a megabyte or more of
+//! stale pages there (the pages of the pieces just left are noted written,
+//! so megabytes of them are stale at the copy's next refresh) are taken on
+//! several threads, `Shadow::take_all` through `wide`. The thread that
+//! waits in `wide` takes whatever job is in the pool's queue: another
+//! refresh of the same submission that no helper has begun, which asks for
+//! [`GATE`] on the thread that holds it. A lock of `std` is not taken twice
+//! by one thread: that thread stands for ever, its submission with it under
+//! the submission lock, every other reader behind [`GATE`], and the title
+//! behind the submission. No device is lost and nothing is logged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
