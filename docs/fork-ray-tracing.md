@@ -152,6 +152,15 @@ dispatches, faults and what came.
   names it brings up to date, and streamed-in geometry is unpacked before
   anything draws with it. Those ranges' copies are now brought up to date too
   (counted as "ranges in buffers brought up to date").
+  A/B from the same save (rtcheck4, 69a62cc, against rtcheck5, b1ebafd):
+  pages without a copy 1.5 against 4.3 a frame, 2 cycles against 93, 2,963
+  against 5,357 nodes outside.
+- Small packed bottom levels left empty after unpacking: some 300 a dump
+  (rtcheck4: 331, rtcheck5: 281) have marks 0x8102 (packed, rehydrated),
+  tens to hundreds of KB, yet the walk finds one box node and one triangle:
+  the root's children are all zero, and each counts 3 to 35 nodes reached
+  twice. They lie close together (0x107d680100 to 0x107daf0100, one to a
+  64 KiB page mostly). Open: under investigation.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
