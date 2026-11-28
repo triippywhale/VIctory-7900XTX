@@ -725,6 +725,16 @@ fn sweep() {
     {
         return;
     }
+    // How long each part takes, for the frame-rate line
+    // (`sweep_aside::line`).
+    let mut at = std::time::Instant::now();
+    let mut took = || {
+        let from = std::mem::replace(&mut at, std::time::Instant::now());
+        (at - from).as_micros() as u64
+    };
+    // What is dropped here at once goes to a thread of its own, if asked
+    // for (`VICTORY_SWEEP_ASIDE=1`).
+    let _aside = sweep_aside::sweeping();
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
@@ -733,11 +743,22 @@ fn sweep() {
     }
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
+    let figures = took();
     crate::shadow::let_go_idle();
+    let windows = took();
     crate::texture::let_go_idle();
+    let staging = took();
     crate::resource::let_go_idle();
+    let textures = took();
     // Pieces left on the card by copies nothing else holds any more.
     crate::left::sweep();
+    sweep_aside::swept([figures, windows, staging, textures, took()]);
+}
+
+/// Drops `object`, which nothing but the caller holds: on a thread of its
+/// own if the caller is the sweep and `VICTORY_SWEEP_ASIDE=1`, else here.
+pub(crate) fn drop_in_sweep<T: Send + 'static>(object: T) {
+    drop(sweep_aside::drop_aside(Retired::Any(Box::new(object))));
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -754,7 +775,8 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire) + queued;
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        // In a sweep with `VICTORY_SWEEP_ASIDE=1`: on a thread of its own.
+        drop(sweep_aside::drop_aside(Retired::Any(Box::new(object))));
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -767,7 +789,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     let started = STARTED.load(Ordering::Acquire) + queued;
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        drop(sweep_aside::drop_aside(Retired::Resource(object)));
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -4440,6 +4462,7 @@ mod panel;
 mod place;
 pub(crate) mod rec;
 mod send;
+mod sweep_aside;
 mod upq;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -10184,6 +10207,7 @@ impl Meter {
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            sweep_aside::line();
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
