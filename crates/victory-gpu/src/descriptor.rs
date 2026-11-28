@@ -1827,7 +1827,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(all(windows, test))]
-pub(crate) use tests::with_test_view_heap;
+pub(crate) use tests::{with_test_view_heap, with_test_view_heap_of};
 
 #[cfg(test)]
 mod tests {
@@ -1846,8 +1846,14 @@ mod tests {
 
     #[cfg(windows)]
     pub(crate) fn with_test_view_heap(run: impl FnOnce(&Heap)) {
+        with_test_view_heap_of(4, run);
+    }
+
+    /// As [`with_test_view_heap`], a heap of `count` slots.
+    #[cfg(windows)]
+    pub(crate) fn with_test_view_heap_of(count: u32, run: impl FnOnce(&Heap)) {
         let mut this = std::ptr::null();
-        let desc = HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 0 };
+        let desc = HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 };
         let placement = Placement { address: 0, size: 0 };
         assert_eq!(create(desc, placement, &mut this), S_OK);
         struct TestHeap(This);
