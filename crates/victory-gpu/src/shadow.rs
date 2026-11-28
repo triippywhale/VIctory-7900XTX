@@ -1568,6 +1568,9 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    /// The same word for the threads of [`wide_more`], which take jobs only
+    /// while they are asked for.
+    extra: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
 }
@@ -1604,12 +1607,51 @@ fn wide_threads() -> usize {
     })
 }
 
+/// `VICTORY_WIDE_MORE=<n>`: n more threads for [`wide`] beside
+/// [`wide_threads`] (unset or 0: none), and the switch's number if it is one
+/// of those that change while the title runs (`VICTORY_AB`: 4 more, or the
+/// variable's number, in the phases it is on; the threads sleep in the
+/// others).
+///
+/// Run tl2 (a 7800X3D, 16 logical processors, 4 such threads): the frame
+/// waits for the submitting thread, 42 to 46 ms of work in a frame of 65, its
+/// largest piece the refreshes spread over these threads; the 8 threads that
+/// translate lists are idle 36 ms of the frame.
+fn wide_more() -> (usize, Option<u32>) {
+    static MORE: std::sync::OnceLock<(usize, Option<u32>)> = std::sync::OnceLock::new();
+    *MORE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_WIDE_MORE").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let most = 16usize.saturating_sub(wide_threads());
+        #[cfg(feature = "diagnostics")]
+        if let Some(bit) = crate::ab::bit("VICTORY_WIDE_MORE") {
+            return (asked.filter(|n| *n > 0).unwrap_or(4).min(most), Some(bit));
+        }
+        (asked.unwrap_or(0).min(most), None)
+    })
+}
+
+/// How many of [`wide_more`]'s threads take jobs now.
+fn wide_more_now() -> usize {
+    match wide_more() {
+        #[cfg(feature = "diagnostics")]
+        (n, Some(bit)) => {
+            if crate::ab::on(bit) {
+                n
+            } else {
+                0
+            }
+        }
+        (n, _) => n,
+    }
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        extra: std::sync::Condvar::new(),
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
@@ -1630,6 +1672,34 @@ fn workers() -> &'static Workers {
                                 break job;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let _working = crate::timeline::span("a job for another thread");
+                    job();
+                }
+            });
+        }
+        for i in 0..wide_more().0 {
+            let _ = std::thread::Builder::new().name(format!("victory-wide-more-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::cores::ahead("victory-wide");
+                let workers = WORKERS.get().expect("made above");
+                loop {
+                    let job = {
+                        if wide_more_now() > 0 {
+                            spin(|| workers.there.load(Ordering::Acquire) > 0);
+                        }
+                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            // Asleep while not asked for: what is there is
+                            // the other threads'.
+                            if wide_more_now() > 0
+                                && let Some(job) = jobs.pop_front()
+                            {
+                                workers.there.fetch_sub(1, Ordering::AcqRel);
+                                break job;
+                            }
+                            jobs = workers.extra.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
                     let _working = crate::timeline::span("a job for another thread");
@@ -1677,6 +1747,9 @@ fn wide(jobs: Vec<Job>) {
     } else {
         workers.more.notify_all();
     }
+    if wide_more_now() > 0 {
+        workers.extra.notify_all();
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1706,7 +1779,7 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
+    let threads = (wide_threads() + wide_more_now() + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
