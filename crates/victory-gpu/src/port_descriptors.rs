@@ -37,7 +37,10 @@
 //! until the fallback looks at its page; nothing reads such a slot as a
 //! descriptor (the title wrote no descriptor there).
 
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+use std::sync::atomic::{
+    AtomicPtr, AtomicU8, AtomicU64, AtomicUsize,
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
+};
 
 /// Whether renderer port #2 is on.
 pub fn on() -> bool {
@@ -112,22 +115,37 @@ pub(crate) fn adopt(start: u64, count: u32) -> bool {
 fn adopt_now(start: u64, count: u32) -> bool {
     let mut adopted = ADOPTED.write().unwrap_or_else(|e| e.into_inner());
     if adopted.is_some() {
-        tracing::info!(start = format_args!("{start:#x}"), count, "renderer port 2: another placed view heap, looked at by its pages as before");
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            count,
+            "renderer port 2: another placed view heap, looked at by its pages as before"
+        );
         return false;
     }
     let count = count as usize;
-    let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
+    let leak =
+        |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
     // (Never freed: a store of the title's may be marking while the heap
     // goes; a few MB at most.)
     let slots = leak(count);
     let chunks = leak(count.div_ceil(CHUNK));
-    let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
+    let writers: &'static [AtomicUsize] = Box::leak(
+        (0..(count * 32).div_ceil(1 << 16))
+            .map(|_| AtomicUsize::new(0))
+            .collect(),
+    );
     MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
     MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);
     MARKS.start.store(start, Release);
     // Last: a store that sees a length sees the rest.
     MARKS.len.store(count as u64 * 32, Release);
-    *adopted = Some(Adopted { start, count, slots, chunks, writers });
+    *adopted = Some(Adopted {
+        start,
+        count,
+        slots,
+        chunks,
+        writers,
+    });
     tracing::info!(
         start = format_args!("{start:#x}"),
         count,
@@ -143,13 +161,20 @@ pub(crate) fn let_go(start: u64) {
     if adopted.as_ref().is_some_and(|a| a.start == start) {
         MARKS.len.store(0, Release);
         *adopted = None;
-        tracing::info!(start = format_args!("{start:#x}"), "renderer port 2: the marked view heap went");
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            "renderer port 2: the marked view heap went"
+        );
     }
 }
 
 /// Whether the heap at `start` is the one whose slots are marked.
 pub(crate) fn adopted(start: u64) -> bool {
-    ADOPTED.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| a.start == start)
+    ADOPTED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|a| a.start == start)
 }
 
 /// Marks the slot at `handle` (a record our own calls wrote), if it is in the
@@ -175,7 +200,9 @@ pub(crate) fn mark(handle: u64) {
 
 /// Whether slot `index`'s mark is set (told, not yet taken).
 fn marked(a: &Adopted, index: u32) -> bool {
-    a.slots.get(index as usize).is_some_and(|s| s.load(Acquire) != 0)
+    a.slots
+        .get(index as usize)
+        .is_some_and(|s| s.load(Acquire) != 0)
 }
 
 /// The marked slots of the heap at `start`, each mark cleared, as runs of
@@ -193,7 +220,10 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
         // Cleared before its slots are read: a mark set meanwhile sets it again.
         chunk.swap(0, AcqRel);
         let first = c * CHUNK;
-        for (i, slot) in a.slots[first..(first + CHUNK).min(a.count)].iter().enumerate() {
+        for (i, slot) in a.slots[first..(first + CHUNK).min(a.count)]
+            .iter()
+            .enumerate()
+        {
             if slot.load(Relaxed) == 0 || slot.swap(0, AcqRel) == 0 {
                 continue;
             }
@@ -217,7 +247,9 @@ pub(crate) fn faulted(at: usize, rip: usize) {
     if MARKS.len.load(Relaxed) == 0 {
         return;
     }
-    let Ok(adopted) = ADOPTED.try_read() else { return };
+    let Ok(adopted) = ADOPTED.try_read() else {
+        return;
+    };
     if let Some(a) = adopted.as_ref() {
         let off = (at as u64).wrapping_sub(a.start);
         if let Some(w) = a.writers.get((off >> 16) as usize) {
@@ -230,14 +262,26 @@ pub(crate) fn faulted(at: usize, rip: usize) {
 /// (`VICTORY_PORT_DESCRIPTORS_EVERY=<frames>`, 8 if not given).
 fn check_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *N.get_or_init(|| every_of(std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY").ok().as_deref()))
+    *N.get_or_init(|| {
+        every_of(
+            std::env::var("VICTORY_PORT_DESCRIPTORS_EVERY")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// Pages the fallback looks at a frame (`VICTORY_PORT_DESCRIPTORS_CHECK=<pages>`,
 /// 16 if not given; `all`: every written page at every sync; 0: none).
 fn check_budget() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| budget_of(std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK").ok().as_deref()))
+    *N.get_or_init(|| {
+        budget_of(
+            std::env::var("VICTORY_PORT_DESCRIPTORS_CHECK")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 /// What `VICTORY_PORT_DESCRIPTORS_CHECK` says: 16 pages a frame unless told
@@ -259,7 +303,9 @@ fn budget_of(spec: Option<&str>) -> usize {
 
 /// What `VICTORY_PORT_DESCRIPTORS_EVERY` says (unset: 8).
 fn every_of(spec: Option<&str>) -> u64 {
-    spec.and_then(|v| v.trim().parse().ok()).unwrap_or(8u64).max(1)
+    spec.and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8u64)
+        .max(1)
 }
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
@@ -272,7 +318,12 @@ struct Fallback {
     next: usize,
 }
 
-static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
+static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback {
+    pages: std::collections::BTreeSet::new(),
+    asked: 0,
+    looked: 0,
+    next: 0,
+});
 
 /// Whether the fallback is whole: every written page, at every sync of the
 /// heaps (several a frame), as the layer looked before the port.
@@ -322,7 +373,12 @@ pub(crate) fn to_check(frame: u64) -> Vec<usize> {
     let mut out = Vec::new();
     while out.len() < check_budget() {
         let from = f.next;
-        let Some(&page) = f.pages.range(from..).next().or_else(|| f.pages.iter().next()) else {
+        let Some(&page) = f
+            .pages
+            .range(from..)
+            .next()
+            .or_else(|| f.pages.iter().next())
+        else {
             break;
         };
         f.pages.remove(&page);
@@ -353,9 +409,18 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     let n = CHECKED[1].fetch_add(1, Relaxed);
     MISSED_ALL.fetch_add(1, Relaxed);
-    let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
+    let rip = a
+        .writers
+        .get(((handle - a.start) >> 16) as usize)
+        .map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    let writer = if rip >= base && rip < base + size {
+        format!("title+{:#x}", rip - base)
+    } else if rip != 0 {
+        format!("{rip:#x} (not the title's)")
+    } else {
+        "not known (no fault on its block)".into()
+    };
     {
         let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         *by.entry(writer.clone()).or_default() += 1;
@@ -417,7 +482,10 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let len = MARKS.len.load(Acquire);
     if len != 0 && n >= 4 {
         let start = MARKS.start.load(Relaxed);
-        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
+        let (lo, hi) = (
+            (to as u64).max(start),
+            (to as u64 + n as u64).min(start + len),
+        );
         if lo < hi {
             COPIES[0].fetch_add(1, Relaxed);
             // Each slot whose first word now lies in the copy and is a view's.
@@ -510,7 +578,8 @@ pub(crate) static CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: view records the fallback found that no mark told of.
 static MISSED_ALL: AtomicU64 = AtomicU64::new(0);
 /// Since the start: the missed records by the place that last faulted on their block.
-static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// Since the start: slots taken, of them marked by our calls; pages checked.
 static ALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
@@ -521,21 +590,28 @@ pub(crate) fn line(frames: f64) {
     }
     let [taken, takings, ns] = [0, 1, 2].map(|i| TAKEN[i].swap(0, Relaxed));
     let ours = MARKED_BY_US.swap(0, Relaxed);
-    let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
+    let [pages, missed, other, pending, check_ns, tabled] =
+        [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
     let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
     let title_copies = [0, 1].map(|i| TITLE_COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
     if !working() {
-        tracing::info!("renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched");
+        tracing::info!(
+            "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched"
+        );
         return;
     }
     let writers = {
         let by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<(&String, &u64)> = by.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
-        v.iter().take(6).map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
+        v.iter()
+            .take(6)
+            .map(|(w, n)| format!("{w} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
@@ -560,7 +636,11 @@ pub(crate) fn line(frames: f64) {
         ALL[1].load(Relaxed),
         ALL[2].load(Relaxed),
         MISSED_ALL.load(Relaxed),
-        if writers.is_empty() { "none".into() } else { writers }
+        if writers.is_empty() {
+            "none".into()
+        } else {
+            writers
+        }
     );
 }
 

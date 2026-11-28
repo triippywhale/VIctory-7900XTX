@@ -207,7 +207,11 @@ pub(crate) enum Bound {
 /// submission, already in flight when the copy-back lands, would not:
 /// constants are not written by shaders, so this is not expected to
 /// matter).
-pub(crate) fn constant_gpu(address: u64, len: u64, how: Bound) -> Option<(&'static ID3D12Resource, u64)> {
+pub(crate) fn constant_gpu(
+    address: u64,
+    len: u64,
+    how: Bound,
+) -> Option<(&'static ID3D12Resource, u64)> {
     constant_in_heap(address, len, how, 256)
 }
 
@@ -216,7 +220,11 @@ pub(crate) fn constant_gpu(address: u64, len: u64, how: Bound) -> Option<(&'stat
 /// raw view of the constant buffer at its exact offset, on 16 bytes (where
 /// a raw view may begin). The title's ring of constants is on 16 bytes,
 /// hardly ever on 256, so only this reads it in place.
-pub(crate) fn constant_raw_view(address: u64, len: u64, how: Bound) -> Option<(&'static ID3D12Resource, u64)> {
+pub(crate) fn constant_raw_view(
+    address: u64,
+    len: u64,
+    how: Bound,
+) -> Option<(&'static ID3D12Resource, u64)> {
     let found = constant_in_heap(address, len, how, 16);
     if found.is_some() {
         CONSTANTS[5].fetch_add(1, Ordering::Relaxed);
@@ -225,7 +233,12 @@ pub(crate) fn constant_raw_view(address: u64, len: u64, how: Bound) -> Option<(&
 }
 
 /// [`constant_gpu`] and [`constant_raw_view`]: `address` on `align` bytes.
-fn constant_in_heap(address: u64, len: u64, how: Bound, align: u64) -> Option<(&'static ID3D12Resource, u64)> {
+fn constant_in_heap(
+    address: u64,
+    len: u64,
+    how: Bound,
+    align: u64,
+) -> Option<(&'static ID3D12Resource, u64)> {
     if !constants_only() || address == 0 {
         return None;
     }
@@ -351,7 +364,13 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         Err((at, why)) => {
             let n = STATS[at].fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
-                tracing::warn!(start = format_args!("{start:#x}"), len, window, why, "renderer port 1: title memory not in place, a copy as before");
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    window,
+                    why,
+                    "renderer port 1: title memory not in place, a copy as before"
+                );
             }
             None
         }
@@ -361,7 +380,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 /// [`place_for`]'s work: the region holding the pages of `[start, start +
 /// len)`, opened if none does, and a buffer placed in it. `Err` with the
 /// statistic to count and why.
-pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, (usize, String)> {
+pub(crate) fn place_in(
+    device: &ID3D12Device,
+    start: u64,
+    len: u64,
+) -> Result<Placed, (usize, String)> {
     let at = start & !(K64 - 1);
     let end = (start + len.max(1)).next_multiple_of(K64);
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -379,17 +402,29 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
         }
     };
     let region = &regions[i];
-    let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at).map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
+    let buffer = crate::inplace::place(device, &region.heap, at - region.start, end - at)
+        .map_err(|e| (6, format!("no buffer placed in the region: {e}")))?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap: region.heap.clone(), gpu, bias: start - at })
+    Ok(Placed {
+        buffer,
+        heap: region.heap.clone(),
+        gpu,
+        bias: start - at,
+    })
 }
 
 /// Opens the stretch around `[at, end)` (64 KiB aligned) as a heap through
 /// a view of ours of the same pages.
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
-        return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
+        return Err((
+            3,
+            format!(
+                "not one stretch of a section: {:?}",
+                cover(at as usize, (end - at) as usize)
+            ),
+        ));
     };
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
@@ -406,17 +441,39 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
         return Err((3, format!("{bytes:#x} bytes, over the most of a region")));
     }
     if first > at || first + bytes < end || offset % K64 != 0 {
-        return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
+        return Err((
+            3,
+            format!("the stretch {first:#x}+{bytes:#x} does not hold it"),
+        ));
     }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
-    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
+    let view = unsafe {
+        mem::MapViewOfFile(
+            section as _,
+            mem::FILE_MAP_WRITE,
+            (offset >> 32) as u32,
+            offset as u32,
+            bytes as usize,
+        )
+    }
+    .Value as usize;
     if view == 0 {
-        return Err((5, format!("no view of the stretch: {}", std::io::Error::last_os_error())));
+        return Err((
+            5,
+            format!(
+                "no view of the stretch: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
     }
     let unmap = || {
         // SAFETY: our own view, nothing opened on it.
-        unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
     };
     if !committed(view, bytes as usize) {
         unmap();
@@ -437,10 +494,19 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             let whole = if constants_only() {
                 match crate::inplace::place(device, &heap, 0, bytes) {
                     Ok(buffer) => {
-                        crate::host::name(&buffer, || format!("title memory {first:#x}+{bytes:#x} in place, for constant buffers"));
+                        crate::host::name(&buffer, || {
+                            format!(
+                                "title memory {first:#x}+{bytes:#x} in place, for constant buffers"
+                            )
+                        });
                         // SAFETY: a live buffer.
                         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                        let whole: &'static Whole = Box::leak(Box::new(Whole { start: first, end: first + bytes, buffer, gpu }));
+                        let whole: &'static Whole = Box::leak(Box::new(Whole {
+                            start: first,
+                            end: first + bytes,
+                            buffer,
+                            gpu,
+                        }));
                         Some(whole)
                     }
                     // The heap holds our view's pages; the view stays
@@ -450,7 +516,12 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
             } else {
                 None
             };
-            Ok(Region { start: first, end: first + bytes, heap, whole })
+            Ok(Region {
+                start: first,
+                end: first + bytes,
+                heap,
+                whole,
+            })
         }
         Err(e) => {
             unmap();
@@ -466,7 +537,9 @@ fn committed(at: usize, len: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != mem::MEM_COMMIT {
+        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.State != mem::MEM_COMMIT
+        {
             return false;
         }
         here = (info.BaseAddress as usize).saturating_add(info.RegionSize);
@@ -490,7 +563,9 @@ pub(crate) fn forget(at: usize, len: usize) {
     }
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
     let before = regions.len();
-    let (gone, kept): (Vec<Region>, Vec<Region>) = std::mem::take(&mut *regions).into_iter().partition(|r| r.end > at && r.start < end);
+    let (gone, kept): (Vec<Region>, Vec<Region>) = std::mem::take(&mut *regions)
+        .into_iter()
+        .partition(|r| r.end > at && r.start < end);
     *regions = kept;
     STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
     bounds(&regions);
@@ -505,13 +580,18 @@ pub(crate) fn forget(at: usize, len: usize) {
     }
     // Those with a buffer for constant buffer views are kept; the others
     // are let go as before.
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).extend(gone.into_iter().filter(|r| r.whole.is_some()));
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(gone.into_iter().filter(|r| r.whole.is_some()));
 }
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).
 fn touches(at: usize, len: usize) -> bool {
     let hi = BOUNDS[1].load(Ordering::Relaxed);
-    hi != 0 && (at as u64) < hi && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
+    hi != 0
+        && (at as u64) < hi
+        && (at as u64).saturating_add(len as u64) > BOUNDS[0].load(Ordering::Relaxed)
 }
 
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
@@ -537,8 +617,14 @@ pub(crate) fn log(frames: f64) {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-    let tables: Vec<f64> = TABLES.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9)).collect();
+    let per: Vec<f64> = STATS[9..]
+        .iter()
+        .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames)
+        .collect();
+    let tables: Vec<f64> = TABLES
+        .iter()
+        .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9))
+        .collect();
     tracing::info!(
         "renderer port 1 (VICTORY_PORT_CONSTANTS={}) per frame: {:.0} tables' constant buffer views made in place (the title's bytes, no fill), \
          {:.0} filled at submission",
@@ -547,7 +633,10 @@ pub(crate) fn log(frames: f64) {
         tables[1],
     );
     if constants_only() {
-        let c: Vec<f64> = CONSTANTS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9)).collect();
+        let c: Vec<f64> = CONSTANTS
+            .iter()
+            .map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames.max(1e-9))
+            .collect();
         tracing::info!(
             "renderer port 1 constants in place (VICTORY_PORT_CONSTANTS=3) per frame: {:.0} constant buffer views read where the title has them \
              ({:.0} tables', {:.0} root, {:.0} title slots'; {:.0} of them raw views, VICTORY_PORT_CBV; {:.1} MB of refreshes and fills not asked \
@@ -609,7 +698,9 @@ mod tests {
     #[test]
     fn warp_a_stretch_of_a_reserved_section_is_used_in_place_through_a_view_of_ours() {
         let _turn = crate::indirect::tests::warp_turn();
-        let Some(device) = crate::inplace::tests::warp() else { return };
+        let Some(device) = crate::inplace::tests::warp() else {
+            return;
+        };
         if windows::core::Interface::cast::<ID3D12Device13>(&device).is_err() {
             return;
         }
@@ -627,41 +718,94 @@ mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 8 * K, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0)
-                .cast::<u8>();
+            let hole = mem::VirtualAlloc2(
+                process,
+                std::ptr::null(),
+                8 * K,
+                mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER,
+                mem::PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+            .cast::<u8>();
             assert!(!hole.is_null());
             // Two views, pages 0..3 and 3..8 of the section, in turn.
-            mem::VirtualFree(hole.cast(), 3 * K, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            mem::VirtualFree(
+                hole.cast(),
+                3 * K,
+                mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER,
+            );
             let mut views = Vec::new();
             for (page, n) in [(0usize, 3usize), (3, 5)] {
-                let view = mem::MapViewOfFile3(section, process, hole.add(page * K).cast(), (page * K) as u64, n * K, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+                let view = mem::MapViewOfFile3(
+                    section,
+                    process,
+                    hole.add(page * K).cast(),
+                    (page * K) as u64,
+                    n * K,
+                    mem::MEM_REPLACE_PLACEHOLDER,
+                    mem::PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
                 assert!(!view.Value.is_null(), "{}", std::io::Error::last_os_error());
-                assert!(!mem::VirtualAlloc(view.Value, n * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
-                crate::inplace::title_memory_view(view.Value as usize, n * K, section as usize, (page * K) as u64);
+                assert!(
+                    !mem::VirtualAlloc(view.Value, n * K, mem::MEM_COMMIT, mem::PAGE_READWRITE)
+                        .is_null()
+                );
+                crate::inplace::title_memory_view(
+                    view.Value as usize,
+                    n * K,
+                    section as usize,
+                    (page * K) as u64,
+                );
                 views.push(view);
             }
             let base = hole as u64;
             let (start, len) = (base + K as u64 + 0x40, 5 * K as u64);
-            let placed = place_in(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            let placed =
+                place_in(&device, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
             assert_eq!(placed.bias, 0x40);
             let mut rig = crate::inplace::Rig::new(&device).unwrap();
-            for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize).iter_mut().enumerate() {
+            for (i, b) in std::slice::from_raw_parts_mut(start as *mut u8, len as usize)
+                .iter_mut()
+                .enumerate()
+            {
                 *b = (i * 7 + 3) as u8;
             }
-            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
-            assert!(got == std::slice::from_raw_parts(start as *const u8, len as usize), "the card reads the title's bytes, across both views");
-            rig.store(&placed.buffer, placed.bias + 3 * K as u64, &[0x5a; 256]).unwrap();
-            assert!(std::slice::from_raw_parts((start + 3 * K as u64) as *const u8, 256).iter().all(|&b| b == 0x5a), "the card's write shows in the title's view");
+            let got = rig
+                .fetch(&placed.buffer, placed.bias, len as usize)
+                .unwrap();
+            assert!(
+                got == std::slice::from_raw_parts(start as *const u8, len as usize),
+                "the card reads the title's bytes, across both views"
+            );
+            rig.store(&placed.buffer, placed.bias + 3 * K as u64, &[0x5a; 256])
+                .unwrap();
+            assert!(
+                std::slice::from_raw_parts((start + 3 * K as u64) as *const u8, 256)
+                    .iter()
+                    .all(|&b| b == 0x5a),
+                "the card's write shows in the title's view"
+            );
             // Another buffer in the same stretch: the same region.
             let regions = REGIONS.lock().unwrap().len();
-            let second = place_in(&device, base + 6 * K as u64, 100).unwrap_or_else(|e| panic!("not placed: {e:?}"));
-            assert_eq!(REGIONS.lock().unwrap().len(), regions, "one region for the stretch");
+            let second = place_in(&device, base + 6 * K as u64, 100)
+                .unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(
+                REGIONS.lock().unwrap().len(),
+                regions,
+                "one region for the stretch"
+            );
             assert_eq!(second.bias, 0);
             // The title's views may change under the heap.
             drop((placed, second));
             forget(base as usize, 8 * K);
             for view in views {
-                assert!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0, "the title's own view can be unmapped");
+                assert!(
+                    mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER) != 0,
+                    "the title's own view can be unmapped"
+                );
             }
             crate::inplace::views_gone(base as usize, 8 * K);
             mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);

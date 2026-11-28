@@ -88,7 +88,8 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 
 /// For the memory lines: containers kept and their bytes, translations
 /// kept and the bytes of their host code. None of them is ever let go.
-static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static KEPT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
@@ -154,9 +155,13 @@ impl Shader {
             name: program_name(bytes),
             container: bytes.to_vec(),
             #[cfg(windows)]
-            ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+            ambient: (stage == "compute")
+                .then(|| crate::ambient::role(bytes))
+                .flatten(),
             #[cfg(windows)]
-            probe: crate::lightprobe::on().then(|| crate::lightprobe::role(bytes)).flatten(),
+            probe: crate::lightprobe::on()
+                .then(|| crate::lightprobe::role(bytes))
+                .flatten(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -205,7 +210,10 @@ impl Shader {
                 }
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    KEPT[3].fetch_add(
+                        t.host.dxil.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -252,7 +260,9 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
-        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => {
+            Some(cs.threads)
+        }
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
@@ -357,7 +367,8 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -374,7 +385,10 @@ pub(crate) fn builder_rests(why: &'static str) {
     b.rests = crate::frame::current() + 2;
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder rests for this frame and the next: its stages run all or none"
+        );
     }
 }
 
@@ -385,7 +399,10 @@ pub(crate) fn builder_rests(why: &'static str) {
 pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !std::mem::replace(&mut b.stopped, true) {
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+        tracing::warn!(
+            why,
+            "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none"
+        );
     }
 }
 
@@ -502,8 +519,9 @@ fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
     };
     code.iter().any(|i| {
         matches!(i.encoding, Encoding::Flat | Encoding::Global)
-            && i.name()
-                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+            && i.name().is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            })
     })
 }
 
@@ -635,7 +653,10 @@ pub(crate) fn note_drop(this: This) {
 pub(crate) fn note_why(why: String) {
     crate::capture::op(0, || format!("DROPPED {why}"));
     let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
-    *drops.get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    *drops
+        .get_or_insert_with(HashMap::new)
+        .entry(why)
+        .or_default() += 1;
 }
 
 /// The drops counted since the last call, most first (diagnostics).
@@ -842,7 +863,11 @@ pub(crate) extern "system" fn create_precompiled_compute(
 /// compute pipeline: translated on first use, cached by its bytes.
 /// A description that does not read fails with `out` null, and the title
 /// falls back to its container.
-fn precompiled_compute(desc: *const PrecompiledCompute, iid: *const Iid, out: *mut This) -> HRESULT {
+fn precompiled_compute(
+    desc: *const PrecompiledCompute,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
     static CALLS: AtomicU32 = AtomicU32::new(0);
     static REFUSED: AtomicU32 = AtomicU32::new(0);
@@ -858,14 +883,19 @@ fn precompiled_compute(desc: *const PrecompiledCompute, iid: *const Iid, out: *m
     let parts = [&desc.settings, &desc.code, &desc.bindings].map(precompiled_part);
     let container = match &parts {
         [Some(settings), Some(code), Some(bindings)] => {
-            victory_shader::precompiled::compute_container(settings, code, bindings).map_err(|e| e.to_string())
+            victory_shader::precompiled::compute_container(settings, code, bindings)
+                .map_err(|e| e.to_string())
         }
         _ => Err("a part of the description is missing or not readable".to_owned()),
     };
     match container {
         Ok(container) => {
             if calls <= 4 || calls.is_power_of_two() {
-                tracing::info!(calls, code = desc.code.size, "precompiled compute pipeline (device method 0x218)");
+                tracing::info!(
+                    calls,
+                    code = desc.code.size,
+                    "precompiled compute pipeline (device method 0x218)"
+                );
             }
             hand_out(
                 vec![shader("compute", &container)],
@@ -988,7 +1018,13 @@ fn read_stream(
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8 (a stream
             // of ours need not be aligned).
-            let code = unsafe { stream.as_ptr().add(at + 8).cast::<Bytecode>().read_unaligned() };
+            let code = unsafe {
+                stream
+                    .as_ptr()
+                    .add(at + 8)
+                    .cast::<Bytecode>()
+                    .read_unaligned()
+            };
             shaders.extend(shader(stage, &code));
         }
         #[cfg(windows)]
@@ -1113,7 +1149,11 @@ impl Prebuild {
 
     /// Its shaders and state, as a run describes them.
     pub fn describe(&self) -> String {
-        let state = self.graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+        let state = self
+            .graphics
+            .as_ref()
+            .map(|g| g.describe())
+            .unwrap_or_default();
         format!("{:?}\t{state}", self.shaders)
     }
 
@@ -1133,10 +1173,12 @@ impl Prebuild {
         library::save(false);
         match made {
             Some(_) => Ok(()),
-            None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
-                Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
-            }),
+            None => Err(
+                match self.shaders.iter().find(|s| s.translated().is_none()) {
+                    Some(s) => format!("{} shader does not translate", s.stage),
+                    None => "the host refuses it".into(),
+                },
+            ),
         }
     }
 }
@@ -1259,7 +1301,9 @@ mod tests {
     #[test]
     fn a_precompiled_compute_pipeline_keeps_its_program() {
         fn hex(s: &str) -> Vec<u8> {
-            (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+            (0..s.len() / 2)
+                .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
         }
         let settings = hex("00cf05400201096c00000000080008000100000043032c408a0b0000");
         // `s_mov_b32 s8, s4; s_mov_b32 s9, 0; s_load_dwordx8 s[16:23],
@@ -1275,11 +1319,17 @@ mod tests {
         }
         bindings.extend_from_slice(&0x43u32.to_le_bytes());
         bindings.extend_from_slice(&[0; 28]);
-        let part = |b: &[u8]| Bytecode { code: b.as_ptr(), size: b.len() };
+        let part = |b: &[u8]| Bytecode {
+            code: b.as_ptr(),
+            size: b.len(),
+        };
         let desc = PrecompiledCompute {
             root: std::ptr::null(),
             settings: part(&settings),
-            id: Bytecode { code: std::ptr::null(), size: 0 },
+            id: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
             code: part(&code),
             bindings: part(&bindings),
             rest: [0; 4],
@@ -1287,14 +1337,21 @@ mod tests {
         let mut p = std::ptr::null();
         let hr = precompiled_compute(&desc, &PIPELINE_IIDS[0], &mut p);
         assert_eq!(hr, S_OK);
-        let [shader] = pipeline(p).shaders.as_slice() else { panic!("one shader") };
+        let [shader] = pipeline(p).shaders.as_slice() else {
+            panic!("one shader")
+        };
         assert_eq!(shader.stage, "compute");
         let c = victory_shader::Container::parse(&shader.container).unwrap();
-        let programs = victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL).unwrap().data).unwrap();
+        let programs =
+            victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL).unwrap().data)
+                .unwrap();
         assert_eq!(programs[0].code, code);
         assert_eq!(programs[0].layout[0].user_data, 4);
         // A description whose binding table does not read fails, `out` null.
-        let desc = PrecompiledCompute { bindings: part(&settings), ..desc };
+        let desc = PrecompiledCompute {
+            bindings: part(&settings),
+            ..desc
+        };
         let mut q = std::ptr::dangling();
         let hr = precompiled_compute(&desc, &PIPELINE_IIDS[0], &mut q);
         assert_eq!(hr, E_INVALIDARG);

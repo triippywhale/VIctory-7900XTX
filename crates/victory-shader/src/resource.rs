@@ -352,12 +352,12 @@ pub fn track(
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
-        let proof = t
-            .waterfall(block, &accesses, &reads)
-            .map_err(|what| ShaderError::Unsupported {
-                offset: t.inst((block, accesses[0])).machine.offset,
-                what,
-            })?;
+        let proof =
+            t.waterfall(block, &accesses, &reads)
+                .map_err(|what| ShaderError::Unsupported {
+                    offset: t.inst((block, accesses[0])).machine.offset,
+                    what,
+                })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
     }
@@ -756,9 +756,10 @@ impl<'a> Tracer<'a> {
     /// [`Self::code_high`], at most `depth` additions deep.
     fn code_high_in(&self, t: Term, depth: u32) -> bool {
         let Term::Value(x) = t else { return false };
-        if self.def(x).is_some_and(|i| {
-            i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x)
-        }) {
+        if self
+            .def(x)
+            .is_some_and(|i| i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x))
+        {
             return true;
         }
         depth > 0
@@ -1005,7 +1006,11 @@ impl<'a> Tracer<'a> {
             // A join of paths into tables in the code is the byte in the code
             // already: each path's `s_getpc_b64` counts as its own offset.
             let joined = s.dynamic.is_some_and(|d| self.code_join(d).is_some());
-            let first = if joined { 0 } else { pc.machine.offset as u32 + 4 };
+            let first = if joined {
+                0
+            } else {
+                pc.machine.offset as u32 + 4
+            };
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
@@ -1556,7 +1561,6 @@ impl<'a> Tracer<'a> {
         };
         (x == d1).then_some([w0, d1, d2, d3])
     }
-
 
     /// For a `v_readfirstlane_b32` result: the VGPR value it reads.
     fn first_lane_source(&self, v: Value) -> Option<Value> {
@@ -2126,7 +2130,8 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
+                else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -2443,7 +2448,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     match (inst.name(), *src) {
         // A 64-bit move of a literal with its sign bit clear: the high
         // dword is 0 whichever way the literal is extended.
-        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => Some(Moved::Const(if k == 0 { x } else { 0 })),
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -2459,7 +2466,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
             Some(Moved::Const(if k == 0 { x } else { 0 }))
         }
-        ("s_not_b32", Operand::Literal(x)) if inst.writes.get(k)?.0 != Reg::Scc => Some(Moved::Const(!x)),
+        ("s_not_b32", Operand::Literal(x)) if inst.writes.get(k)?.0 != Reg::Scc => {
+            Some(Moved::Const(!x))
+        }
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
@@ -2532,9 +2541,9 @@ pub(crate) mod tests {
     #[test]
     fn literal_scalar_operations_can_build_immediate_sampler_words() {
         for (first, second) in [
-            ([0xBE88_03FF, 0x92], [0xBE89_03FF, 0x00FF_F000]),        // s_mov_b32
+            ([0xBE88_03FF, 0x92], [0xBE89_03FF, 0x00FF_F000]), // s_mov_b32
             ([0xBE88_0BFF, 0x4900_0000], [0xBE89_03FF, 0x00FF_F000]), // s_brev_b32
-            ([0xBE88_03FF, 0x92], [0xBE89_07FF, 0xFF00_0FFF]),        // s_not_b32
+            ([0xBE88_03FF, 0x92], [0xBE89_07FF, 0xFF00_0FFF]), // s_not_b32
         ] {
             let mut words = vec![
                 0xBE82_0308, // s_mov_b32 s2, s8
@@ -2552,8 +2561,15 @@ pub(crate) mod tests {
                 S_ENDPGM,
             ]);
             let r = track_words(&words, &[param(Table, 8, 1)], HwStage::Ps);
-            let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler).unwrap();
-            assert_eq!(sampler.source, Source::Constant(vec![0x92, 0x00FF_F000, 0x1400_0000, 0]));
+            let sampler = r
+                .descriptors
+                .iter()
+                .find(|d| d.role == Role::Sampler)
+                .unwrap();
+            assert_eq!(
+                sampler.source,
+                Source::Constant(vec![0x92, 0x00FF_F000, 0x1400_0000, 0])
+            );
         }
     }
 
@@ -2857,7 +2873,10 @@ pub(crate) mod tests {
         assert_eq!(r.scalar.len(), 1);
         let a = r.scalar[0].1;
         assert_eq!((a.param, a.offset), (CODE, 0));
-        assert!(a.dynamic.is_some(), "the join is the computed term, the byte in the code");
+        assert!(
+            a.dynamic.is_some(),
+            "the join is the computed term, the byte in the code"
+        );
     }
 
     /// An address into a table in the code computed per lane and taken from
@@ -3064,7 +3083,6 @@ pub(crate) mod tests {
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
     }
-
 
     #[test]
     fn a_selection_that_mixes_two_descriptors_fails() {

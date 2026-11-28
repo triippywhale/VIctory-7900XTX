@@ -156,7 +156,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+    let found = pool
+        .iter()
+        .position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
     let index = match found {
         Some(index) => index,
         None => {
@@ -171,7 +173,9 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
             };
             let mut made: Option<ID3D12Heap> = None;
             // SAFETY: plain creation; the out pointer is ours.
-            if let Err(e) = unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) } {
+            if let Err(e) =
+                unsafe { device.CreateHeap::<ID3D12Heap>(&raw const desc, &raw mut made) }
+            {
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
@@ -278,7 +282,11 @@ impl Tiled {
     /// layer: how the card cuts it into tiles. `None` if the card will not
     /// say, or cuts it in a way this does not handle; the caller then makes
     /// the texture the old way.
-    pub(crate) fn make(device: &ID3D12Device, texture: &ID3D12Resource, levels: u32) -> Option<Tiled> {
+    pub(crate) fn make(
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        levels: u32,
+    ) -> Option<Tiled> {
         if levels == 0 || levels > 16 {
             return None;
         }
@@ -300,7 +308,10 @@ impl Tiled {
             );
         }
         let standard_levels = u32::from(packed.NumStandardMips);
-        if total == 0 || standard_levels + u32::from(packed.NumPackedMips) != levels || standard_levels > count {
+        if total == 0
+            || standard_levels + u32::from(packed.NumPackedMips) != levels
+            || standard_levels > count
+        {
             return None;
         }
         let mut standard = Vec::with_capacity(standard_levels as usize);
@@ -310,12 +321,19 @@ impl Tiled {
                 .checked_mul(u32::from(tiling.HeightInTiles))
                 .and_then(|n| n.checked_mul(u32::from(tiling.DepthInTiles)))
                 .unwrap_or(0);
-            if tiles == 0 || tiles > HEAP_TILES || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE {
+            if tiles == 0
+                || tiles > HEAP_TILES
+                || tiling.StartTileIndexInOverallResource == D3D12_PACKED_TILE
+            {
                 return None;
             }
             standard.push(tiles);
         }
-        let packed_tiles = if packed.NumPackedMips > 0 { packed.NumTilesForPackedMips } else { 0 };
+        let packed_tiles = if packed.NumPackedMips > 0 {
+            packed.NumTilesForPackedMips
+        } else {
+            0
+        };
         if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
             return None;
         }
@@ -378,7 +396,14 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            named,
+            if room { named } else { card },
+        );
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -474,7 +499,11 @@ impl Tiled {
         let first_packed = self.standard.len() as u32;
         let mut without = 0;
         for level in 0..self.levels.min(32) {
-            let has = if level < first_packed { given.levels[level as usize] } else { given.packed };
+            let has = if level < first_packed {
+                given.levels[level as usize]
+            } else {
+                given.packed
+            };
             if !has {
                 without |= 1 << level;
             }
@@ -586,7 +615,9 @@ impl Tiled {
                 given.packed
             }
         };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+        let shown = (0..self.levels)
+            .find(|&level| has(level) && with_tiles(level))
+            .unwrap_or(u32::MAX);
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
@@ -617,7 +648,11 @@ impl Tiled {
 
     /// A bit for every level of the texture.
     pub(crate) fn every_level(&self) -> u32 {
-        if self.levels >= 32 { u32::MAX } else { (1 << self.levels) - 1 }
+        if self.levels >= 32 {
+            u32::MAX
+        } else {
+            (1 << self.levels) - 1
+        }
     }
 
     /// The bytes of the tiles it has now.
@@ -631,7 +666,8 @@ impl Drop for Tiled {
     fn drop(&mut self) {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
         let mut bytes = 0;
-        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
         for &(index, start, tiles) in &given.runs {
             by_heap.entry(index).or_default().push((start, tiles));
             bytes += u64::from(tiles) * TILE;
@@ -671,12 +707,20 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         D3D12_SRV_DIMENSION_TEXTURE2D => {
             // SAFETY: `ViewDimension` selects `Texture2D`.
             let view = unsafe { &mut desc.Anonymous.Texture2D };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(
+                &mut view.MostDetailedMip,
+                &mut view.MipLevels,
+                &mut view.ResourceMinLODClamp,
+            );
         }
         D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
             // SAFETY: `ViewDimension` selects `Texture2DArray`.
             let view = unsafe { &mut desc.Anonymous.Texture2DArray };
-            clamp(&mut view.MostDetailedMip, &mut view.MipLevels, &mut view.ResourceMinLODClamp);
+            clamp(
+                &mut view.MostDetailedMip,
+                &mut view.MipLevels,
+                &mut view.ResourceMinLODClamp,
+            );
         }
         _ => {}
     }
@@ -805,7 +849,9 @@ void look() {
                 let layered = D3D12GetDebugInterface(&mut layer).is_ok() && layer.is_some();
                 layer.iter().for_each(|l| l.EnableDebugLayer());
                 if card && !layered {
-                    eprintln!("no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it");
+                    eprintln!(
+                        "no D3D12 debug layer (Windows optional feature \"Graphics Tools\"): not run on the card without it"
+                    );
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -827,9 +873,17 @@ void look() {
                     .ok()?;
                 eprintln!(
                     "levels on demand, {}: tiled resources tier {}, debug layer {}",
-                    if card { "ON THE CARD" } else { "on the software adapter" },
+                    if card {
+                        "ON THE CARD"
+                    } else {
+                        "on the software adapter"
+                    },
                     options.TiledResourcesTier.0,
-                    if messages.is_some() { "on" } else { "not installed" }
+                    if messages.is_some() {
+                        "on"
+                    } else {
+                        "not installed"
+                    }
                 );
                 if options.TiledResourcesTier.0 < 2 {
                     return None;
@@ -840,8 +894,9 @@ void look() {
                         ..Default::default()
                     })
                     .ok()?;
-                let allocator: ID3D12CommandAllocator =
-                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).ok()?;
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .ok()?;
                 let list: ID3D12GraphicsCommandList = device
                     .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
                     .ok()?;
@@ -879,10 +934,14 @@ void look() {
                     let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
                     if queue.GetMessage(i, Some(message), &mut size).is_ok() {
                         let m = &*message;
-                        let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        let text =
+                            std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
                         let text = String::from_utf8_lossy(text);
                         let text = text.trim_end_matches('\0');
-                        eprintln!("D3D12 says (severity {}, id {}): {text}", m.Severity.0, m.ID.0);
+                        eprintln!(
+                            "D3D12 says (severity {}, id {}): {text}",
+                            m.Severity.0, m.ID.0
+                        );
                         if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                             first_error = Some(text.to_owned());
                         }
@@ -899,8 +958,17 @@ void look() {
             let error = self.said();
             // SAFETY: a plain query.
             let removed = unsafe { self.device.GetDeviceRemovedReason() };
-            assert!(removed.is_ok(), "{}, {what}: the device is lost: {removed:?}", self.step);
-            assert!(error.is_none(), "{}, {what}: the debug layer reports an error: {}", self.step, error.unwrap_or_default());
+            assert!(
+                removed.is_ok(),
+                "{}, {what}: the device is lost: {removed:?}",
+                self.step
+            );
+            assert!(
+                error.is_none(),
+                "{}, {what}: the debug layer reports an error: {}",
+                self.step,
+                error.unwrap_or_default()
+            );
         }
 
         /// Gives tiles as a submission would, and stops if the mapping
@@ -923,7 +991,9 @@ void look() {
                 let run: ID3D12CommandList = self.list.cast().unwrap();
                 self.queue.ExecuteCommandLists(&[Some(run)]);
                 self.queue.Signal(&self.fence, self.submitted).unwrap();
-                self.fence.SetEventOnCompletion(self.submitted, self.event).unwrap();
+                self.fence
+                    .SetEventOnCompletion(self.submitted, self.event)
+                    .unwrap();
                 // Never without end: a step is a few copies of a few
                 // megabytes. On the card the limit stays under Windows' own
                 // two seconds; the software adapter, which compiles its
@@ -941,7 +1011,13 @@ void look() {
             }
         }
 
-        fn buffer(&self, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES, bytes: u64) -> ID3D12Resource {
+        fn buffer(
+            &self,
+            kind: D3D12_HEAP_TYPE,
+            flags: D3D12_RESOURCE_FLAGS,
+            state: D3D12_RESOURCE_STATES,
+            bytes: u64,
+        ) -> ID3D12Resource {
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: kind,
                 ..Default::default()
@@ -952,7 +1028,10 @@ void look() {
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: flags,
                 ..Default::default()
@@ -961,7 +1040,14 @@ void look() {
             // SAFETY: plain buffer creation.
             unsafe {
                 self.device
-                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut out)
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut out,
+                    )
                     .unwrap();
             }
             out.unwrap()
@@ -970,7 +1056,12 @@ void look() {
         /// A square texture description of `side` texels and `levels`
         /// levels; `reserved`: in the layout a texture without memory of
         /// its own must have.
-        fn desc(format: DXGI_FORMAT, side: u32, levels: u16, reserved: bool) -> D3D12_RESOURCE_DESC {
+        fn desc(
+            format: DXGI_FORMAT,
+            side: u32,
+            levels: u16,
+            reserved: bool,
+        ) -> D3D12_RESOURCE_DESC {
             D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                 Width: u64::from(side),
@@ -978,8 +1069,15 @@ void look() {
                 DepthOrArraySize: 1,
                 MipLevels: levels,
                 Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Layout: if reserved { D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE } else { D3D12_TEXTURE_LAYOUT_UNKNOWN },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: if reserved {
+                    D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                },
                 ..Default::default()
             }
         }
@@ -990,14 +1088,19 @@ void look() {
             let mut made: Option<ID3D12Resource> = None;
             // SAFETY: plain creation; a texture that is no target has no clear value.
             let asked = unsafe {
-                self.device
-                    .CreateReservedResource(desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made)
+                self.device.CreateReservedResource(
+                    desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut made,
+                )
             };
             // The layer's reason first, if it refused.
             self.check("a texture without memory made");
             asked.expect("a reserved texture");
             let texture = made.expect("a reserved texture");
-            let tiled = Tiled::make(&self.device, &texture, u32::from(desc.MipLevels)).expect("the card says how it cuts the texture");
+            let tiled = Tiled::make(&self.device, &texture, u32::from(desc.MipLevels))
+                .expect("the card says how it cuts the texture");
             (texture, tiled)
         }
 
@@ -1032,14 +1135,20 @@ void look() {
         /// level are `byte(level)`.
         fn filled(&self, layout: &Laid, byte: impl Fn(usize) -> u8) -> ID3D12Resource {
             let (footprints, rows) = (&layout.footprints, &layout.rows);
-            let upload = self.buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, layout.total);
+            let upload = self.buffer(
+                D3D12_HEAP_TYPE_UPLOAD,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                layout.total,
+            );
             // SAFETY: the buffer is `total` bytes; each level's rows lie inside it.
             unsafe {
                 let mut data = std::ptr::null_mut();
                 upload.Map(0, None, Some(&mut data)).unwrap();
                 for (level, f) in footprints.iter().enumerate() {
                     let len = rows[level] as usize * f.Footprint.RowPitch as usize;
-                    std::slice::from_raw_parts_mut(data.cast::<u8>().add(f.Offset as usize), len).fill(byte(level));
+                    std::slice::from_raw_parts_mut(data.cast::<u8>().add(f.Offset as usize), len)
+                        .fill(byte(level));
                 }
                 upload.Unmap(0, None);
             }
@@ -1057,20 +1166,47 @@ void look() {
             upload: Option<&ID3D12Resource>,
         ) -> Vec<[Vec<u8>; 2]> {
             let (footprints, rows) = (&layout.footprints, &layout.rows);
-            let back = self.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, layout.total);
+            let back = self.buffer(
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                layout.total,
+            );
             self.run(|list| {
                 // SAFETY: an open list; the texture and buffers outlive the run.
                 unsafe {
                     if let Some(upload) = upload {
                         for (level, f) in footprints.iter().enumerate() {
-                            list.CopyTextureRegion(&sub(texture, level as u32), 0, 0, 0, &placed(upload, *f), None);
+                            list.CopyTextureRegion(
+                                &sub(texture, level as u32),
+                                0,
+                                0,
+                                0,
+                                &placed(upload, *f),
+                                None,
+                            );
                         }
                     }
-                    list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
                     for (level, f) in footprints.iter().enumerate() {
-                        list.CopyTextureRegion(&placed(&back, *f), 0, 0, 0, &sub(texture, level as u32), None);
+                        list.CopyTextureRegion(
+                            &placed(&back, *f),
+                            0,
+                            0,
+                            0,
+                            &sub(texture, level as u32),
+                            None,
+                        );
                     }
-                    list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
                 }
             });
             let mut read = Vec::new();
@@ -1081,7 +1217,10 @@ void look() {
                 for (level, f) in footprints.iter().enumerate() {
                     let pitch = f.Footprint.RowPitch as usize;
                     let len = rows[level] as usize * pitch;
-                    let bytes = std::slice::from_raw_parts(data.cast::<u8>().cast_const().add(f.Offset as usize), len);
+                    let bytes = std::slice::from_raw_parts(
+                        data.cast::<u8>().cast_const().add(f.Offset as usize),
+                        len,
+                    );
                     // The bytes of a row that are the level's own (its
                     // blocks or texels; the rest of the pitch is padding).
                     let own = layout.wide[level] as usize;
@@ -1106,16 +1245,23 @@ void look() {
             // SAFETY: a borrowed pointer the location never releases.
             pResource: unsafe { std::mem::transmute_copy(texture) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index,
+            },
         }
     }
 
-    fn placed(buffer: &ID3D12Resource, footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT) -> D3D12_TEXTURE_COPY_LOCATION {
+    fn placed(
+        buffer: &ID3D12Resource,
+        footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    ) -> D3D12_TEXTURE_COPY_LOCATION {
         D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
             pResource: unsafe { std::mem::transmute_copy(buffer) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: footprint,
+            },
         }
     }
 
@@ -1131,7 +1277,11 @@ void look() {
     /// (i) Levels arrive one by one: after each step every level with
     /// tiles reads back its own bytes and every level without reads zeros.
     fn levels_arrive(rig: &mut Rig, format: DXGI_FORMAT) {
-        rig.step = if format == DXGI_FORMAT_BC7_UNORM { "step 1, levels arrive (BC7)" } else { "step 1, levels arrive (BC3)" };
+        rig.step = if format == DXGI_FORMAT_BC7_UNORM {
+            "step 1, levels arrive (BC7)"
+        } else {
+            "step 1, levels arrive (BC3)"
+        };
         let desc = Rig::desc(format, SIDE, LEVELS, true);
         let (texture, tiled) = rig.reserved(&desc);
         // (The card packs the levels smaller than a tile into shared
@@ -1143,7 +1293,10 @@ void look() {
             tiled.standard,
             tiled.packed
         );
-        assert!(!rig.card || tiled.packed > 0, "on the card a 1024 texture has levels smaller than a tile");
+        assert!(
+            !rig.card || tiled.packed > 0,
+            "on the card a 1024 texture has levels smaller than a tile"
+        );
         let layout = rig.footprints(&desc);
         let upload = rig.filled(&layout, |level| level as u8 + 1);
         for first in [3u32, 1, 0] {
@@ -1151,8 +1304,16 @@ void look() {
             rig.give(&tiled, &texture, from_level(first));
             let read = rig.round_trip(&texture, &layout, Some(&upload));
             for (level, bytes) in read.iter().enumerate() {
-                let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
-                assert!(all(bytes, want), "format {} from level {first}: level {level} reads {bytes:?}, wanted {want}", format.0);
+                let want = if tiled.has_tiles(level as u32) {
+                    level as u8 + 1
+                } else {
+                    0
+                };
+                assert!(
+                    all(bytes, want),
+                    "format {} from level {first}: level {level} reads {bytes:?}, wanted {want}",
+                    format.0
+                );
             }
         }
         assert!(tiled.whole());
@@ -1181,31 +1342,59 @@ void look() {
         // SAFETY: plain texture creation.
         unsafe {
             rig.device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &source_desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut made)
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &source_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut made,
+                )
                 .unwrap();
         }
         let source = made.unwrap();
         rig.run(|list| {
             // SAFETY: an open list and live resources.
             unsafe {
-                list.CopyTextureRegion(&sub(&source, 0), 0, 0, 0, &placed(&source_bytes, source_layout.footprints[0]), None);
-                list.ResourceBarrier(&[transition(&source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyTextureRegion(
+                    &sub(&source, 0),
+                    0,
+                    0,
+                    0,
+                    &placed(&source_bytes, source_layout.footprints[0]),
+                    None,
+                );
+                list.ResourceBarrier(&[transition(
+                    &source,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
                 // No tiles yet: this copy goes nowhere.
                 list.CopyTextureRegion(&sub(&texture, level), 0, 0, 0, &sub(&source, 0), None);
             }
         });
         let before = rig.round_trip(&texture, &layout, None);
-        assert!(all(&before[level as usize], 0), "a copy into a level without tiles left {:?}", before[level as usize]);
+        assert!(
+            all(&before[level as usize], 0),
+            "a copy into a level without tiles left {:?}",
+            before[level as usize]
+        );
         // As `texture.rs` `card_writes` has it: the give at the list's
         // submission, the copy in the list.
         assert_ne!(tiled.claim(tiled.with_level(level)), 0, "the level is new");
         rig.give(&tiled, &texture, tiled.with_level(level));
         rig.run(|list| {
             // SAFETY: as above.
-            unsafe { list.CopyTextureRegion(&sub(&texture, level), 0, 0, 0, &sub(&source, 0), None) };
+            unsafe {
+                list.CopyTextureRegion(&sub(&texture, level), 0, 0, 0, &sub(&source, 0), None)
+            };
         });
         let after = rig.round_trip(&texture, &layout, None);
-        assert!(all(&after[level as usize], 0x5a), "the copy after the give left {:?}", after[level as usize]);
+        assert!(
+            all(&after[level as usize], 0x5a),
+            "the copy after the give left {:?}",
+            after[level as usize]
+        );
         assert_eq!(tiled.claim(tiled.with_level(level)), 0, "claimed once");
     }
 
@@ -1236,8 +1425,16 @@ void look() {
         );
         let upload = rig.filled(&layout, |_| 0x3c);
         let read = rig.round_trip(&second, &layout, Some(&upload));
-        assert!(all(&read[level as usize], 0x3c), "the reused level reads {:?}", read[level as usize]);
-        assert!(all(&read[0], 0), "level 0 has no tiles and reads {:?}", read[0]);
+        assert!(
+            all(&read[level as usize], 0x3c),
+            "the reused level reads {:?}",
+            read[level as usize]
+        );
+        assert!(
+            all(&read[0], 0),
+            "level 0 has no tiles and reads {:?}",
+            read[0]
+        );
     }
 
     /// (iv) A level whose tiles come from several runs of the heap (single
@@ -1246,7 +1443,9 @@ void look() {
         rig.step = "step 4, a level on several ranges of the heap";
         // Three single tiles; the first and the last go back, the middle
         // one stays taken.
-        let singles: Vec<_> = (0..3).map(|_| take(&rig.device, 1).expect("a tile")).collect();
+        let singles: Vec<_> = (0..3)
+            .map(|_| take(&rig.device, 1).expect("a tile"))
+            .collect();
         give_back(singles[0].1, &singles[0].2);
         give_back(singles[2].1, &singles[2].2);
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
@@ -1256,7 +1455,10 @@ void look() {
         assert!(tiled.standard.len() > 1 && tiled.standard[1] >= 2);
         rig.give(&tiled, &texture, 1 << 1);
         let runs = tiled.given.lock().unwrap().runs.len();
-        eprintln!("level 1 ({} tiles) was mapped on {runs} ranges", tiled.standard[1]);
+        eprintln!(
+            "level 1 ({} tiles) was mapped on {runs} ranges",
+            tiled.standard[1]
+        );
         assert!(runs >= 2, "the single free tiles were not used first");
         let upload = rig.filled(&layout, |_| 0x77);
         let read = rig.round_trip(&texture, &layout, Some(&upload));
@@ -1320,18 +1522,28 @@ void look() {
             let mut shown = as_asked;
             show_from(&mut shown, tiled.first_shown()?, u32::from(LEVELS));
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
-            let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let step = rig
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
-            rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
+            rig.device
+                .CreateShaderResourceView(&texture, Some(&raw const shown), at);
             at.ptr += step;
-            rig.device.CreateShaderResourceView(&texture, Some(&raw const as_asked), at);
+            rig.device
+                .CreateShaderResourceView(&texture, Some(&raw const as_asked), at);
             let words = rig.buffer(
                 D3D12_HEAP_TYPE_DEFAULT,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 256,
             );
-            let back = rig.buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, 256);
+            let back = rig.buffer(
+                D3D12_HEAP_TYPE_READBACK,
+                D3D12_RESOURCE_FLAG_NONE,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                256,
+            );
             (root, pipeline, views, words, back)
         };
         // Before the one dispatch: the pipeline and both views are sound.
@@ -1339,14 +1551,22 @@ void look() {
         rig.run(|list| {
             // SAFETY: an open list and live objects.
             unsafe {
-                list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                list.ResourceBarrier(&[transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
                 list.SetDescriptorHeaps(&[Some(views.clone())]);
                 list.SetComputeRootSignature(&root);
                 list.SetPipelineState(&pipeline);
                 list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
                 list.SetComputeRootUnorderedAccessView(1, words.GetGPUVirtualAddress());
                 list.Dispatch(1, 1, 1);
-                list.ResourceBarrier(&[transition(&words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.ResourceBarrier(&[transition(
+                    &words,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
                 list.CopyBufferRegion(&back, 0, &words, 0, 16);
             }
         });
@@ -1359,14 +1579,24 @@ void look() {
             back.Unmap(0, None);
             read
         };
-        eprintln!("a sample at level 0: {} through the view from level 1, {} through the view as asked", read[0], read[1]);
-        assert_eq!(read[0], 32, "the view from the first level with tiles reads level 1");
-        assert_eq!(read[1], 0, "the view from level 0 reads a level without tiles");
+        eprintln!(
+            "a sample at level 0: {} through the view from level 1, {} through the view as asked",
+            read[0], read[1]
+        );
+        assert_eq!(
+            read[0], 32,
+            "the view from the first level with tiles reads level 1"
+        );
+        assert_eq!(
+            read[1], 0,
+            "the view from level 0 reads a level without tiles"
+        );
         Some(())
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
-        rig.step = "step 6, no room on the card: held levels wait, and get their tiles when asked again";
+        rig.step =
+            "step 6, no room on the card: held levels wait, and get their tiles when asked again";
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
         let (texture, tiled) = rig.reserved(&desc);
         let layout = rig.footprints(&desc);
@@ -1374,31 +1604,50 @@ void look() {
         let read_as_given = |rig: &mut Rig, what: &str| {
             let read = rig.round_trip(&texture, &layout, Some(&upload));
             for (level, bytes) in read.iter().enumerate() {
-                let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
-                assert!(all(bytes, want), "{what}: level {level} reads {bytes:?}, wanted {want}");
+                let want = if tiled.has_tiles(level as u32) {
+                    level as u8 + 1
+                } else {
+                    0
+                };
+                assert!(
+                    all(bytes, want),
+                    "{what}: level {level} reads {bytes:?}, wanted {want}"
+                );
             }
         };
         // No room: nothing is given, the held levels are said to wait,
         // nothing is shown, every level reads zeros.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), false);
         rig.check("an upload without room");
-        assert!(!changed && waiting, "without room: changed {changed}, waiting {waiting}");
+        assert!(
+            !changed && waiting,
+            "without room: changed {changed}, waiting {waiting}"
+        );
         assert_eq!(tiled.given_bytes(), 0, "without room no tile is given");
         assert_eq!(tiled.first_shown(), None);
         read_as_given(rig, "without room");
         // Asked again with room: the same levels get theirs.
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
         rig.check("the upload again, with room");
-        assert!(changed && !waiting, "with room: changed {changed}, waiting {waiting}");
+        assert!(
+            changed && !waiting,
+            "with room: changed {changed}, waiting {waiting}"
+        );
         assert!(tiled.has_tiles(3) && !tiled.has_tiles(2));
         assert_eq!(tiled.first_shown(), Some(3));
         read_as_given(rig, "with room");
         // More levels held and no room again: the ones that have tiles
         // are brought up to date, the new ones wait, the view stays.
         let before = tiled.given_bytes();
-        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
+        let (changed, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), false);
         rig.check("more levels held, without room");
-        assert!(!changed && waiting, "more levels without room: changed {changed}, waiting {waiting}");
+        assert!(
+            !changed && waiting,
+            "more levels without room: changed {changed}, waiting {waiting}"
+        );
         assert_eq!(tiled.given_bytes(), before);
         assert_eq!(tiled.first_shown(), Some(3));
         read_as_given(rig, "more levels without room");
@@ -1409,9 +1658,14 @@ void look() {
         rig.check("the card's own write, without room");
         assert!(changed && tiled.has_tiles(0) && !tiled.has_tiles(1) && !tiled.has_tiles(2));
         assert_eq!(tiled.first_shown(), Some(0));
-        assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
+        assert_eq!(
+            tiled.claim(1 << 0),
+            0,
+            "a level with tiles is not claimed again"
+        );
         // With room everything held gets its tiles.
-        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
+        let (_, waiting) =
+            tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
         rig.check("the last upload, with room");
         assert!(!waiting && tiled.whole());
         read_as_given(rig, "everything given");
@@ -1426,11 +1680,21 @@ void look() {
         assert_eq!(tiled.claim(level), 0, "claimed once");
         // The list that claimed it was reset without being submitted.
         tiled.unclaim(level);
-        assert_eq!(tiled.claim(level), level, "claimed again after it was given up");
+        assert_eq!(
+            tiled.claim(level),
+            level,
+            "claimed again after it was given up"
+        );
         // The small levels the card packs together are claimed together.
         let small = tiled.with_level(u32::from(LEVELS) - 1);
-        assert!(!rig.card || small.count_ones() > 1, "on the card a 1024 texture has several levels in one tile");
-        assert_eq!(tiled.claim(1 << (u32::from(LEVELS) - 1)), 1 << (u32::from(LEVELS) - 1));
+        assert!(
+            !rig.card || small.count_ones() > 1,
+            "on the card a 1024 texture has several levels in one tile"
+        );
+        assert_eq!(
+            tiled.claim(1 << (u32::from(LEVELS) - 1)),
+            1 << (u32::from(LEVELS) - 1)
+        );
         tiled.unclaim(small);
         assert_eq!(tiled.claim(small), small);
     }
@@ -1440,7 +1704,9 @@ void look() {
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
     fn levels_on_demand_on_the_card() {
         let Some(mut rig) = Rig::new() else {
-            eprintln!("no adapter with tiled resources of tier 2, or no debug layer for a run on the card; skipped");
+            eprintln!(
+                "no adapter with tiled resources of tier 2, or no debug layer for a run on the card; skipped"
+            );
             return;
         };
         rig.check("the device made");
@@ -1458,7 +1724,11 @@ void look() {
         rig.check("every step done");
         eprintln!(
             "all steps passed {}",
-            if rig.card { "ON THE CARD" } else { "on the software adapter; VICTORY_TILES_TEST_CARD=1 is the run on the card" }
+            if rig.card {
+                "ON THE CARD"
+            } else {
+                "on the software adapter; VICTORY_TILES_TEST_CARD=1 is the run on the card"
+            }
         );
         let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         eprintln!(
@@ -1573,9 +1843,17 @@ void look() {
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
         assert!(!changed);
-        assert_eq!(tiled.card.load(Ordering::Relaxed), 0, "failed tile allocation must not poison `card`");
+        assert_eq!(
+            tiled.card.load(Ordering::Relaxed),
+            0,
+            "failed tile allocation must not poison `card`"
+        );
         assert_eq!(tiled.first_shown(), None);
-        assert_eq!(tiled.claim(1 << 0), 1 << 0, "failed level must be unclaimed");
+        assert_eq!(
+            tiled.claim(1 << 0),
+            1 << 0,
+            "failed level must be unclaimed"
+        );
         // Even if level 0 later becomes allocatable, an upload with `room == false`
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;

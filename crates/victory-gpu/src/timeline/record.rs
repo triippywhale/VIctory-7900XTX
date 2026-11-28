@@ -116,7 +116,15 @@ pub(super) fn put(kind: Kind, name: &'static str, t: (u64, u64), a: u64, b: u64,
 }
 
 /// Records an event of `thread`.
-fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: u64, b: u64, stack: u32) {
+fn put_of(
+    thread: u32,
+    kind: Kind,
+    name: &'static str,
+    (t0, t1): (u64, u64),
+    a: u64,
+    b: u64,
+    stack: u32,
+) {
     let slots = SLOTS.load(Ordering::Acquire);
     if slots.is_null() {
         return;
@@ -127,7 +135,17 @@ fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: 
     }
     // SAFETY: a plain query.
     let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() } as u16;
-    let event = Event { t0, t1, a, b, name, thread, stack, cpu, kind };
+    let event = Event {
+        t0,
+        t1,
+        a,
+        b,
+        name,
+        thread,
+        stack,
+        cpu,
+        kind,
+    };
     // SAFETY: within the buffer, and this place was given to this call alone.
     unsafe {
         let slot = &*slots.add(at);
@@ -272,7 +290,14 @@ pub(super) fn waited(name: &'static str, object: u64, t0: u64) {
     let us = micros(t1 - t0);
     if us >= 2 {
         let stack = if us >= DEEP { stack() } else { 0 };
-        put(Kind::Wait, name, (t0, t1), object, CARD.with(Cell::get), stack);
+        put(
+            Kind::Wait,
+            name,
+            (t0, t1),
+            object,
+            CARD.with(Cell::get),
+            stack,
+        );
     }
 }
 
@@ -294,7 +319,14 @@ pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
 /// `fence` signalled behind them, with the timestamps at `stamp`.
 pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>) {
     if on() {
-        put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, stamp.map_or(0, |s| s as u64 + 1), 0);
+        put(
+            Kind::Sent,
+            "ExecuteCommandLists",
+            (t0, ticks()),
+            fence,
+            stamp.map_or(0, |s| s as u64 + 1),
+            0,
+        );
     }
 }
 
@@ -344,7 +376,12 @@ pub(crate) fn title_thread() {
     for place in &TITLES {
         match place.load(Ordering::Relaxed) {
             there if there == id => return,
-            0 if place.compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed).is_ok() => return,
+            0 if place
+                .compare_exchange(0, id, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok() =>
+            {
+                return;
+            }
             _ => {}
         }
     }
@@ -355,7 +392,9 @@ pub(crate) fn title_thread() {
 /// on a value in memory has no event of its own).
 fn sample() {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT, CONTEXT_CONTROL_AMD64, GetThreadContext,
+    };
     use windows_sys::Win32::System::Threading::{
         OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
     };
@@ -373,7 +412,8 @@ fn sample() {
                 Some(o) => o.1,
                 None => {
                     // SAFETY: a thread of our own process.
-                    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, id) };
+                    let handle =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, id) };
                     open.push((id, handle));
                     handle
                 }
@@ -407,11 +447,22 @@ fn sample() {
             // What lies near the instruction may be a return address; where
             // the instruction is the system's, all of it may tell something.
             let mut frames = [0usize; DEPTH];
-            let near = words.iter().copied().filter(|w| *w != 0 && (at >> 40 == 0x7f || w.abs_diff(at) < 0x1000_0000));
+            let near = words
+                .iter()
+                .copied()
+                .filter(|w| *w != 0 && (at >> 40 == 0x7f || w.abs_diff(at) < 0x1000_0000));
             for (frame, word) in frames.iter_mut().zip(near) {
                 *frame = word;
             }
-            put_of(id, Kind::Sample, "a sample", (t, t), at as u64, 0, keep(frames));
+            put_of(
+                id,
+                Kind::Sample,
+                "a sample",
+                (t, t),
+                at as u64,
+                0,
+                keep(frames),
+            );
         }
         let until = ticks() + frequency() / 4000;
         while ticks() < until {
@@ -450,7 +501,10 @@ fn parse(text: &str) -> (Option<(Vec<f64>, u64)>, &str) {
     let mut parts = text.splitn(3, ',');
     let three = (parts.next(), parts.next(), parts.next());
     if let (Some(from), Some(frames), Some(file)) = three
-        && let Ok(from) = from.split('+').map(|f| f.trim().parse::<f64>()).collect::<Result<Vec<f64>, _>>()
+        && let Ok(from) = from
+            .split('+')
+            .map(|f| f.trim().parse::<f64>())
+            .collect::<Result<Vec<f64>, _>>()
         && let Ok(frames) = frames.trim().parse::<u64>()
     {
         return (Some((from, frames)), file);
@@ -465,7 +519,11 @@ fn asked() -> Option<&'static Asked> {
     ASKED
         .get_or_init(|| {
             let file = std::env::var_os("VICTORY_TIMELINE").filter(|v| !v.is_empty())?;
-            let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok());
+            let number = |name: &str| {
+                std::env::var(name)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            };
             let text = file.to_string_lossy();
             let (when, file) = parse(&text);
             let (after, frames) = when.unwrap_or_else(|| {
@@ -533,7 +591,11 @@ pub(crate) fn presented() {
         stage.before = Some(super::report::Threads::now());
         tracing::info!(file = %asked.file.display(), frames = asked.frames, "the timeline begins (VICTORY_TIMELINE)");
         begin();
-        if std::thread::Builder::new().name("victory-sample".into()).spawn(sample).is_err() {
+        if std::thread::Builder::new()
+            .name("victory-sample".into())
+            .spawn(sample)
+            .is_err()
+        {
             tracing::warn!("the timeline is without samples of the title's threads");
         }
         frame();
@@ -550,7 +612,10 @@ pub(crate) fn presented() {
     let file = match asked.after.len() {
         1 => asked.file.clone(),
         _ => {
-            let end = asked.file.extension().map_or("json".into(), |e| e.to_string_lossy().into_owned());
+            let end = asked
+                .file
+                .extension()
+                .map_or("json".into(), |e| e.to_string_lossy().into_owned());
             asked.file.with_extension(format!("{after:.0}.{end}"))
         }
     };
@@ -566,7 +631,11 @@ pub(crate) fn presented() {
         (stage.began, stage.frames, stage.writing) = (false, 0, false);
         stage.made += 1;
     };
-    if std::thread::Builder::new().name("victory-timeline".into()).spawn(write).is_err() {
+    if std::thread::Builder::new()
+        .name("victory-timeline".into())
+        .spawn(write)
+        .is_err()
+    {
         tracing::warn!("no thread to write the timeline");
     }
 }
@@ -627,7 +696,8 @@ pub(super) fn end() -> Data {
     let count = NEXT_STACK.swap(0, Ordering::SeqCst).min(STACKS);
     // SAFETY: that many were given out; each was written before the event
     // that names it.
-    let stacks = unsafe { std::slice::from_raw_parts(STACK.load(Ordering::Acquire), count) }.to_vec();
+    let stacks =
+        unsafe { std::slice::from_raw_parts(STACK.load(Ordering::Acquire), count) }.to_vec();
     Data {
         events,
         stacks,
@@ -670,8 +740,14 @@ mod tests {
 
     #[test]
     fn a_timeline_is_asked_for_by_seconds_frames_and_a_file() {
-        assert_eq!(parse("120,20,D:/a.json"), (Some((vec![120.0], 20)), "D:/a.json"));
-        assert_eq!(parse("120+130.5,20,D:/a,b.json"), (Some((vec![120.0, 130.5], 20)), "D:/a,b.json"));
+        assert_eq!(
+            parse("120,20,D:/a.json"),
+            (Some((vec![120.0], 20)), "D:/a.json")
+        );
+        assert_eq!(
+            parse("120+130.5,20,D:/a,b.json"),
+            (Some((vec![120.0, 130.5], 20)), "D:/a,b.json")
+        );
         assert_eq!(parse("D:/a,1,2.json"), (None, "D:/a,1,2.json"));
         assert_eq!(parse("D:/a.json"), (None, "D:/a.json"));
     }

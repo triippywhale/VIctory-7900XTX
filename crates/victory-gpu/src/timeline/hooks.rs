@@ -81,7 +81,10 @@ fn measured<T>(name: &'static str, bytes: usize, call: impl FnOnce() -> T) -> T 
 
 /// The function `name` of the table, as the system has it.
 fn real(name: &str) -> usize {
-    TABLE.iter().find(|t| t.0 == name).map_or(0, |t| t.1.load(Ordering::Relaxed))
+    TABLE
+        .iter()
+        .find(|t| t.0 == name)
+        .map_or(0, |t| t.1.load(Ordering::Relaxed))
 }
 
 /// `take(lock)`, a try that does not wait, then `wait`.
@@ -90,7 +93,9 @@ fn lock_of(name: &'static str, lock: Handle, take: &str, call: impl FnOnce()) {
     if take != 0 {
         // SAFETY: `TryEnterCriticalSection` or a `TryAcquireSRWLock` call:
         // one pointer, a truth value (one byte of it for the latter).
-        let taken = unsafe { std::mem::transmute::<usize, unsafe extern "system" fn(Handle) -> u8>(take)(lock) };
+        let taken = unsafe {
+            std::mem::transmute::<usize, unsafe extern "system" fn(Handle) -> u8>(take)(lock)
+        };
         if taken != 0 {
             return;
         }
@@ -257,7 +262,11 @@ pub fn import(name: &str, address: usize) -> usize {
     if !arm() {
         return address;
     }
-    let Some((i, (_, at, _))) = TABLE.iter().enumerate().find(|(i, t)| *i < ONLY_REAL && t.0 == name) else {
+    let Some((i, (_, at, _))) = TABLE
+        .iter()
+        .enumerate()
+        .find(|(i, t)| *i < ONLY_REAL && t.0 == name)
+    else {
         return address;
     };
     if at.load(Ordering::Relaxed) == 0 {
@@ -301,7 +310,10 @@ unsafe fn wrap_imports() -> usize {
                     continue; // by number
                 }
                 let name = CStr::from_ptr((at(entry as u32) + 2) as *const _);
-                let Some(index) = TABLE[..ONLY_REAL].iter().position(|t| t.0.as_bytes() == name.to_bytes()) else {
+                let Some(index) = TABLE[..ONLY_REAL]
+                    .iter()
+                    .position(|t| t.0.as_bytes() == name.to_bytes())
+                else {
                     continue;
                 };
                 if TABLE[index].1.load(Ordering::Relaxed) == 0 {

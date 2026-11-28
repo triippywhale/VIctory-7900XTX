@@ -88,7 +88,10 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
             return Vec::new();
         }
         let frequency = host.queue.GetTimestampFrequency().unwrap_or(0);
-        (frequency, std::slice::from_raw_parts(stamps.back as *const u64, 2 * MOST))
+        (
+            frequency,
+            std::slice::from_raw_parts(stamps.back as *const u64, 2 * MOST),
+        )
     };
     if frequency == 0 {
         return Vec::new();
@@ -111,7 +114,9 @@ fn times(taken: usize) -> Vec<(u64, u64)> {
 impl Host {
     fn make_stamps(&self) -> windows::core::Result<Stamps> {
         let Some((buffer, back)) = self.shared_buffer(16 * MOST as u64) else {
-            return Err(windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY));
+            return Err(windows::core::Error::from(
+                windows::Win32::Foundation::E_OUTOFMEMORY,
+            ));
         };
         // SAFETY: plain object creation; a fresh mapping of that size.
         unsafe {
@@ -126,13 +131,26 @@ impl Host {
                 &mut heap,
             )?;
             let heap = heap.ok_or_else(windows::core::Error::empty)?;
-            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let mut lists = Vec::with_capacity(2 * MOST);
             for at in 0..2 * MOST as u32 {
-                let list: ID3D12GraphicsCommandList =
-                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
                 list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
-                list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, at, 1, &buffer, u64::from(at) * 8);
+                list.ResolveQueryData(
+                    &heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    at,
+                    1,
+                    &buffer,
+                    u64::from(at) * 8,
+                );
                 list.Close()?;
                 lists.push(list.cast()?);
             }
@@ -172,7 +190,9 @@ mod tests {
             unsafe {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
-                host.fence.SetEventOnCompletion(*submitted, host.event).unwrap();
+                host.fence
+                    .SetEventOnCompletion(*submitted, host.event)
+                    .unwrap();
                 WaitForSingleObject(host.event, INFINITE);
             }
         }
@@ -182,6 +202,9 @@ mod tests {
         let (from, to) = times[5];
         // (The two clocks agree to some tens of microseconds.)
         let near = 2_000;
-        assert!(from <= to && from + near >= sent && to <= done + near, "{sent} {from} {to} {done}");
+        assert!(
+            from <= to && from + near >= sent && to <= done + near,
+            "{sent} {from} {to} {done}"
+        );
     }
 }

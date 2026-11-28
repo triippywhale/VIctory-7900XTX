@@ -119,7 +119,8 @@ impl Mapped {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE,
+            CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY,
+            PAGE_READWRITE,
         };
         if len == 0 {
             return None;
@@ -138,11 +139,21 @@ impl Mapped {
             if mapping.is_null() {
                 return None;
             }
-            let at = MapViewOfFile(mapping, if write { FILE_MAP_WRITE } else { FILE_MAP_READ }, 0, 0, 0);
+            let at = MapViewOfFile(
+                mapping,
+                if write { FILE_MAP_WRITE } else { FILE_MAP_READ },
+                0,
+                0,
+                0,
+            );
             CloseHandle(mapping);
             at
         };
-        (!at.Value.is_null()).then_some(Mapped { at, len, _file: None })
+        (!at.Value.is_null()).then_some(Mapped {
+            at,
+            len,
+            _file: None,
+        })
     }
 
     /// The file at `path`, mapped for reading; `None` if it is not there,
@@ -218,7 +229,9 @@ impl Blob {
         let path = dir.join(LIBRARY_FILE);
         let next = dir.join(NEXT_FILE);
         if next.exists() && std::fs::rename(&next, &path).is_err() {
-            tracing::warn!("the host pipeline library saved last could not take the old one's place");
+            tracing::warn!(
+                "the host pipeline library saved last could not take the old one's place"
+            );
         }
         if mapped()
             && let Some(file) = Mapped::open(&path)
@@ -243,7 +256,8 @@ impl Blob {
 /// The mapped library file's view (address, bytes; 0: not mapped), when a
 /// pipeline was last loaded from the library (`crate::host::now_ms`), and
 /// whether the view's pages were let go since ([`trim`]).
-static VIEW: [std::sync::atomic::AtomicUsize; 2] = [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+static VIEW: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 static LOADED_AT: AtomicU64 = AtomicU64::new(0);
 static TRIMMED: AtomicBool = AtomicBool::new(false);
 /// The bytes of the view let go so far, for the memory line.
@@ -274,10 +288,12 @@ struct Call(u32, u64);
 fn call(what: &'static str, name: &str) -> Call {
     let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
     let label = LABEL.with(|l| l.borrow().clone());
-    CALLS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((thread, what, format!("{name} {label}"), since));
+    CALLS.lock().unwrap_or_else(|e| e.into_inner()).push((
+        thread,
+        what,
+        format!("{name} {label}"),
+        since,
+    ));
     Call(thread, since)
 }
 
@@ -315,7 +331,10 @@ pub(crate) fn removal_note() -> String {
             );
         }
     }
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let (at, len) = (
+        VIEW[0].load(Ordering::Relaxed),
+        VIEW[1].load(Ordering::Relaxed),
+    );
     if at == 0 {
         text.push_str("; its file is not mapped");
         return text;
@@ -324,7 +343,11 @@ pub(crate) fn removal_note() -> String {
     let _ = write!(
         text,
         "; its file is mapped ({len} bytes), the handle {}",
-        if holds() { "kept open" } else { "closed (VICTORY_LIBRARY_HANDLE=0)" }
+        if holds() {
+            "kept open"
+        } else {
+            "closed (VICTORY_LIBRARY_HANDLE=0)"
+        }
     );
     match REPLACED[0].load(Ordering::Relaxed) {
         0 => text.push_str("; this run has not replaced the file"),
@@ -337,7 +360,11 @@ pub(crate) fn removal_note() -> String {
         }
     }
     if TRIMMED_BYTES.load(Ordering::Relaxed) > 0 {
-        let _ = write!(text, "; its pages were last let go {:.1} s ago", ago(TRIMMED_AT.load(Ordering::Relaxed)));
+        let _ = write!(
+            text,
+            "; its pages were last let go {:.1} s ago",
+            ago(TRIMMED_AT.load(Ordering::Relaxed))
+        );
     }
     // Within two seconds: pages not in memory come from the disk.
     let started = std::time::Instant::now();
@@ -356,9 +383,15 @@ pub(crate) fn removal_note() -> String {
             }
         }
     }
-    let _ = write!(text, "; {zero} of the {looked} pages looked at read as zeros now");
+    let _ = write!(
+        text,
+        "; {zero} of the {looked} pages looked at read as zeros now"
+    );
     if let Some(first) = first {
-        let _ = write!(text, " (the first is page {first}): the library's contents were lost there");
+        let _ = write!(
+            text,
+            " (the first is page {first}): the library's contents were lost there"
+        );
     }
     text
 }
@@ -375,7 +408,10 @@ pub(crate) fn removal_note() -> String {
 /// `VICTORY_LIBRARY_TRIM=0`: the pages stay until Windows takes them.
 pub(crate) fn trim() {
     static ON: OnceLock<bool> = OnceLock::new();
-    let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
+    let (at, len) = (
+        VIEW[0].load(Ordering::Relaxed),
+        VIEW[1].load(Ordering::Relaxed),
+    );
     if at == 0
         || TRIMMED.load(Ordering::Relaxed)
         || !*ON.get_or_init(|| std::env::var_os("VICTORY_LIBRARY_TRIM").is_none_or(|v| v != "0"))
@@ -396,9 +432,15 @@ pub(crate) fn trim() {
         unsafe { windows_sys::Win32::System::Memory::VirtualUnlock(at as *const _, len) };
         TRIMMED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
         TRIMMED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
-        crate::host::trail(|| format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)"));
+        crate::host::trail(|| {
+            format!("pipeline library: the mapped file's pages let go from memory ({len} bytes)")
+        });
     };
-    if std::thread::Builder::new().name("victory-library-trim".into()).spawn(work).is_err() {
+    if std::thread::Builder::new()
+        .name("victory-library-trim".into())
+        .spawn(work)
+        .is_err()
+    {
         TRIMMED.store(false, Ordering::Relaxed);
     }
 }
@@ -441,7 +483,10 @@ fn same_name(name: &str) -> HeldName<'_> {
 
 impl Drop for HeldName<'_> {
     fn drop(&mut self) {
-        HELD_NAMES.lock().unwrap_or_else(|e| e.into_inner()).remove(self.0);
+        HELD_NAMES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(self.0);
         NAME_RELEASED.notify_all();
     }
 }
@@ -488,7 +533,9 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
         // SAFETY: the bytes outlive the library (kept beside it).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            device
+                .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
+                .cast()
         }
     };
     if !blob.bytes().is_empty() {
@@ -496,7 +543,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
             Ok(library) => {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
-                tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+                tracing::info!(
+                    bytes,
+                    mapped = matches!(blob, Blob::Mapped(_)),
+                    "host pipeline library loaded"
+                );
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
@@ -509,7 +560,9 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     saving: RwLock::new(()),
                 });
             }
-            Err(e) => tracing::info!(error = %e, "host pipeline library rejected; starting an empty one"),
+            Err(e) => {
+                tracing::info!(error = %e, "host pipeline library rejected; starting an empty one")
+            }
         }
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
@@ -530,7 +583,11 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+        .chain([state.as_bytes()])
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
@@ -554,8 +611,7 @@ fn retry_out_of_memory<T>(
     serial: &Mutex<()>,
     mut create: impl FnMut() -> windows::core::Result<T>,
 ) -> windows::core::Result<T> {
-    let out_of_memory =
-        |r: &windows::core::Result<T>| matches!(r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
+    let out_of_memory = |r: &windows::core::Result<T>| matches!(r, Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY);
     let mut made = create();
     if !out_of_memory(&made) {
         return made;
@@ -571,9 +627,14 @@ fn retry_out_of_memory<T>(
     match &made {
         Ok(_) => {
             OOM_RECOVERED.fetch_add(1, Ordering::Relaxed);
-            tracing::info!(attempts = attempts + 1, "host pipeline made after the compiler ran out of memory");
+            tracing::info!(
+                attempts = attempts + 1,
+                "host pipeline made after the compiler ran out of memory"
+            );
         }
-        Err(e) => tracing::warn!(error = %e, attempts = attempts + 1, "host pipeline still refused when tried again"),
+        Err(e) => {
+            tracing::warn!(error = %e, attempts = attempts + 1, "host pipeline still refused when tried again")
+        }
     }
     made
 }
@@ -658,13 +719,22 @@ unsafe extern "system" fn compiler_crashed(
     let name = MAKING
         .try_with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
         .unwrap_or_default();
-    if record.ExceptionCode != ACCESS_VIOLATION || name.is_empty() || record.ExceptionInformation[1] >= 0x10000 {
+    if record.ExceptionCode != ACCESS_VIOLATION
+        || name.is_empty()
+        || record.ExceptionInformation[1] >= 0x10000
+    {
         return CONTINUE_SEARCH;
     }
-    tracing::error!(name, "the driver's compiler crashed making a pipeline: it is left out, its worker parked");
+    tracing::error!(
+        name,
+        "the driver's compiler crashed making a pipeline: it is left out, its worker parked"
+    );
     if let Some(dir) = DIR.get() {
         use std::io::Write;
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(CRASHED_FILE));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(CRASHED_FILE));
         if let Ok(mut f) = file {
             let _ = writeln!(f, "{name}");
         }
@@ -683,8 +753,15 @@ fn create_guarded(
 ) -> windows::core::Result<ID3D12PipelineState> {
     if crashed_before(name) {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(name, "a pipeline the driver's compiler crashed on is left out"));
-        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+        ONCE.call_once(|| {
+            tracing::warn!(
+                name,
+                "a pipeline the driver's compiler crashed on is left out"
+            )
+        });
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ));
     }
     let _making = Making::new(name);
     create_retrying(create)
@@ -732,7 +809,10 @@ pub(crate) fn pipeline(
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
-                format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+                format!(
+                    "pipeline library: loaded {label} in {:.1} ms",
+                    began.elapsed().as_secs_f64() * 1e3
+                )
             });
             return Ok(pso);
         }
@@ -852,7 +932,9 @@ fn store_deferred_after_save(library: &Library) {
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let (Some(dir), Some(library)) = (DIR.get(), library()) else {
+        return;
+    };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -901,7 +983,11 @@ pub(crate) fn save(now: bool) {
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 {
+        replace_library(dir, &tmp)
+    } else {
+        Ok(())
+    };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -912,11 +998,19 @@ pub(crate) fn save(now: bool) {
         crate::host::trail(|| {
             format!(
                 "pipeline library: saved {bytes} bytes, {}",
-                if in_place { "renamed over the library's file" } else { "left beside the library's file for the next start" }
+                if in_place {
+                    "renamed over the library's file"
+                } else {
+                    "left beside the library's file for the next start"
+                }
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let slow: Vec<String> = slow_ones()
+        .iter()
+        .flatten()
+        .map(|(key, ms)| format!("{key} {ms}"))
+        .collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -924,12 +1018,28 @@ pub(crate) fn save(now: bool) {
     // library a system did not let replace the mapped one waits as
     // `NEXT_FILE`, and keeps its size and time when it is renamed).
     if written.is_ok() && PREBUILDING.load(Ordering::Relaxed) {
-        let file = [NEXT_FILE, LIBRARY_FILE].map(|f| dir.join(f)).into_iter().find(|f| f.exists());
-        let list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|keys| {
-            (keys.len(), keys.iter().map(String::as_str).collect::<Vec<_>>().join("\n"))
-        });
+        let file = [NEXT_FILE, LIBRARY_FILE]
+            .map(|f| dir.join(f))
+            .into_iter()
+            .find(|f| f.exists());
+        let list = PREBUILT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|keys| {
+                (
+                    keys.len(),
+                    keys.iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            });
         if let (Some(tag), Some((n, keys))) = (file.as_deref().and_then(tag), list) {
-            match write_atomically(&dir.join(PREBUILT_FILE), format!("{tag}\n{keys}").as_bytes()) {
+            match write_atomically(
+                &dir.join(PREBUILT_FILE),
+                format!("{tag}\n{keys}").as_bytes(),
+            ) {
                 Ok(()) => tracing::info!(pipelines = n, "pre-built pipelines listed"),
                 Err(e) => tracing::warn!(error = %e, "pre-built pipelines not listed"),
             }
@@ -956,7 +1066,11 @@ pub(crate) fn save(now: bool) {
 /// 1.3 GB more of the process's own memory for the seconds a save takes;
 /// through a buffer where the file cannot be mapped (and with
 /// `VICTORY_LIBRARY_MAP=0`).
-fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<()> {
+fn serialise(
+    library: &ID3D12PipelineLibrary1,
+    tmp: &std::path::Path,
+    size: usize,
+) -> std::io::Result<()> {
     let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
     if mapped()
         && let Some(mut file) = Mapped::create(tmp, size)
@@ -977,7 +1091,8 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE))
+        .or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -1009,7 +1124,10 @@ static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(
 fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
     if slow.is_none() {
-        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok())
+            .unwrap_or_default();
         *slow = Some(
             listed
                 .lines()
@@ -1033,7 +1151,10 @@ pub(crate) fn note_time(key: &str, ms: u64) {
         return;
     }
     let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    let known = slow
+        .get_or_insert_default()
+        .entry(key.to_owned())
+        .or_insert(0);
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -1055,7 +1176,12 @@ static PREBUILT_CHANGED: AtomicBool = AtomicBool::new(false);
 /// switches it reads, the shader cache's and the host description's code).
 fn tag(file: &std::path::Path) -> Option<String> {
     let meta = std::fs::metadata(file).ok()?;
-    let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let time = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     let mut h = blake3::Hasher::new();
     for part in [
         &meta.len().to_le_bytes()[..],
@@ -1091,21 +1217,36 @@ pub(crate) fn start_prebuild() {
         .get()
         .and_then(|d| {
             let tag = tag(&d.join(LIBRARY_FILE))?;
-            Some(listed(&std::fs::read_to_string(d.join(PREBUILT_FILE)).ok()?, &tag))
+            Some(listed(
+                &std::fs::read_to_string(d.join(PREBUILT_FILE)).ok()?,
+                &tag,
+            ))
         })
         .unwrap_or_default();
-    tracing::info!(pipelines = keys.len(), "pre-built pipelines already in the library");
+    tracing::info!(
+        pipelines = keys.len(),
+        "pre-built pipelines already in the library"
+    );
     *PREBUILT.lock().unwrap_or_else(|e| e.into_inner()) = Some(keys);
 }
 
 /// Whether the pre-build has the title pipeline `key` in the library.
 pub(crate) fn prebuilt(key: &str) -> bool {
-    PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|k| k.contains(key))
+    PREBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|k| k.contains(key))
 }
 
 /// The pre-build has the title pipeline `key` in the library now.
 pub(crate) fn note_prebuilt(key: String) {
-    if PREBUILT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(key) {
+    if PREBUILT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(key)
+    {
         PREBUILT_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -1121,7 +1262,11 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let set: HashSet<String> = listed
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
@@ -1161,7 +1306,10 @@ mod tests {
     fn a_store_during_a_save_does_not_wait() {
         let saving = RwLock::new(());
         let alone = saving.write().unwrap();
-        assert!(matches!(saving.try_read(), Err(std::sync::TryLockError::WouldBlock)));
+        assert!(matches!(
+            saving.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
         drop(alone);
         assert!(saving.try_read().is_ok());
         assert!(defer_room(0));
@@ -1181,7 +1329,11 @@ mod tests {
         let mut calls = 0;
         let made = retry_out_of_memory(&serial, || {
             calls += 1;
-            if calls < 3 { Err(out_of_memory()) } else { Ok(calls) }
+            if calls < 3 {
+                Err(out_of_memory())
+            } else {
+                Ok(calls)
+            }
         });
         assert_eq!(made.unwrap(), 3);
         let mut calls = 0;
@@ -1202,14 +1354,20 @@ mod tests {
             calls += 1;
             Err(out_of_memory())
         });
-        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_OUTOFMEMORY);
+        assert_eq!(
+            made.unwrap_err().code(),
+            windows::Win32::Foundation::E_OUTOFMEMORY
+        );
         assert_eq!(calls, 2 + OOM_SERIAL_ATTEMPTS);
         let mut calls = 0;
         let made = retry_out_of_memory(&serial, || -> windows::core::Result<()> {
             calls += 1;
             Err(windows::Win32::Foundation::E_INVALIDARG.into())
         });
-        assert_eq!(made.unwrap_err().code(), windows::Win32::Foundation::E_INVALIDARG);
+        assert_eq!(
+            made.unwrap_err().code(),
+            windows::Win32::Foundation::E_INVALIDARG
+        );
         assert_eq!(calls, 1);
     }
 
@@ -1227,10 +1385,12 @@ mod tests {
 
     #[test]
     fn a_rejected_blob_gives_an_empty_library() {
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
+        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
+        else {
             return; // no host GPU here
         };
-        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16))).expect("an empty library");
+        let library = open(&device, Blob::Held(b"not a pipeline library".repeat(16)))
+            .expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(matches!(library._blob, Blob::None));
@@ -1272,7 +1432,9 @@ mod tests {
     /// The bytes at `at` of the pattern the test below writes.
     fn pattern(at: usize, out: &mut [u8]) {
         for (i, word) in out.chunks_exact_mut(4).enumerate() {
-            let v = ((at / 4 + i) as u32).wrapping_mul(2_654_435_761).wrapping_add(1);
+            let v = ((at / 4 + i) as u32)
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(1);
             word.copy_from_slice(&v.to_le_bytes());
         }
     }
@@ -1334,7 +1496,10 @@ mod tests {
         let mut expected = vec![0u8; 4096];
         for (page, bytes) in mapped.bytes().chunks(4096).enumerate() {
             pattern(page * 4096, &mut expected);
-            assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
+            assert!(
+                bytes == &expected[..],
+                "page {page} of the replaced library no longer reads as the old file"
+            );
         }
     }
 

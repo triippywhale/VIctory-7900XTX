@@ -17,13 +17,18 @@ struct Asked {
 fn parse(text: &str) -> Option<Asked> {
     let mut parts = text.split(',').map(str::trim);
     let seconds = parts.next()?.parse::<f64>().ok().filter(|s| *s > 1.0)?;
-    let switches: Vec<String> = parts.filter(|s| !s.is_empty()).map(str::to_string).collect();
+    let switches: Vec<String> = parts
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
     (!switches.is_empty() && switches.len() <= 8).then_some(Asked { seconds, switches })
 }
 
 fn asked() -> Option<&'static Asked> {
     static ASKED: OnceLock<Option<Asked>> = OnceLock::new();
-    ASKED.get_or_init(|| parse(&std::env::var("VICTORY_AB").ok()?)).as_ref()
+    ASKED
+        .get_or_init(|| parse(&std::env::var("VICTORY_AB").ok()?))
+        .as_ref()
 }
 
 /// The switches that are on now, a bit each.
@@ -62,7 +67,11 @@ fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
     }
     let mean = frames.iter().sum::<f32>() / frames.len() as f32;
     frames.sort_by(f32::total_cmp);
-    (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10])
+    (
+        mean,
+        frames[frames.len() / 2],
+        frames[frames.len() * 9 / 10],
+    )
 }
 
 /// The title's present ends on this thread. `change`: called when another
@@ -97,7 +106,13 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
     let (was, will) = (bits(p.number), bits(number));
     let (mean, median, most) = summary(&mut p.frames);
-    let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
+    let on: Vec<&str> = asked
+        .switches
+        .iter()
+        .enumerate()
+        .filter(|(n, _)| was >> n & 1 != 0)
+        .map(|(_, s)| s.as_str())
+        .collect();
     tracing::info!(
         "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
         p.number,
@@ -120,7 +135,10 @@ mod tests {
     #[test]
     fn switches_and_seconds_are_read_and_frames_summed_up() {
         let a = parse("10, VICTORY_A,VICTORY_B").unwrap();
-        assert_eq!((a.seconds, a.switches), (10.0, vec!["VICTORY_A".to_string(), "VICTORY_B".to_string()]));
+        assert_eq!(
+            (a.seconds, a.switches),
+            (10.0, vec!["VICTORY_A".to_string(), "VICTORY_B".to_string()])
+        );
         assert!(parse("10").is_none());
         assert!(parse("x,VICTORY_A").is_none());
         assert!(parse("0,VICTORY_A").is_none());

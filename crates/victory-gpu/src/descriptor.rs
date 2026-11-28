@@ -193,7 +193,9 @@ fn sync_on() -> bool {
 #[cfg(windows)]
 fn sync_aside() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0")
+    })
 }
 
 /// How long that thread waits for a submission before it makes a round of its
@@ -205,14 +207,18 @@ fn sync_aside() -> bool {
 fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4u64);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
 
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) =
+    (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
@@ -228,46 +234,55 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
-        let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
-            crate::cores::keep_on_fast_cores("victory-heap-sync");
-            crate::cores::many_ahead("victory-heap-sync");
-            let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-            /// A round is over, however it ends.
-            struct Over;
-            impl Drop for Over {
-                fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
-                    SYNC_ROUNDS.1.notify_all();
-                }
-            }
-            // Between the rounds asked for, while submissions come.
-            let mut last = std::time::Instant::now();
-            loop {
-                let mut r = rounds();
-                let mut asked = r.0 != r.1;
-                while !asked {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
-                        r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
-                        continue;
-                    };
-                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
-                    r = back;
-                    asked = r.0 != r.1;
-                    if over.timed_out() {
-                        break;
+        let made = std::thread::Builder::new()
+            .name("victory-heap-sync".into())
+            .spawn(|| {
+                crate::cores::keep_on_fast_cores("victory-heap-sync");
+                crate::cores::many_ahead("victory-heap-sync");
+                let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+                /// A round is over, however it ends.
+                struct Over;
+                impl Drop for Over {
+                    fn drop(&mut self) {
+                        SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                        SYNC_ROUNDS.1.notify_all();
                     }
                 }
-                drop(r);
-                let _over = asked.then(|| {
-                    last = std::time::Instant::now();
-                    Over
-                });
-                let _round =
-                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
-                let _ = std::panic::catch_unwind(sync_heaps);
-            }
-        });
+                // Between the rounds asked for, while submissions come.
+                let mut last = std::time::Instant::now();
+                loop {
+                    let mut r = rounds();
+                    let mut asked = r.0 != r.1;
+                    while !asked {
+                        let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500)
+                        else {
+                            r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                            asked = r.0 != r.1;
+                            continue;
+                        };
+                        let (back, over) = SYNC_ROUNDS
+                            .1
+                            .wait_timeout(r, every)
+                            .unwrap_or_else(|e| e.into_inner());
+                        r = back;
+                        asked = r.0 != r.1;
+                        if over.timed_out() {
+                            break;
+                        }
+                    }
+                    drop(r);
+                    let _over = asked.then(|| {
+                        last = std::time::Instant::now();
+                        Over
+                    });
+                    let _round = crate::timeline::span(if asked {
+                        "the heaps' records, for a submission"
+                    } else {
+                        "the heaps' records, early"
+                    });
+                    let _ = std::panic::catch_unwind(sync_heaps);
+                }
+            });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
     if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
@@ -302,9 +317,11 @@ pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
     drop(rounds);
     if asked {
         SYNC_ROUNDS.1.notify_all();
-        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
-        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     SyncedHeaps(Some(mark))
 }
@@ -328,7 +345,8 @@ pub(crate) fn round_after_now() -> u64 {
         rounds.0 = round;
         drop(rounds);
         SYNC_ROUNDS.1.notify_all();
-        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     round
 }
@@ -352,7 +370,11 @@ pub(crate) fn round_mark() -> u64 {
 #[cfg(windows)]
 pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
     let (from, to) = (at as u64, at as u64 + len as u64);
-    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
+    SHADER_HEAPS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(start, end, _)| from < end && start < to)
 }
 
 #[cfg(windows)]
@@ -364,10 +386,16 @@ impl Drop for SyncedHeaps {
         let began = std::time::Instant::now();
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
         while rounds.1 < mine {
-            rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
+            rounds = SYNC_ROUNDS
+                .1
+                .wait(rounds)
+                .unwrap_or_else(|e| e.into_inner());
         }
         drop(rounds);
-        SYNCED[6].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        SYNCED[6].fetch_add(
+            began.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 
@@ -387,7 +415,8 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored, mut tabled, mut later) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
@@ -439,7 +468,8 @@ pub(crate) fn sync_heaps() {
             // Renderer port #2: the slots the title's patched stores and our
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
-            let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
+            let phase =
+                crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
             for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
                 let from = start as usize + first as usize * step as usize;
                 parts.push((from, from + n as usize * step as usize, false));
@@ -447,14 +477,20 @@ pub(crate) fn sync_heaps() {
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
-                let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
+                let phase = crate::timeline::span(
+                    "the heaps' records: asking (renderer port 2's fallback)",
+                );
                 let taken = written.take(start as usize, end as usize);
                 phase.end();
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
             for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                parts.push((
+                    page.max(start as usize),
+                    (page + crate::watch::PAGE).min(end as usize),
+                    true,
+                ));
             }
         } else {
             let began = std::time::Instant::now();
@@ -465,13 +501,21 @@ pub(crate) fn sync_heaps() {
             for (range_from, range_end) in taken {
                 let mut page = range_from & !(crate::watch::PAGE - 1);
                 while page < range_end {
-                    parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end), false));
+                    parts.push((
+                        page.max(range_from),
+                        (page + crate::watch::PAGE).min(range_end),
+                        false,
+                    ));
                     page += crate::watch::PAGE;
                 }
             }
         }
         // The marks' runs are short: more of them a job.
-        let pages_a_job = if port { pages_a_job.max(parts.len() / 48) } else { pages_a_job };
+        let pages_a_job = if port {
+            pages_a_job.max(parts.len() / 48)
+        } else {
+            pages_a_job
+        };
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
         // thread at 160 pages, run faults-6).
@@ -479,7 +523,10 @@ pub(crate) fn sync_heaps() {
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
         let in_place = sync_in_place() && step == 32 && crate::safecopy::on();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts
+            .chunks(pages_a_job)
+            .map(|_| Default::default())
+            .collect();
         let phase = crate::timeline::span("the heaps' records: pages read and compared");
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
@@ -491,17 +538,28 @@ pub(crate) fn sync_heaps() {
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
-                let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                let first = ((from - start as usize) as u64)
+                    .div_ceil(step)
+                    .max(slots.start);
                 let lead = (start + first * step) as usize;
                 let records: &[u8] = if in_place {
                     // Read where they are, each record once, and compared
                     // as it is read (`host::Copied::changes_in_place`).
                     let at = std::time::Instant::now();
-                    let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
+                    let count = (to.saturating_sub(lead) as u64 / step)
+                        .min(slots.end.saturating_sub(first));
                     changed.clear();
                     // SAFETY: as below; title memory is read by a copy that
                     // fails where a page is not there.
-                    let whole = unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
+                    let whole = unsafe {
+                        copied.changes_in_place(
+                            first as u32,
+                            lead as *const u8,
+                            count as usize,
+                            &mut bits,
+                            &mut changed,
+                        )
+                    };
                     out.ns[1] += since(at);
                     // (A run of marked slots is no page; nor does it ask the guards.)
                     if !port || check {
@@ -540,7 +598,13 @@ pub(crate) fn sync_heaps() {
                     let at = std::time::Instant::now();
                     // SAFETY: the parts are ranges of the heap apart from one
                     // another, and only records that lie whole in one are its.
-                    unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                    unsafe {
+                        copied.changes(
+                            first as u32,
+                            &records[..(count * step) as usize],
+                            &mut changed,
+                        )
+                    };
                     out.ns[1] += since(at);
                     records
                 };
@@ -555,7 +619,12 @@ pub(crate) fn sync_heaps() {
                     };
                     if check {
                         // Renderer port #2's fallback: what no mark told of.
-                        crate::port_descriptors::missed(index, start + u64::from(index) * step, !samplers && word(0) == VIEW_TAG, host.copied_tabled(index, frame));
+                        crate::port_descriptors::missed(
+                            index,
+                            start + u64::from(index) * step,
+                            !samplers && word(0) == VIEW_TAG,
+                            host.copied_tabled(index, frame),
+                        );
                     }
                     if !samplers && word(0) == VIEW_TAG {
                         // A draw's own table: the draw makes what it
@@ -568,7 +637,8 @@ pub(crate) fn sync_heaps() {
                         // slot from this anyway, they wait for a draw
                         // or a pass: noted some frames on, unless a
                         // draw's table turns out to hold them.
-                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits()
+                        {
                             out.wait.push(index);
                             continue;
                         }
@@ -637,11 +707,17 @@ pub(crate) fn sync_heaps() {
     }
     drop(heaps);
     let micros = started.elapsed().as_micros() as u64;
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
+    for (count, n) in SYNCED
+        .iter()
+        .zip([pages, looked, mirrored, micros, tabled, later])
+    {
         count.fetch_add(n, Relaxed);
     }
     let [taking, reading, making] = spent;
-    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, making]) {
+    for (count, n) in SYNC_SPLIT
+        .iter()
+        .zip([views, bytes, taking, reading, making])
+    {
         count.fetch_add(n, Relaxed);
     }
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
@@ -686,7 +762,8 @@ fn sync_in_place() -> bool {
 /// nanoseconds reading pages, comparing them with what was last seen, and
 /// sorting out the records that changed.
 #[cfg(windows)]
-static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Pages and records [`sync_heaps`] gives a thread at a time
 /// (`VICTORY_SYNC_FINE=1`: [`SYNC_PAGES_FINE`] and [`SYNC_AT_A_TIME_FINE`];
@@ -698,12 +775,17 @@ static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::ato
 #[cfg(windows)]
 fn sync_jobs() -> (usize, usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let default_fine = || *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_some_and(|v| v != "0"));
+    let default_fine =
+        || *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FINE").is_some_and(|v| v != "0"));
     #[cfg(feature = "diagnostics")]
     let fine = crate::ab::pick("VICTORY_SYNC_FINE").unwrap_or_else(default_fine);
     #[cfg(not(feature = "diagnostics"))]
     let fine = default_fine();
-    if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
+    if fine {
+        (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE)
+    } else {
+        (SYNC_PAGES, SYNC_AT_A_TIME)
+    }
 }
 
 #[cfg(windows)]
@@ -715,7 +797,8 @@ const SYNC_AT_A_TIME_FINE: usize = 64;
 /// Of those mirrored, since the last frame line: no view, a view of an object,
 /// another, a sampler; waited and no draw came.
 #[cfg(windows)]
-static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What a thread found on its pages of a heap, for [`sync_heaps`].
 #[cfg(windows)]
@@ -751,13 +834,15 @@ const SYNC_AT_A_TIME: usize = 256;
 /// records that waited for one ([`host::HostHeap::copied_wait`]); and the
 /// microseconds submissions waited for it ([`sync_aside`]).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// The same, of [`SYNCED`]'s pages: those in view memory that was guarded;
 /// bytes read; nanoseconds asking what was written, reading it and comparing
 /// it with what was last seen, making views.
 #[cfg(windows)]
-static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
@@ -766,7 +851,8 @@ pub(crate) fn sync_line(frames: f64) {
     crate::port_descriptors::line(frames);
     crate::draw::in_place_indirect_line(frames);
     crate::draw::table_memo_line(frames);
-    let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [twins, moved, lost] =
+        [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
             "raw twins of buffer views made per frame (VICTORY_RAW_VIEWS=0: none): {:.0}, of them {:.1} that do not begin on 16 bytes ({:.1} null)",
@@ -775,11 +861,18 @@ pub(crate) fn sync_line(frames: f64) {
             lost as f64 / frames
         );
     }
-    let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
-    let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
-    let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
-    let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let [pages, looked, mirrored, micros, tabled, later, waited] =
+        [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let split =
+        [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let kinds = [0, 1, 2, 3, 4]
+        .map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let jobs = [0, 1, 2].map(|i| {
+        SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames
+    });
+    let quick = [0, 1].map(|i| {
+        host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
+    });
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
     if pages == 0 {
         return;
@@ -867,7 +960,10 @@ pub(crate) fn lent_heap() -> Option<usize> {
 pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T> {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     // SAFETY: registered heaps are live (removed when dropped).
-    heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
+    heaps
+        .iter()
+        .any(|&(_, _, h)| h == heap)
+        .then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -1171,7 +1267,8 @@ fn inline() -> bool {
 
 /// Views named whole in their records since the start: constant buffer
 /// views, views of placed memory (for the memory line).
-static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static NAMED_WHOLE: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The two record words of the 62 bits `payload` of kind `kind`.
 fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
@@ -1199,14 +1296,21 @@ fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
     } else {
         return None;
     };
-    Some(kind_words(CONSTANT, code << CONSTANT_ADDRESS_BITS | address))
+    Some(kind_words(
+        CONSTANT,
+        code << CONSTANT_ADDRESS_BITS | address,
+    ))
 }
 
 /// The constant buffer view [`constant_words`] named.
 fn constant_of(i: u32, generation: u32) -> View {
     let payload = payload(i, generation);
     let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
-    let size = if code >> 14 == 0 { code } else { (code & 0x3fff) << 8 };
+    let size = if code >> 14 == 0 {
+        code
+    } else {
+        (code & 0x3fff) << 8
+    };
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
@@ -1247,7 +1351,8 @@ impl Views {
     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
         let payload = payload(i, generation);
         let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
-        let &(unordered, resource, rest) = self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+        let &(unordered, resource, rest) =
+            self.shapes.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
         let mut desc = [0u32; 16];
         desc[..10].copy_from_slice(&rest[..10]);
         (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
@@ -1462,7 +1567,10 @@ pub(crate) fn make_waiting() {
             // there.)
             // (The heap stays while the lock is held: `mirror`.)
             let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-            let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
+            let Some(&(_, _, at)) = heaps
+                .iter()
+                .find(|&&(start, end, _)| (start..end).contains(&handle))
+            else {
                 continue;
             };
             // SAFETY: a registered heap, live while the lock is held.
@@ -1847,8 +1955,16 @@ mod tests {
     #[cfg(windows)]
     pub(crate) fn with_test_view_heap(run: impl FnOnce(&Heap)) {
         let mut this = std::ptr::null();
-        let desc = HeapDesc { kind: VIEWS_KIND, count: 4, flags: SHADER_VISIBLE, nodes: 0 };
-        let placement = Placement { address: 0, size: 0 };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address: 0,
+            size: 0,
+        };
         assert_eq!(create(desc, placement, &mut this), S_OK);
         struct TestHeap(This);
         impl Drop for TestHeap {
@@ -2043,15 +2159,44 @@ mod tests {
     #[test]
     fn constant_views_fit_their_records() {
         let top = (1u64 << CONSTANT_ADDRESS_BITS) - 1;
-        for address in [0u64, 0x100, 0x2602_0000, 0xd_6b60_0000, 0x7ffd_a34f_0000, top] {
-            for size in [0u32, 1, 255, 256, 4000, (1 << 14) - 1, 1 << 14, 65536, (1 << 22) - 256] {
+        for address in [
+            0u64,
+            0x100,
+            0x2602_0000,
+            0xd_6b60_0000,
+            0x7ffd_a34f_0000,
+            top,
+        ] {
+            for size in [
+                0u32,
+                1,
+                255,
+                256,
+                4000,
+                (1 << 14) - 1,
+                1 << 14,
+                65536,
+                (1 << 22) - 256,
+            ] {
                 let [i, generation] = constant_words(address, size).expect("fits");
                 assert_eq!(generation >> KIND_SHIFT, CONSTANT);
-                assert_eq!(view_at(i, generation), Some(View::Constant(address, size)), "{address:#x} {size}");
+                assert_eq!(
+                    view_at(i, generation),
+                    Some(View::Constant(address, size)),
+                    "{address:#x} {size}"
+                );
             }
         }
-        assert_eq!(constant_words(top + 1, 256), None, "an address past 47 bits");
-        assert_eq!(constant_words(0x1000, (1 << 14) + 1), None, "16 KiB or more, no multiple of 256");
+        assert_eq!(
+            constant_words(top + 1, 256),
+            None,
+            "an address past 47 bits"
+        );
+        assert_eq!(
+            constant_words(0x1000, (1 << 14) + 1),
+            None,
+            "16 KiB or more, no multiple of 256"
+        );
         assert_eq!(constant_words(0x1000, 1 << 22), None, "4 MiB");
         // Different views never share their words.
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
@@ -2078,8 +2223,24 @@ mod tests {
             View::Placed(_, r, _) => *r == resource,
             _ => false,
         };
-        let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let entries = || {
+            VIEWS
+                .read()
+                .unwrap()
+                .list
+                .iter()
+                .filter(|(v, _)| mine(v))
+                .count()
+        };
+        let shapes = || {
+            VIEWS
+                .read()
+                .unwrap()
+                .shapes
+                .iter()
+                .filter(|s| s.1 == resource)
+                .count()
+        };
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);

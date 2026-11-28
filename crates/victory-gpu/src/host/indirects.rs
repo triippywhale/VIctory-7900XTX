@@ -45,12 +45,27 @@ impl Indirects {
     /// An indirect execution of `kind` (the argument's type) of at most
     /// `count` records with `pipeline` (a host object) and user data.
     /// A direct mesh dispatch of `count` groups is of kind [`DIRECT`].
-    pub(crate) fn note(&mut self, pipeline: usize, name: &str, kind: u32, count: u32, user: &[u32]) {
-        self.names.entry(pipeline).or_insert_with(|| name.to_owned());
+    pub(crate) fn note(
+        &mut self,
+        pipeline: usize,
+        name: &str,
+        kind: u32,
+        count: u32,
+        user: &[u32],
+    ) {
+        self.names
+            .entry(pipeline)
+            .or_insert_with(|| name.to_owned());
         let used = user.len().min(WORDS);
         let mut words = [0; WORDS];
         words[..used].copy_from_slice(&user[..used]);
-        let ran = Ran { pipeline, kind, count, words, used: used as u8 };
+        let ran = Ran {
+            pipeline,
+            kind,
+            count,
+            words,
+            used: used as u8,
+        };
         if kind == DIRECT {
             self.meshes.push(ran);
         } else {
@@ -70,13 +85,22 @@ impl Indirects {
     /// its user data.
     pub(crate) fn nth(&self, nth: usize, direct: bool) -> Option<(String, &[u32])> {
         let ran = if direct { &self.meshes } else { &self.ran }.get(nth)?;
-        let name = self.names.get(&ran.pipeline).map_or("a pipeline", String::as_str);
+        let name = self
+            .names
+            .get(&ran.pipeline)
+            .map_or("a pipeline", String::as_str);
         let words = &ran.words[..usize::from(ran.used)];
         Some((
             if direct {
-                format!("{name} (a mesh dispatch of {} groups, the list's {nth}, user data {words:x?})", ran.count)
+                format!(
+                    "{name} (a mesh dispatch of {} groups, the list's {nth}, user data {words:x?})",
+                    ran.count
+                )
             } else {
-                format!("{name} (indirect kind {} max {}, the list's indirect execution {nth}, user data {words:x?})", ran.kind, ran.count)
+                format!(
+                    "{name} (indirect kind {} max {}, the list's indirect execution {nth}, user data {words:x?})",
+                    ran.kind, ran.count
+                )
             },
             words,
         ))
@@ -86,7 +110,10 @@ impl Indirects {
 /// How many indirect executions come before command `at` of a history of
 /// breadcrumb operations (`is` tells them): which of a list's it is.
 pub(crate) fn before<T>(history: &[T], at: usize, is: impl Fn(&T) -> bool) -> usize {
-    history[..at.min(history.len())].iter().filter(|op| is(op)).count()
+    history[..at.min(history.len())]
+        .iter()
+        .filter(|op| is(op))
+        .count()
 }
 
 /// The heap slots the user data may name, for the report to describe: the
@@ -99,7 +126,11 @@ pub(crate) fn slots(words: &[u32], count: u32, table: u32) -> Vec<(usize, u32)> 
             out.push((i, word));
         }
         if word % 32 == 0 && word / 32 > 16 && word / 32 < count {
-            out.extend((0..table).map(|k| (i, word / 32 + k)).filter(|s| s.1 < count));
+            out.extend(
+                (0..table)
+                    .map(|k| (i, word / 32 + k))
+                    .filter(|s| s.1 < count),
+            );
         }
     }
     out
@@ -122,14 +153,23 @@ mod tests {
         let nth = before(&history, 3, |op| *op == 5);
         assert_eq!(nth, 1);
         let (text, words) = all.nth(nth, false).unwrap();
-        assert!(text.starts_with("[compute b] (indirect kind 2 max 1"), "{text}");
+        assert!(
+            text.starts_with("[compute b] (indirect kind 2 max 1"),
+            "{text}"
+        );
         assert_eq!(words, [7; WORDS]);
         all.note(2, "[mesh b]", DIRECT, 9, &[1]);
         let (text, _) = all.nth(0, true).unwrap();
-        assert!(text.starts_with("[compute b] (a mesh dispatch of 9 groups"), "{text}");
+        assert!(
+            text.starts_with("[compute b] (a mesh dispatch of 9 groups"),
+            "{text}"
+        );
         assert!(all.nth(1, true).is_none());
         let (text, words) = all.nth(2, false).unwrap();
-        assert!(text.starts_with("[compute a] (indirect kind 10 max 4"), "{text}");
+        assert!(
+            text.starts_with("[compute a] (indirect kind 10 max 4"),
+            "{text}"
+        );
         assert!(words.is_empty());
         assert!(all.nth(3, false).is_none());
         assert_eq!(before(&history, 99, |op| *op == 5), 3);
@@ -143,6 +183,14 @@ mod tests {
     fn user_data_names_slots() {
         let words = [0, 0x2549f40, 0x20, 0x11, 0x26f1, 0xffff_ffff];
         let slots = slots(&words, 1_245_184, 2);
-        assert_eq!(slots, [(1, 0x2549f40 / 32), (1, 0x2549f40 / 32 + 1), (3, 0x11), (4, 0x26f1)]);
+        assert_eq!(
+            slots,
+            [
+                (1, 0x2549f40 / 32),
+                (1, 0x2549f40 / 32 + 1),
+                (3, 0x11),
+                (4, 0x26f1)
+            ]
+        );
     }
 }

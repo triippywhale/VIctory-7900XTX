@@ -90,6 +90,9 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
+#[cfg(feature = "diagnostics")]
+mod stores;
+
 /// Copies that can be numbered (the run of heap slots is one longer).
 const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
@@ -202,7 +205,9 @@ pub(crate) enum Use {
     Reads,
     /// Stores by address, as the structure builder; `back`: its results in
     /// small title buffers come back.
-    Builds { back: bool },
+    Builds {
+        back: bool,
+    },
 }
 
 /// A page of title memory in an arena.
@@ -311,6 +316,8 @@ struct Memory {
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
     trace: trace::Trace,
+    #[cfg(feature = "diagnostics")]
+    stores: stores::Stores,
 }
 
 /// Since the last report.
@@ -368,6 +375,9 @@ pub(crate) struct Ready {
     /// number. False once the numbers have run out ([`COPIES`]): what it
     /// names then reads zeros, a dropped stage for the structure builder.
     pub(crate) whole: bool,
+    /// (`VICTORY_BVH_STORES=1`) The dispatch's tag in the builder's store
+    /// notes; 0 otherwise.
+    pub(crate) tag: u32,
 }
 
 impl Memory {
@@ -377,13 +387,18 @@ impl Memory {
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
-        crate::host::name(&directory.buffer, || "title memory by address: directory".into());
+        crate::host::name(&directory.buffer, || {
+            "title memory by address: directory".into()
+        });
         // Twice the notes a shader knows of: the programs that walk leave
         // theirs in the first half, the builder in the second ([`ready`]).
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 8)?;
+        // After them the builder's store notes (`VICTORY_BVH_STORES=1`).
+        let notes =
+            MEMORY_FAULTS as usize * 8 + victory_shader::emit::MEMORY_STORE_NOTES as usize * 4;
+        let (faults, data) = host.shared_buffer(notes as u64)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 8) };
+        unsafe { std::ptr::write_bytes(data, 0, notes) };
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -410,7 +425,10 @@ impl Memory {
             fault_order: Default::default(),
             fault_held: [0; 2],
             given: HashMap::new(),
-            wanted: [vec![0; MEMORY_PAGES as usize / 64], vec![0; MEMORY_PAGES as usize / 64]],
+            wanted: [
+                vec![0; MEMORY_PAGES as usize / 64],
+                vec![0; MEMORY_PAGES as usize / 64],
+            ],
             wanted_pages: [0; 2],
             room: None,
             full: false,
@@ -425,6 +443,8 @@ impl Memory {
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
             trace: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            stores: Default::default(),
         })
     }
 
@@ -566,7 +586,12 @@ impl Memory {
         }
         if self.pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    MOST,
+                    "title memory by address: no more pages are taken; others read zeros"
+                )
+            });
             return false;
         }
         if self.free.is_empty() && !self.another() {
@@ -609,7 +634,9 @@ impl Memory {
     /// every ray crosses the bus). Asked once a frame.
     fn card_room(&mut self) -> bool {
         *self.room.get_or_insert_with(|| {
-            host().and_then(|h| h.video_memory()).is_none_or(|[budget, used, ..]| used + ARENA < budget / 100 * 97)
+            host()
+                .and_then(|h| h.video_memory())
+                .is_none_or(|[budget, used, ..]| used + ARENA < budget / 100 * 97)
         })
     }
 
@@ -617,7 +644,8 @@ impl Memory {
     /// card has room for the arena it may come to take; else the place of
     /// the oldest such page.
     fn fault_room(&mut self) -> bool {
-        (self.fault_held[0] + self.fault_held[1] < faults_most() && self.card_room()) || self.give_back()
+        (self.fault_held[0] + self.fault_held[1] < faults_most() && self.card_room())
+            || self.give_back()
     }
 
     /// Gives back the oldest page held from a fault, unless it is younger
@@ -627,7 +655,12 @@ impl Memory {
     fn give_back(&mut self) -> bool {
         let kind = goes_first(self.fault_held, faults_most());
         while let Some(&(page, serial)) = self.fault_order[kind].front() {
-            let Some(born) = self.pages.get(&page).filter(|h| h.serial == serial && h.fault != 0).map(|h| h.born) else {
+            let Some(born) = self
+                .pages
+                .get(&page)
+                .filter(|h| h.serial == serial && h.fault != 0)
+                .map(|h| h.born)
+            else {
                 // Named by a list since, or gone.
                 self.fault_order[kind].pop_front();
                 continue;
@@ -647,7 +680,9 @@ impl Memory {
     /// `page`, held from a fault, is given up: its place is free and shaders
     /// find it empty again.
     fn let_go(&mut self, page: u64) {
-        let Some(held) = self.pages.remove(&page) else { return };
+        let Some(held) = self.pages.remove(&page) else {
+            return;
+        };
         if held.fault != 0 {
             self.fault_held[usize::from(held.fault) - 1] -= 1;
         }
@@ -682,12 +717,17 @@ impl Memory {
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
-        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s))
+        else {
             return false;
         };
         self.arenas.push((n, at));
         // The lowest first.
-        self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
+        self.free.extend(
+            (0..(ARENA / PAGE) as usize)
+                .rev()
+                .map(|i| (n, at + i * PAGE as usize)),
+        );
         true
     }
 
@@ -697,10 +737,24 @@ impl Memory {
         let serial = self.holdings;
         self.pages.insert(
             page,
-            Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, serial, fault: 0, owners: 0, theirs: false },
+            Held {
+                at,
+                copy,
+                taken: 0,
+                looked: u64::MAX,
+                born: self.frame,
+                serial,
+                fault: 0,
+                owners: 0,
+                theirs: false,
+            },
         );
         self.order.push((page, serial));
-        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        fill(
+            self.entry(page),
+            copy,
+            at as u64 - self.copies[copy].span().0,
+        );
         self.shares(page);
     }
 
@@ -734,13 +788,22 @@ impl Memory {
     fn mirror(&mut self, list: &HostList) {
         let mut copies = 0;
         for (&page, buffers) in &self.over {
-            let Some(k) = self.copy_of(page) else { continue };
+            let Some(k) = self.copy_of(page) else {
+                continue;
+            };
             let to = &self.copies[k];
             // An arena's page lies at its place in the arena's memory; a
             // window is title memory itself.
-            let base = self.pages.get(&page).map_or(page * PAGE, |held| held.at as u64);
+            let base = self
+                .pages
+                .get(&page)
+                .map_or(page * PAGE, |held| held.at as u64);
             for &(start, len) in buffers {
-                let Some(from) = crate::shadow::peek(start, 1).filter(|s| s.written() && !s.in_place()) else { continue };
+                let Some(from) =
+                    crate::shadow::peek(start, 1).filter(|s| s.written() && !s.in_place())
+                else {
+                    continue;
+                };
                 let (lo, hi) = (start.max(page * PAGE), (start + len).min((page + 1) * PAGE));
                 if lo < hi && list.mirror_copy(&from, lo, to, base + (lo - page * PAGE), hi - lo) {
                     copies += 1;
@@ -756,7 +819,10 @@ impl Memory {
     fn tell(&mut self, copy: usize, at: usize) {
         // (Noted with the switch off too: `VICTORY_AB` turns it on and off.)
         let offset = (at - self.copies[copy].span().0 as usize) / PAGE as usize;
-        self.told.entry(copy).or_default().insert(offset, self.frame);
+        self.told
+            .entry(copy)
+            .or_default()
+            .insert(offset, self.frame);
     }
 
     /// The runs (byte offsets) of the pages of the arena that is `copy` told
@@ -782,9 +848,13 @@ impl Memory {
     /// The packed structure at `address` is gone: the pages it alone had are
     /// given back.
     fn gone(&mut self, address: u64) {
-        let Some(packed) = self.packed.remove(&address) else { return };
+        let Some(packed) = self.packed.remove(&address) else {
+            return;
+        };
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
-            let Some(held) = self.pages.get_mut(&page) else { continue };
+            let Some(held) = self.pages.get_mut(&page) else {
+                continue;
+            };
             held.owners = held.owners.saturating_sub(1);
             if held.owners == 0 && held.theirs {
                 self.free.push((held.copy, held.at));
@@ -802,7 +872,9 @@ impl Memory {
         crate::texture::committed(address as *const u8, 8) && {
             crate::left::before_take(address as usize, address as usize + 8, 0);
             crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
-            self.packed.get(&address).is_some_and(|p| p.header == u64::from_le_bytes(header))
+            self.packed
+                .get(&address)
+                .is_some_and(|p| p.header == u64::from_le_bytes(header))
         }
     }
 
@@ -817,7 +889,11 @@ impl Memory {
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
             let (page, serial) = self.order[self.sweep];
-            let fault = self.pages.get(&page).filter(|h| h.serial == serial).map(|h| h.fault);
+            let fault = self
+                .pages
+                .get(&page)
+                .filter(|h| h.serial == serial)
+                .map(|h| h.fault);
             // The title's memory under a page from a fault is gone: so is
             // what was read there. (A question to the system: put for a
             // page every fourth time the sweep comes to it.)
@@ -855,7 +931,11 @@ impl Memory {
     /// A dispatch of the builder was given `address` to write: if it is in a
     /// title buffer's copy, stores by address reach that from here on.
     fn opens(&mut self, address: u64) {
-        let Some(n) = self.map(address / PAGE).then(|| self.copy_of(address / PAGE)).flatten() else {
+        let Some(n) = self
+            .map(address / PAGE)
+            .then(|| self.copy_of(address / PAGE))
+            .flatten()
+        else {
             return;
         };
         if self.pages.contains_key(&(address / PAGE)) || !self.open.insert(n) {
@@ -908,9 +988,10 @@ impl Memory {
             }
             held.looked = frame;
             self.stats.looked += 1;
-            let wrote = answer
-                .as_ref()
-                .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
+            let wrote = answer.as_ref().map(|(_, w)| {
+                w.binary_search_by_key(&(page as usize), |w| w.0)
+                    .map_or(0, |i| w[i].1)
+            });
             let now = answer.as_ref().map_or(1, |a| a.0);
             let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
             if !stale {
@@ -929,7 +1010,8 @@ impl Memory {
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
-                let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
+                let ours =
+                    unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
                 changed += merge(&title, ours, never) as u64 * 4;
             }
             self.stats.changed += changed;
@@ -972,7 +1054,11 @@ impl Memory {
         let Some((len, header)) = self.packed_at(address) else {
             // Anything else: what came since its page was first taken.
             for page in page..=(address + VIEW - 1) / PAGE {
-                if self.pages.get(&page).is_some_and(|h| h.born + YOUNG >= self.frame) {
+                if self
+                    .pages
+                    .get(&page)
+                    .is_some_and(|h| h.born + YOUNG >= self.frame)
+                {
                     self.take(page, 0, PAGE as usize, false);
                 }
             }
@@ -990,7 +1076,14 @@ impl Memory {
         }
         let last = (address + len - 1) / PAGE;
         if !self.packed.contains_key(&address) {
-            self.packed.insert(address, Packed { frame: self.frame, len, header });
+            self.packed.insert(
+                address,
+                Packed {
+                    frame: self.frame,
+                    len,
+                    header,
+                },
+            );
             self.packed_order.push(address);
             for page in page..=last {
                 let new = self.copy_of(page).is_none();
@@ -1038,17 +1131,28 @@ impl Memory {
     /// a submission; `whole`: sent whether they differ from those last taken
     /// or not.
     fn take(&mut self, page: u64, from: usize, to: usize, whole: bool) {
-        let Some(held) = self.pages.get(&page) else { return };
+        let Some(held) = self.pages.get(&page) else {
+            return;
+        };
         let shadow = &self.copies[held.copy];
         let base = held.at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
         let mut at = from;
         let mut changed = false;
         // Pieces of buffer copies left on the card there first (`crate::left`).
-        crate::left::before_take(page as usize * PAGE as usize + from, page as usize * PAGE as usize + to, 0);
+        crate::left::before_take(
+            page as usize * PAGE as usize + from,
+            page as usize * PAGE as usize + to,
+            0,
+        );
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
-            crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
+            crate::host::copy_mapped(
+                title.as_mut_ptr(),
+                (page as usize * PAGE as usize + at) as *const u8,
+                n,
+                false,
+            );
             // SAFETY: a page of an arena of ours, under the mutex.
             let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
             if *ours != title[..n] {
@@ -1138,7 +1242,10 @@ impl Memory {
             if self.copy_of(page).is_some() {
                 continue;
             }
-            if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+            if page < 0x1_0000
+                || page >= u64::from(MEMORY_PAGES) - 1
+                || self.refused.contains(&page)
+            {
                 left[2] += 1;
             } else if made >= FAULTS {
                 left[0] += 1;
@@ -1173,14 +1280,25 @@ impl Memory {
         static WHOLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if left[1] > 0 && WHOLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
             let mut text = String::new();
-            for &(page, _) in pages.iter().filter(|p| p.0 >= 0x1_0000 && self.copy_of(p.0).is_none()) {
+            for &(page, _) in pages
+                .iter()
+                .filter(|p| p.0 >= 0x1_0000 && self.copy_of(p.0).is_none())
+            {
                 let at = page * PAGE;
                 let committed = crate::texture::committed(at as *const u8, PAGE as usize);
                 let buffer = crate::shadow::in_buffer(at, 1).is_some();
                 let packed = committed && self.packed_at(at).is_some();
-                text += &format!(" {at:#x}{}{}{}", if committed { "" } else { "?" }, if buffer { "b" } else { "" }, if packed { "p" } else { "" });
+                text += &format!(
+                    " {at:#x}{}{}{}",
+                    if committed { "" } else { "?" },
+                    if buffer { "b" } else { "" },
+                    if packed { "p" } else { "" }
+                );
             }
-            tracing::warn!(frame = self.frame, "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}");
+            tracing::warn!(
+                frame = self.frame,
+                "title memory by address: pages left without a copy by the bounds (?: not committed, b: in a title buffer, p: a packed structure there):{text}"
+            );
         }
         if say {
             let (given_back, oldest) = (self.stats.given - gave, self.oldest());
@@ -1217,7 +1335,11 @@ impl Memory {
         let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
         let mut seen = std::collections::HashSet::new();
         for &word in words {
-            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
+            if word & 0xFF == 0
+                && (1 << 32..1 << 37).contains(&word)
+                && seen.insert(word / PAGE)
+                && self.map(word / PAGE)
+            {
                 let page = word / PAGE;
                 self.bring(page, page + 1);
             }
@@ -1240,7 +1362,8 @@ impl Memory {
                 self.stats.back += 1;
                 // A window of title memory around the buffer: the buffer's
                 // own copy, which the title's copies read, is another one.
-                let own = crate::shadow::peek(at, n).is_some_and(|s| Arc::ptr_eq(&s, &self.copies[k]));
+                let own =
+                    crate::shadow::peek(at, n).is_some_and(|s| Arc::ptr_eq(&s, &self.copies[k]));
                 if !own && self.results.insert(page, k).is_none() {
                     RESULTS.store(true, std::sync::atomic::Ordering::Relaxed);
                     tracing::info!(
@@ -1271,7 +1394,11 @@ impl Memory {
             let runs = self.told_runs(n);
             self.stats.told_runs += runs.len() as u64;
             for (from, to) in runs {
-                shadow.refresh(list, start + from, (to - from).min(len.saturating_sub(from)));
+                shadow.refresh(
+                    list,
+                    start + from,
+                    (to - from).min(len.saturating_sub(from)),
+                );
             }
         }
     }
@@ -1290,11 +1417,16 @@ impl Memory {
         self.wanted_pages[1] = 0;
         // (What is not asked about any more.)
         let now_frame = self.frame;
-        self.given.retain(|_, given| now_frame.wrapping_sub(given.0) < 2 * FAULT_YOUNG);
+        self.given
+            .retain(|_, given| now_frame.wrapping_sub(given.0) < 2 * FAULT_YOUNG);
         for kind in 0..2 {
             if self.fault_order[kind].len() > 2 * self.fault_held[kind] + 4096 {
                 let pages = &self.pages;
-                self.fault_order[kind].retain(|&(p, serial)| pages.get(&p).is_some_and(|h| h.serial == serial && h.fault != 0));
+                self.fault_order[kind].retain(|&(p, serial)| {
+                    pages
+                        .get(&p)
+                        .is_some_and(|h| h.serial == serial && h.fault != 0)
+                });
             }
         }
         let s = std::mem::take(&mut self.stats);
@@ -1337,7 +1469,11 @@ impl Memory {
             self.fault_held[0] + self.fault_held[1],
             ((self.fault_held[0] + self.fault_held[1]) as u64 * PAGE) >> 20,
             (faults_most() as u64 * PAGE) >> 20,
-            if recycle() { "" } else { "; VICTORY_BVH_FAULTS_RECYCLE=0: none held so, the number is for the run" },
+            if recycle() {
+                ""
+            } else {
+                "; VICTORY_BVH_FAULTS_RECYCLE=0: none held so, the number is for the run"
+            },
             self.fault_held[0],
             self.fault_held[1],
             oldest,
@@ -1362,7 +1498,8 @@ impl Memory {
             // SAFETY: a live committed buffer.
             unsafe { shadow.buffer.GetHeapProperties(Some(&mut props), None) }.is_ok()
                 && props.Type != D3D12_HEAP_TYPE_DEFAULT
-                && !(props.Type == D3D12_HEAP_TYPE_CUSTOM && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+                && !(props.Type == D3D12_HEAP_TYPE_CUSTOM
+                    && props.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
         };
         let arena = |n: usize| self.arenas.iter().any(|a| a.0 == n);
         let (mut pc, mut pc_mb, mut pc_arenas) = (0, 0u64, 0);
@@ -1434,7 +1571,9 @@ pub(crate) fn results(src: u64, len: u64) -> Option<Arc<Shadow>> {
 /// (`crate::left`: it takes such a page again only where the title wrote).
 pub(crate) fn holds(at: u64, end: u64) -> bool {
     let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().is_some_and(|m| (at / PAGE..end.div_ceil(PAGE)).any(|page| m.pages.contains_key(&page)))
+    guard
+        .as_ref()
+        .is_some_and(|m| (at / PAGE..end.div_ceil(PAGE)).any(|page| m.pages.contains_key(&page)))
 }
 
 /// `VICTORY_BVH_TRACE=1`: a buffer copy out of the builder's results.
@@ -1490,7 +1629,9 @@ fn sizes_wait() -> bool {
 fn asks_size(written: &[u64], constants: &[u32], threads: Option<[u32; 3]>) -> bool {
     threads == Some([1, 1, 1])
         && matches!(*constants, [_, hi, 1..=3, ..] if (1..0x20).contains(&hi))
-        && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
+        && written
+            .first()
+            .is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
 }
 
 /// Whether one of `lists` asks for sizes.
@@ -1501,7 +1642,11 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
         static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n.is_power_of_two() || n.is_multiple_of(100) {
-            tracing::info!(n, frame = crate::frame::current(), "submissions that ask for structures' sizes, waited for");
+            tracing::info!(
+                n,
+                frame = crate::frame::current(),
+                "submissions that ask for structures' sizes, waited for"
+            );
         }
     }
     asked
@@ -1600,6 +1745,7 @@ pub(crate) fn ready(
     constants: &[u32],
     use_: Use,
     threads: Option<[u32; 3]>,
+    name: Option<&str>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -1616,12 +1762,23 @@ pub(crate) fn ready(
         m.report();
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
+        #[cfg(feature = "diagnostics")]
+        m.take_stores();
     }
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
-        m.trace.dispatch(frame, list, addresses, written, constants, threads);
+        m.trace
+            .dispatch(frame, list, addresses, written, constants, threads);
     }
     let builds = use_ != Use::Reads;
+    #[cfg(feature = "diagnostics")]
+    let tag = if builds && stores::on() {
+        m.stores.tag(frame, name.unwrap_or("?"), written, addresses)
+    } else {
+        0
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let (tag, _) = (0, name);
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
@@ -1633,7 +1790,8 @@ pub(crate) fn ready(
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
     const READ: usize = usize::MAX - 0x6d;
-    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
+    let named =
+        |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units (the builder's alone). A constant that only
     // looks like one names memory nothing reads; one that is not the title's
@@ -1688,7 +1846,10 @@ pub(crate) fn ready(
             });
             m.bring_up(list);
         }
-        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
+        if builds
+            && written.contains(&at)
+            && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize)
+        {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
@@ -1777,9 +1938,15 @@ pub(crate) fn ready(
     Some(Ready {
         directory: directory.gpu(directory.span().0),
         // (The shader's places are the same in either half.)
-        faults: m.faults.2 + if builds { u64::from(MEMORY_FAULTS) * 4 } else { 0 },
+        faults: m.faults.2
+            + if builds {
+                u64::from(MEMORY_FAULTS) * 4
+            } else {
+                0
+            },
         base,
         whole: !m.short,
+        tag,
     })
 }
 
@@ -1835,7 +2002,11 @@ fn held_over_written(start: u64) {
     let n = guard.get_or_insert_with(Inputs::default);
     n.pages += 1;
     if n.pages <= 400 {
-        let list: Vec<String> = found.iter().take(8).map(|(s, l)| format!("{s:#x}+{l}")).collect();
+        let list: Vec<String> = found
+            .iter()
+            .take(8)
+            .map(|(s, l)| format!("{s:#x}+{l}"))
+            .collect();
         tracing::info!(
             "bvh inputs: page {start:#x} is read by address from title memory, but {} title buffers in it are written by shaders in their own copies: {}",
             found.len(),
@@ -1853,13 +2024,24 @@ impl Memory {
         }
         let mut guard = INPUTS.lock().unwrap_or_else(|e| e.into_inner());
         let n = guard.get_or_insert_with(Inputs::default);
-        for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
-            let Some((start, len)) = crate::shadow::in_buffer(at, 1) else { continue };
+        for &at in addresses
+            .iter()
+            .filter(|&&a| a >= 1 << 32 && !written.contains(&a))
+        {
+            let Some((start, len)) = crate::shadow::in_buffer(at, 1) else {
+                continue;
+            };
             let page = at / PAGE;
             let own_copy = crate::shadow::peek(at, 1);
             let kind = match self.copy_of(page) {
                 None => 3u8,
-                Some(k) if own_copy.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.copies[k])) => 0,
+                Some(k)
+                    if own_copy
+                        .as_ref()
+                        .is_some_and(|s| Arc::ptr_eq(s, &self.copies[k])) =>
+                {
+                    0
+                }
                 Some(_) if self.pages.contains_key(&page) => 1,
                 Some(_) => 2,
             };
@@ -1874,11 +2056,20 @@ impl Memory {
                 n.written += 1;
             }
             if n.said.len() < 400 && n.said.insert((start, kind)) {
-                let what = ["its own copy", "an arena page (title memory)", "a window of title memory", "nothing"][kind as usize];
+                let what = [
+                    "its own copy",
+                    "an arena page (title memory)",
+                    "a window of title memory",
+                    "nothing",
+                ][kind as usize];
                 tracing::info!(
                     "bvh inputs: the builder reads {at:#x} in title buffer {start:#x} ({len} bytes, page {:#x} {}): from {what}; shaders write its copy: {shaders_write}",
                     page * PAGE,
-                    if start <= page * PAGE && start + len >= (page + 1) * PAGE { "whole in it" } else { "shared" },
+                    if start <= page * PAGE && start + len >= (page + 1) * PAGE {
+                        "whole in it"
+                    } else {
+                        "shared"
+                    },
                 );
             }
         }
@@ -1986,7 +2177,9 @@ mod trace {
                 }
             } else if threads == Some([32, 1, 1])
                 && let [from, to] = *written
-                && [from, to].iter().all(|&a| a >= 1 << 32 && crate::shadow::in_buffer(a, 1).is_none())
+                && [from, to]
+                    .iter()
+                    .all(|&a| a >= 1 << 32 && crate::shadow::in_buffer(a, 1).is_none())
             {
                 let known = self.sizes.get(&from).copied();
                 self.say(format!("frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}", &constants[..constants.len().min(4)]));
@@ -2028,7 +2221,10 @@ mod dump {
             if self.done || folder().is_none() {
                 return;
             }
-            for &at in addresses.iter().filter(|&&a| a >= 1 << 32 && !written.contains(&a)) {
+            for &at in addresses
+                .iter()
+                .filter(|&&a| a >= 1 << 32 && !written.contains(&a))
+            {
                 if let Some(span) = crate::shadow::in_buffer(at, 1) {
                     self.buffers.insert(span);
                 }
@@ -2038,10 +2234,16 @@ mod dump {
 
     fn folder() -> Option<&'static std::path::PathBuf> {
         static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-        FOLDER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into)).as_ref()
+        FOLDER
+            .get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into))
+            .as_ref()
     }
 
-    fn turn(buffer: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+    fn turn(
+        buffer: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) -> D3D12_RESOURCE_BARRIER {
         D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -2079,7 +2281,11 @@ mod dump {
                 }
                 text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
-                    let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
+                    let arena = self
+                        .arenas
+                        .iter()
+                        .position(|a| a.0 == held.copy)
+                        .unwrap_or(usize::MAX);
                     let at = held.at - self.arenas[arena].1;
                     text += &format!("{:#x} {arena} {at:#x}\n", page * PAGE);
                 }
@@ -2087,10 +2293,14 @@ mod dump {
                 for (n, (_, data)) in copies.iter().enumerate() {
                     // SAFETY: a mapping of an arena's bytes; the copies ran
                     // frames ago.
-                    let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
                     let _ = std::fs::write(folder.join(format!("arena-{n}.bin")), bytes);
                 }
-                tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
+                tracing::info!(
+                    arenas = copies.len(),
+                    "title memory by address: the arenas are written out"
+                );
                 return;
             }
             if self.dump.done || !folder.join("go").exists() {
@@ -2101,13 +2311,23 @@ mod dump {
             let mut copies = Vec::new();
             for &(n, _) in &self.arenas {
                 let buffer = &self.copies[n].buffer;
-                let Some((to, data)) = host.shared_buffer(ARENA) else { break };
+                let Some((to, data)) = host.shared_buffer(ARENA) else {
+                    break;
+                };
                 // SAFETY: an open list; live buffers of those sizes. The list
                 // has not used the arena yet.
                 unsafe {
-                    list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.list.ResourceBarrier(&[turn(
+                        buffer,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
                     list.list.CopyBufferRegion(&to, 0, buffer, 0, ARENA);
-                    list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                    list.list.ResourceBarrier(&[turn(
+                        buffer,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
                 }
                 list.keep(&to);
                 copies.push((to, data as usize));
@@ -2126,7 +2346,9 @@ mod dump {
         /// pointer).
         fn title_side(&self, folder: &std::path::Path) {
             use std::io::Write;
-            let Ok(file) = std::fs::File::create(folder.join("title.bin")) else { return };
+            let Ok(file) = std::fs::File::create(folder.join("title.bin")) else {
+                return;
+            };
             let mut out = std::io::BufWriter::with_capacity(1 << 22, file);
             let mut text = format!("frame {}\n", self.frame);
             let mut buf = vec![0u8; PAGE as usize];
@@ -2135,12 +2357,23 @@ mod dump {
             let mut n = 0;
             let mut done = std::collections::HashSet::new();
             for (page, held) in pages {
-                crate::host::copy_mapped(buf.as_mut_ptr(), (page * PAGE) as *const u8, PAGE as usize, false);
+                crate::host::copy_mapped(
+                    buf.as_mut_ptr(),
+                    (page * PAGE) as *const u8,
+                    PAGE as usize,
+                    false,
+                );
                 if out.write_all(&buf).is_err() {
                     return;
                 }
                 done.insert(*page);
-                text += &format!("{:#x} {n} {} {} {}\n", page * PAGE, held.born, held.looked, held.taken);
+                text += &format!(
+                    "{:#x} {n} {} {} {}\n",
+                    page * PAGE,
+                    held.born,
+                    held.looked,
+                    held.taken
+                );
                 n += 1;
             }
             // And the title buffers the builder read through root views, as
@@ -2157,7 +2390,12 @@ mod dump {
                     if !crate::texture::committed(at as *const u8, PAGE as usize) {
                         continue;
                     }
-                    crate::host::copy_mapped(buf.as_mut_ptr(), at as *const u8, PAGE as usize, false);
+                    crate::host::copy_mapped(
+                        buf.as_mut_ptr(),
+                        at as *const u8,
+                        PAGE as usize,
+                        false,
+                    );
                     if out.write_all(&buf).is_err() {
                         return;
                     }
@@ -2168,7 +2406,9 @@ mod dump {
             }
             let _ = out.flush();
             let _ = std::fs::write(folder.join("title-pages.txt"), text);
-            tracing::info!("title memory by address: the CPU's side of the held pages is written out");
+            tracing::info!(
+                "title memory by address: the CPU's side of the held pages is written out"
+            );
         }
     }
 }
@@ -2194,8 +2434,18 @@ mod tests {
         if crate::host::host().is_none() {
             return;
         }
-        let iid = guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
-        let desc = HeapDesc { kind: 0, count: 64, flags: 1, nodes: 1 };
+        let iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let desc = HeapDesc {
+            kind: 0,
+            count: 64,
+            flags: 1,
+            nodes: 1,
+        };
         let mut h: This = std::ptr::null();
         assert_eq!(create_heap(std::ptr::null(), &desc, &iid, &mut h), S_OK);
         let host_heap = heap(h).host().expect("host view heap");
@@ -2235,8 +2485,22 @@ mod tests {
 
     #[test]
     fn a_frames_notes_come_once_a_page_and_the_builders_stay_the_builders() {
-        let notes = noted(vec![(0x2_0000, false), (0x10, true), (0x1_0005, true), (0x1_0005, false), (0x1_0004, false)]);
-        assert_eq!(notes, [(0x10, true), (0x1_0004, false), (0x1_0005, true), (0x2_0000, false)]);
+        let notes = noted(vec![
+            (0x2_0000, false),
+            (0x10, true),
+            (0x1_0005, true),
+            (0x1_0005, false),
+            (0x1_0004, false),
+        ]);
+        assert_eq!(
+            notes,
+            [
+                (0x10, true),
+                (0x1_0004, false),
+                (0x1_0005, true),
+                (0x2_0000, false)
+            ]
+        );
         // Those below 4 GiB are the first of them.
         assert_eq!(notes.partition_point(|p| p.0 < 0x1_0000), 1);
     }

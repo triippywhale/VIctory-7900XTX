@@ -49,7 +49,11 @@ pub(crate) fn on() -> bool {
 /// yet (`asked >= done + 2`: the one before it is not done) begins after
 /// now; with `asked == done + 1` round `asked` may be running already.
 pub(crate) fn round_after(asked: u64, done: u64) -> (u64, bool) {
-    if asked >= done + 2 { (asked, false) } else { (asked + 1, true) }
+    if asked >= done + 2 {
+        (asked, false)
+    } else {
+        (asked + 1, true)
+    }
 }
 
 thread_local! {
@@ -120,7 +124,11 @@ pub(crate) const LATE_ROUNDS: usize = 8;
 
 /// The lane waited `ns` for the heaps' records; `on`: with the switch.
 pub(crate) fn heaps_waited(ns: u64, on: bool) {
-    let (time, count) = if on { (HEAPS_NS_ON, HEAPS_ON) } else { (HEAPS_NS_OFF, HEAPS_OFF) };
+    let (time, count) = if on {
+        (HEAPS_NS_ON, HEAPS_ON)
+    } else {
+        (HEAPS_NS_OFF, HEAPS_OFF)
+    };
     STATS[time].fetch_add(ns, Relaxed);
     STATS[count].fetch_add(1, Relaxed);
 }
@@ -217,7 +225,10 @@ mod tests {
         }
         for (call, round) in given {
             if let Some(&at) = began.get(&round) {
-                assert!(at > call, "round {round} began at {at}, before the call at {call}");
+                assert!(
+                    at > call,
+                    "round {round} began at {at}, before the call at {call}"
+                );
             }
         }
     }

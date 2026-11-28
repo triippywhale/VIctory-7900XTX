@@ -112,7 +112,9 @@ impl Host {
                 &mut heap,
             )?;
             let heap = heap.ok_or_else(windows::core::Error::empty)?;
-            let back = self.read_back_buffer(16 * PAIRS as u64).ok_or_else(windows::core::Error::empty)?;
+            let back = self
+                .read_back_buffer(16 * PAIRS as u64)
+                .ok_or_else(windows::core::Error::empty)?;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data))?;
             std::ptr::write_bytes(data.cast::<u8>(), 0, 16 * PAIRS);
@@ -140,7 +142,13 @@ pub(crate) fn before(list: &ID3D12GraphicsCommandList) -> Option<usize> {
 }
 
 /// The second stamp of the dispatch just recorded, and its pair read back.
-pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind: Kind, pso: usize, name: &str) {
+pub(crate) fn after(
+    list: &ID3D12GraphicsCommandList,
+    pair: Option<usize>,
+    kind: Kind,
+    pso: usize,
+    name: &str,
+) {
     let (Some(pair), Some(ring)) = (pair, RING.get().and_then(Option::as_ref)) else {
         return;
     };
@@ -148,7 +156,14 @@ pub(crate) fn after(list: &ID3D12GraphicsCommandList, pair: Option<usize>, kind:
     // (a read-back buffer is always a copy's destination).
     unsafe {
         list.EndQuery(&ring.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * pair as u32 + 1);
-        list.ResolveQueryData(&ring.heap, D3D12_QUERY_TYPE_TIMESTAMP, 2 * pair as u32, 2, &ring.back, 16 * pair as u64);
+        list.ResolveQueryData(
+            &ring.heap,
+            D3D12_QUERY_TYPE_TIMESTAMP,
+            2 * pair as u32,
+            2,
+            &ring.back,
+            16 * pair as u64,
+        );
     }
     let mut sums = SUMS.lock().unwrap_or_else(|e| e.into_inner());
     let sums = sums.get_or_insert_with(Default::default);
@@ -217,8 +232,14 @@ pub(crate) fn line(frames: f64) {
             format!("{} {:.1} ms in {:.0}", k.name(), ms(t), n as f64 / frames)
         })
         .collect();
-    kinds.push(format!("{:.1} pairs not written", sums.lost as f64 / frames));
-    tracing::info!("renderer port RT: the card's time on dispatches per frame, by their own stamps (VICTORY_RT_STAMPS=1): {}", kinds.join(", "));
+    kinds.push(format!(
+        "{:.1} pairs not written",
+        sums.lost as f64 / frames
+    ));
+    tracing::info!(
+        "renderer port RT: the card's time on dispatches per frame, by their own stamps (VICTORY_RT_STAMPS=1): {}",
+        kinds.join(", ")
+    );
     let mut top: Vec<(usize, (Kind, u64, u64))> = sums.pipelines.drain().collect();
     top.sort_unstable_by_key(|(_, (_, _, t))| std::cmp::Reverse(*t));
     for (pso, (kind, n, t)) in top.into_iter().take(12) {

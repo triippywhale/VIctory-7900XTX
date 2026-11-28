@@ -38,7 +38,8 @@ unsafe impl Send for Held {}
 
 /// Since the last frame-rate line: barrier calls asked for while held, and
 /// calls made of them.
-pub(crate) static STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static STATS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
@@ -48,7 +49,11 @@ pub(crate) struct Rec {
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+        }
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -71,7 +76,11 @@ impl Rec {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         // A resource whose state changes again: what is held goes first, so
         // that no call holds two changes of one resource.
-        if barriers.iter().filter_map(named).any(|r| held.0.iter().filter_map(named).any(|h| h == r)) {
+        if barriers
+            .iter()
+            .filter_map(named)
+            .any(|r| held.0.iter().filter_map(named).any(|h| h == r))
+        {
             // SAFETY: as in `flush`.
             unsafe { self.list.ResourceBarrier(&held.0) };
             held.0.clear();
@@ -79,7 +88,8 @@ impl Rec {
         }
         // SAFETY: a plain copy of the descriptions; nothing is released
         // through them (their pointers are borrowed, `ManuallyDrop`).
-        held.0.extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
+        held.0
+            .extend(barriers.iter().map(|b| unsafe { std::ptr::read(b) }));
         STATS[0].fetch_add(1, Relaxed);
         self.any.store(true, Relaxed);
     }

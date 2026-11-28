@@ -321,11 +321,25 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
         ];
         [TABLE, &words, STORE].concat()
     };
-    let (title, twin, last, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [9u32, 10, 11, 12], [[0.0; 4]; 1]);
-    let raw = |data| View::Buffer { data, stride: Stride::Raw };
+    let (title, twin, last, texel) = (
+        [1u32, 2, 3, 4],
+        [5u32, 6, 7, 8],
+        [9u32, 10, 11, 12],
+        [[0.0; 4]; 1],
+    );
+    let raw = |data| View::Buffer {
+        data,
+        stride: Stride::Raw,
+    };
     // (The store goes through the table's third entry: its twin, too.)
     let views = |twins: bool| {
-        let uav = |here: bool| if here { View::RawUav(2) } else { View::Texture(1, 1, &texel) };
+        let uav = |here: bool| {
+            if here {
+                View::RawUav(2)
+            } else {
+                View::Texture(1, 1, &texel)
+            }
+        };
         [
             View::Texture(1, 1, &texel),
             raw(&title),
@@ -342,7 +356,11 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
         let shader = build(&program(at), (8, 0)).expect("translates");
         super::shader::RAW_VIEWS_HERE.set(None);
         for (label, got) in run(&shader, &views(first != 0)) {
-            assert_eq!(got[..2], [0, expected], "{label}: twins from {first}, byte {at}");
+            assert_eq!(
+                got[..2],
+                [0, expected],
+                "{label}: twins from {first}, byte {at}"
+            );
         }
     }
 }
@@ -360,12 +378,23 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     ];
     let words = [TABLE, &load, STORE].concat();
     let (title, twin, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [[0.0; 4]; 1]);
-    let raw = |data| View::Buffer { data, stride: Stride::Raw };
+    let raw = |data| View::Buffer {
+        data,
+        stride: Stride::Raw,
+    };
     super::shader::RAW_VIEWS_HERE.set(Some(4));
     let shader = build(&words, (4, 0)).expect("translates");
     super::shader::RAW_VIEWS_HERE.set(None);
     let other = || View::Texture(1, 1, &texel);
-    let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
+    let views = [
+        raw(&title),
+        other(),
+        other(),
+        other(),
+        raw(&twin),
+        other(),
+        View::RawUav(2),
+    ];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
     }

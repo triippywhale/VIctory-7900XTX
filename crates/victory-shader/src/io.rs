@@ -1032,7 +1032,12 @@ mod tests {
         let mapped: Vec<(Reg, Input)> = p
             .inputs
             .iter()
-            .filter_map(|&(r, v)| io.inputs.iter().find(|&&(iv, _)| iv == v).map(|&(_, inp)| (r, inp)))
+            .filter_map(|&(r, v)| {
+                io.inputs
+                    .iter()
+                    .find(|&&(iv, _)| iv == v)
+                    .map(|&(_, inp)| (r, inp))
+            })
             .collect();
         assert_eq!(
             mapped,
@@ -1087,6 +1092,9 @@ mod tests {
             }]),
         )
         .unwrap_err();
-        assert_eq!(err, ShaderError::Malformed("vertex input VGPR out of range"));
+        assert_eq!(
+            err,
+            ShaderError::Malformed("vertex input VGPR out of range")
+        );
     }
 }

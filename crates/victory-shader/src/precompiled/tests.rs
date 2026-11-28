@@ -5,7 +5,9 @@
 use super::*;
 
 fn hex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 /// An 8x8 group with COMPUTE_PGM_RSRC2 0xb8a.
@@ -48,7 +50,11 @@ fn a_compute_program_reads_as_its_code_uses_it() {
     assert_eq!(p.layout.len(), 1);
     let table = p.layout[0];
     assert_eq!((table.root, table.user_data), (RootType::Table, 4));
-    assert!(p.used.iter().any(|u| u.kind == ResourceType::Srv && u.root == RootType::Table));
+    assert!(
+        p.used
+            .iter()
+            .any(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+    );
 }
 
 /// A table whose stated length runs past its part is refused.

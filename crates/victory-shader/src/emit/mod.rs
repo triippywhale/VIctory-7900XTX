@@ -88,46 +88,49 @@ mod cube_lod_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod geometry_tests;
-#[cfg(all(test, windows))]
-mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_lod_tests;
+#[cfg(all(test, windows))]
+mod intersect_tests;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+#[cfg(all(test, windows))]
+mod probe_tests;
 mod rect;
 mod sampler;
-#[cfg(all(test, windows))]
-mod image_lod_tests;
 mod shader;
+#[cfg(all(test, windows))]
+mod size_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
-mod probe_tests;
-#[cfg(all(test, windows))]
-mod size_tests;
-#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod wave;
 #[cfg(all(test, windows))]
 mod wave64_tests;
-mod wave;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
-pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
+pub use sampler::StaticSampler;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WALK, WALK_SLOTS,
-    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, MEMORY_STORE_NOTES, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT,
+    SLOT_WALK, USER_DATA_SPACE, USER_DISPATCH_TAG, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE,
+    USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_ADDRESSES, VIEW_INTEGER,
+    VIEW_SIGNED, VIEW_STRIDE_BITS, WALK_SLOTS, constants_raw, raw_views, set_raw_views,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -181,10 +184,16 @@ pub fn helper_own() -> bool {
 /// does).
 pub fn group_sync() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 1,
-        _ => 2,
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => 2,
+        }
     })
 }
 
@@ -235,7 +244,9 @@ pub fn bvh_walk_limit() -> Option<u32> {
 
 /// `VICTORY_BVH_WALK_LIMIT`'s value. Pure, for testing.
 fn parse_walk_limit(value: Option<&str>) -> Option<u32> {
-    value.and_then(|v| v.trim().parse::<u32>().ok()).filter(|&n| n > 0)
+    value
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
 }
 
 #[cfg(test)]
@@ -244,6 +255,17 @@ thread_local! {
     pub(crate) static TEST_WALK_LIMIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// [`bvh_walk`] on for a test's thread.
     pub(crate) static TEST_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A diagnostic (`VICTORY_BVH_STORES=1`): every store by address of the
+/// structure builder's programs also notes its page and the dispatch's tag
+/// (`shader.rs` [`MEMORY_STORE_NOTES`]), so the host can say which program
+/// stores outside the structures its dispatch was given. Adds a store to a
+/// buffer of ours per store; what the program computes is unchanged. Part of
+/// the translation: the shader cache keys on it.
+pub fn bvh_stores() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_STORES").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's accesses through its root views stay near
@@ -350,7 +372,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
     out.push(u8::from(cfg!(feature = "diagnostics")));
     out.push(u8::from(cfg!(debug_assertions)));
-    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+    for name in env!("VICTORY_SHADER_SWITCHES")
+        .split(',')
+        .filter(|n| !n.is_empty())
+    {
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
         if let Some(value) = std::env::var_os(name) {
@@ -574,7 +599,9 @@ pub fn emit(
             Ok(()) => true,
             Err((offset, what)) => {
                 if why {
-                    eprintln!("WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}");
+                    eprintln!(
+                        "WAVE64-RETRY local waves: not the allocation idiom at {offset:#x}: {what}"
+                    );
                 }
                 false
             }
@@ -618,7 +645,11 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on {
+                    form(ir::without_skips(p, true))
+                } else {
+                    None
+                };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -656,7 +687,13 @@ pub fn emit(
                     && idiom(p, st) == exact
                 {
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
+                    report(
+                        &format!(
+                            "local waves ({}), {name}",
+                            if exact { "idiom" } else { "APPROXIMATE" }
+                        ),
+                        &local,
+                    );
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
                     }
@@ -664,7 +701,14 @@ pub fn emit(
             }
             if idiom(p, st) == exact {
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                report(
+                    if exact {
+                        "local waves (idiom)"
+                    } else {
+                        "local waves (APPROXIMATE)"
+                    },
+                    &local,
+                );
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -675,8 +719,12 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
+                        let local =
+                            lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                        report(
+                            &format!("local waves (APPROXIMATE, any mask), {name}"),
+                            &local,
+                        );
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
@@ -779,7 +827,10 @@ fn widen(
             .collect();
         if more.is_empty() {
             if why {
-                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+                eprintln!(
+                    "WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be",
+                    wide.len()
+                );
             }
             return r;
         }
@@ -934,7 +985,9 @@ fn geometry_state(c: &Container, max_vertices: u32) -> Result<shader::Geometry, 
         input: at(0)?,
         topology: at(4)?,
     };
-    let declared = psv.get(4 + 26..4 + 28).map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
+    let declared = psv
+        .get(4 + 26..4 + 28)
+        .map(|b| u32::from(u16::from_le_bytes([b[0], b[1]])));
     if at(8)? != 1 || declared != Some(max_vertices) {
         return Err(unsupported("a geometry program with more than one stream"));
     }
@@ -989,7 +1042,9 @@ fn vertex_output_interpolation(
             continue;
         }
         if record[13] > 7 {
-            return Err(ShaderError::Malformed("invalid vertex output interpolation"));
+            return Err(ShaderError::Malformed(
+                "invalid vertex output interpolation",
+            ));
         }
         let first = u32::from(record[9]);
         let rows = first..first + u32::from(record[8]);
@@ -1151,7 +1206,7 @@ mod tests {
             let [w0, w1] = p2(dst_high, omod, clamp);
             let words = [
                 0x7E06_0301u32, // v_mov_b32 v3, v1
-                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC808_0000,    // v_interp_p1_f32 v2, v0, attr0.x
                 w0,
                 w1, // v_interp_p2_f16 v3, attr0, v1, v2
                 0xF800_180F,
@@ -1232,7 +1287,10 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all & !super::bitcode::opt::HOIST);
+        assert_eq!(
+            parse_shader_opt(Some("127")),
+            all & !super::bitcode::opt::HOIST
+        );
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
@@ -1365,7 +1423,10 @@ mod tests {
             wave64: false,
             vgprs: 12,
             layout: vec![table(0, 0), table(1, 2)],
-            used: vec![range(ResourceType::Srv, 8, 0, 0), range(ResourceType::Sampler, 4, 1, 2)],
+            used: vec![
+                range(ResourceType::Srv, 8, 0, 0),
+                range(ResourceType::Sampler, 4, 1, 2),
+            ],
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
@@ -1398,7 +1459,8 @@ mod tests {
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
         ) {
-            v.validate(&mut out.dxil.clone()).expect("the level query validates");
+            v.validate(&mut out.dxil.clone())
+                .expect("the level query validates");
         }
     }
 
@@ -1924,19 +1986,16 @@ mod tests {
         // v2, v3: position x, y (input address: POS_X and POS_Y after the
         // two perspective barycentrics).
         let swizzle = |dst: u32, src: u32, pattern: u32| {
-            [
-                0xD800_0000 | 0x35 << 18 | 0x8000 | pattern,
-                dst << 24 | src,
-            ]
+            [0xD800_0000 | 0x35 << 18 | 0x8000 | pattern, dst << 24 | src]
         };
         let mut words = vec![0xBEFC_0380u32]; // s_mov_b32 m0, 0
         words.extend(swizzle(4, 2, 0xB1)); // lanes 1 0 3 2
         words.extend(swizzle(5, 3, 0x4E)); // lanes 2 3 0 1
         words.extend(swizzle(6, 2, 0xA0)); // lanes 0 0 2 2
         words.extend([
-            0x0808_0504,  // v_sub_f32 v4, v4, v2
-            0x080A_0705,  // v_sub_f32 v5, v5, v3
-            0x080C_0506,  // v_sub_f32 v6, v6, v2
+            0x0808_0504, // v_sub_f32 v4, v4, v2
+            0x080A_0705, // v_sub_f32 v5, v5, v3
+            0x080C_0506, // v_sub_f32 v6, v6, v2
             0xF800_180F,
             0x0302_0504, // exp mrt0 v4, v5, v2, v3 done vm
             0xBF81_0000,
@@ -2011,8 +2070,16 @@ mod tests {
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
-            let lit: Vec<(usize, &[f32; 4])> = texels.iter().enumerate().filter(|t| t.1[2] != 0.0).collect();
-            assert!((20..240).contains(&lit.len()), "{label}: {} texels lit", lit.len());
+            let lit: Vec<(usize, &[f32; 4])> = texels
+                .iter()
+                .enumerate()
+                .filter(|t| t.1[2] != 0.0)
+                .collect();
+            assert!(
+                (20..240).contains(&lit.len()),
+                "{label}: {} texels lit",
+                lit.len()
+            );
             let bad: Vec<_> = lit
                 .iter()
                 .filter(|(n, t)| {
@@ -2021,7 +2088,13 @@ mod tests {
                     (t[0], t[1]) != (x, y)
                 })
                 .collect();
-            assert!(bad.is_empty(), "{label}: {} of {} texels: {:?}", bad.len(), lit.len(), bad[0]);
+            assert!(
+                bad.is_empty(),
+                "{label}: {} of {} texels: {:?}",
+                bad.len(),
+                lit.len(),
+                bad[0]
+            );
         }
     }
 
@@ -2268,8 +2341,7 @@ mod tests {
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let res =
-                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
@@ -2412,7 +2484,10 @@ mod tests {
                     slot: 1,
                 },
             ],
-            used: vec![table(crate::ResourceType::Srv, 0), table(crate::ResourceType::Uav, 8)],
+            used: vec![
+                table(crate::ResourceType::Srv, 0),
+                table(crate::ResourceType::Uav, 8),
+            ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
                 threads: [1, 1, 1],
@@ -2444,7 +2519,9 @@ mod tests {
         ) {
             v.validate(&mut dxil).unwrap();
         }
-        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Ok(host) = super::host::Host::new(true) else {
             eprintln!("no software adapter; the dispatch is skipped");
             return;
@@ -2462,9 +2539,15 @@ mod tests {
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
-        let data: Vec<u32> = (0..12u32).map(|i| 0x1111_1111u32.wrapping_mul(i + 1) ^ 0x8000_0000).collect();
+        let data: Vec<u32> = (0..12u32)
+            .map(|i| 0x1111_1111u32.wrapping_mul(i + 1) ^ 0x8000_0000)
+            .collect();
         let dword = |byte: u64| -> u32 {
-            if byte.is_multiple_of(4) && byte + 4 <= 4 * data.len() as u64 { data[(byte / 4) as usize] } else { 0 }
+            if byte.is_multiple_of(4) && byte + 4 <= 4 * data.len() as u64 {
+                data[(byte / 4) as usize]
+            } else {
+                0
+            }
         };
         for (s0, s1) in [(0u32, 0u32), (16, 0), (24, 4), (40, 28), (48, 44), (8, 12)] {
             let out = host
@@ -2490,8 +2573,15 @@ mod tests {
             for (&(_, n), start) in LOADS.iter().zip(starts) {
                 want.extend((0..u64::from(n)).map(|k| dword(start + 4 * k)));
             }
-            eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
-            assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+            eprintln!(
+                "offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}",
+                &out[0][..28]
+            );
+            assert_eq!(
+                out[0][..28],
+                want[..],
+                "offsets {s0} and {s1}, four dwords a call: {wide}"
+            );
         }
     }
 
@@ -2536,11 +2626,31 @@ mod tests {
             wave64: false,
             vgprs: 4,
             layout: vec![
-                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
-                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
             ],
-            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
-            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+            used: vec![
+                table(crate::ResourceType::Cbv, 0),
+                table(crate::ResourceType::Uav, 8),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
@@ -2570,15 +2680,24 @@ mod tests {
             l
         };
         let (before, after) = (lowered(false), lowered(true));
-        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
-        let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
+        assert_ne!(
+            before.dxil, after.dxil,
+            "the switch changes the translation"
+        );
+        let data: Vec<u32> = (0..16u32)
+            .map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000)
+            .collect();
         let other: Vec<u32> = vec![0xdead_beef; 64];
         let s0 = 8u32;
         let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
-        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (raw, l) in [(false, before), (true, after)] {
             let mut dxil = l.dxil;
-            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
                 v.validate(&mut dxil).unwrap();
             }
             let Ok(host) = super::host::Host::new(true) else {
@@ -2601,7 +2720,10 @@ mod tests {
                 vec![
                     super::host::View::Cbv(&other),
                     super::host::View::RawUav(8),
-                    super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                    super::host::View::Buffer {
+                        data: &data,
+                        stride: super::host::Stride::Raw,
+                    },
                     super::host::View::RawUav(8),
                 ]
             } else {
@@ -2620,7 +2742,10 @@ mod tests {
                 )
                 .unwrap();
             // The UAV is written where the program reads it: its twin with the switch.
-            let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+            let got = out
+                .iter()
+                .find(|o| o[..5].iter().any(|&w| w != 0))
+                .map(|o| o[..5].to_vec());
             assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
         }
     }
@@ -2677,11 +2802,31 @@ mod tests {
             wave64: false,
             vgprs: 9,
             layout: vec![
-                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
-                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
             ],
-            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
-            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [4, 1, 1] }),
+            used: vec![
+                table(crate::ResourceType::Cbv, 0),
+                table(crate::ResourceType::Uav, 8),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [4, 1, 1],
+            }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
@@ -2710,11 +2855,16 @@ mod tests {
             l.unwrap()
         };
         let (before, after) = (lowered(false), lowered(true));
-        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        assert_ne!(
+            before.dxil, after.dxil,
+            "the switch changes the translation"
+        );
         // The buffer: the constant buffer from byte 0x110 on (on 16 bytes,
         // not 256), 64 dwords of it, other bytes before it.
         const FIRST: u32 = 0x110 / 4;
-        let all: Vec<u32> = (0..FIRST + 64).map(|i| 0x0101_0101u32.wrapping_mul(i + 7) ^ 0x2000_0000 ^ i << 20).collect();
+        let all: Vec<u32> = (0..FIRST + 64)
+            .map(|i| 0x0101_0101u32.wrapping_mul(i + 7) ^ 0x2000_0000 ^ i << 20)
+            .collect();
         let cb = &all[FIRST as usize..];
         let other: Vec<u32> = vec![0xdead_beef; 64];
         let s0 = 8u32;
@@ -2722,10 +2872,14 @@ mod tests {
         want.push(cb[(s0 / 4) as usize]);
         want.extend_from_slice(&cb[16..24]);
         let lanes: Vec<u32> = (0..4).map(|lane| cb[8 + lane]).collect();
-        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (raw, l) in [(false, before), (true, after)] {
             let mut dxil = l.dxil;
-            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
                 v.validate(&mut dxil).unwrap();
             }
             let Ok(host) = super::host::Host::new(true) else {
@@ -2751,7 +2905,10 @@ mod tests {
                 vec![
                     super::host::View::Cbv(&other),
                     super::host::View::RawUav(32),
-                    super::host::View::RawAt { data: &all, first: FIRST },
+                    super::host::View::RawAt {
+                        data: &all,
+                        first: FIRST,
+                    },
                     super::host::View::RawUav(32),
                 ]
             } else {
@@ -2774,8 +2931,18 @@ mod tests {
                 .iter()
                 .find(|o| o[..32].iter().any(|&w| w != 0))
                 .unwrap_or_else(|| panic!("nothing written, switch {raw}: {out:x?}"));
-            assert_eq!(got[..13], want[..], "scalar loads, switch {raw}: {:x?}", &got[..32]);
-            assert_eq!(got[24..28], lanes[..], "per lane, switch {raw}: {:x?}", &got[..32]);
+            assert_eq!(
+                got[..13],
+                want[..],
+                "scalar loads, switch {raw}: {:x?}",
+                &got[..32]
+            );
+            assert_eq!(
+                got[24..28],
+                lanes[..],
+                "per lane, switch {raw}: {:x?}",
+                &got[..32]
+            );
         }
     }
 
@@ -2823,12 +2990,32 @@ mod tests {
             wave64: false,
             vgprs: 4,
             layout: vec![
-                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
-                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
             ],
             // The constant buffer at dword 8 is in no entry of its own.
-            used: vec![table(crate::ResourceType::Uav, 0), table(crate::ResourceType::Uav, 16)],
-            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+            used: vec![
+                table(crate::ResourceType::Uav, 0),
+                table(crate::ResourceType::Uav, 16),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         // The twins start at slot 4 (a power of two past the table's three
@@ -2858,12 +3045,18 @@ mod tests {
         super::shader::RAW_VIEWS_HERE.set(None);
         let l = lowered.unwrap();
         const FIRST: u32 = 0x110 / 4;
-        let all: Vec<u32> = (0..FIRST + 16).map(|i| 0x0303_0303u32.wrapping_mul(i + 5) ^ 0x1000_0000).collect();
+        let all: Vec<u32> = (0..FIRST + 16)
+            .map(|i| 0x0303_0303u32.wrapping_mul(i + 5) ^ 0x1000_0000)
+            .collect();
         let cb = &all[FIRST as usize..];
         let other: Vec<u32> = vec![0xdead_beef; 64];
-        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut dxil = l.dxil;
-        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
             v.validate(&mut dxil).unwrap();
         }
         let Ok(host) = super::host::Host::new(true) else {
@@ -2889,7 +3082,10 @@ mod tests {
             // Not a slot of the table's: below the twins.
             super::host::View::RawUav(4),
             super::host::View::RawUav(4),
-            super::host::View::RawAt { data: &all, first: FIRST },
+            super::host::View::RawAt {
+                data: &all,
+                first: FIRST,
+            },
             super::host::View::RawUav(8),
         ];
         let out = host
@@ -2905,7 +3101,10 @@ mod tests {
             )
             .unwrap();
         // The UAV is written where the program reads it: its twin.
-        let got = out.iter().find(|o| o[..4].iter().any(|&w| w != 0)).map(|o| o[..4].to_vec());
+        let got = out
+            .iter()
+            .find(|o| o[..4].iter().any(|&w| w != 0))
+            .map(|o| o[..4].to_vec());
         assert_eq!(got.as_deref(), Some(&cb[4..8]), "{out:x?}");
     }
 
@@ -3086,7 +3285,11 @@ mod tests {
                 )
                 .unwrap();
             let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
+            assert!(
+                (got[0] - (7.0f32 / 3.0)).abs() < 1e-6,
+                "warp={warp} got {:?}",
+                got
+            );
             assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
             assert!(
                 (got[2] - 1e-35).abs() <= 1e-40,
@@ -3114,8 +3317,16 @@ mod tests {
             assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
             assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
             assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
-            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
-            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
+            assert_eq!(
+                out[0][13],
+                f32::INFINITY.to_bits(),
+                "warp={warp} 1e38/1e-38"
+            );
+            assert_eq!(
+                out[0][14],
+                f32::NEG_INFINITY.to_bits(),
+                "warp={warp} -1e38/1e-38"
+            );
         }
     }
 }
@@ -3244,7 +3455,11 @@ mod barycentric_tests {
         pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
     }
 
-    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
+    fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[container::SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -3286,8 +3501,15 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(3);
         // v_interp_mov_f32 v3, p0, attr0.z followed by exp mrt0.
         let words = [0xC80E_0202, e0, e1, 0xBF81_0000];
-        let xy = container::SigElement { cols: 2, ..element("TEXCOORD", 0, 0) };
-        let zw = container::SigElement { col: 2, cols: 2, ..element("NORMAL", 0, 0) };
+        let xy = container::SigElement {
+            cols: 2,
+            ..element("TEXCOORD", 0, 0)
+        };
+        let zw = container::SigElement {
+            col: 2,
+            cols: 2,
+            ..element("NORMAL", 0, 0)
+        };
         let shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy, zw]).unwrap();
         let c = Container::parse(&shader.dxil).unwrap();
         let psv = c.part(FourCC::PSV0).unwrap().data;
@@ -3306,18 +3528,21 @@ mod barycentric_tests {
     fn a_pixel_first_lane_loop_serves_helper_lanes() {
         let shader = pixel(
             &[
-                0xD765_0000, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+                0xD765_0000,
+                0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
                 0x7E02_0280, // v_mov_b32 v1, 0
                 0xBE97_037E, // s_mov_b32 s23, exec_lo
                 0x7E18_0500, // v_readfirstlane_b32 s12, v0
                 0x7D84_000C, // v_cmp_eq_u32 vcc, s12, v0
                 0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
                 0xBF80_0000, // s_nop 0
-                0x7E02_02FF, 0x3F80_0000, // v_mov_b32 v1, 1.0
+                0x7E02_02FF,
+                0x3F80_0000, // v_mov_b32 v1, 1.0
                 0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
                 0xBF89_FFF8, // s_cbranch_execnz loop
                 0xBEFE_0317, // s_mov_b32 exec_lo, s23
-                0xF800_180F, 0x0101_0101, // exp mrt0 v1 v1 v1 v1 done vm
+                0xF800_180F,
+                0x0101_0101, // exp mrt0 v1 v1 v1 v1 done vm
                 0xBF81_0000, // s_endpgm
             ],
             0,

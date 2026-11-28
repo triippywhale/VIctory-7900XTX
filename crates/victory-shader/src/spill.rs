@@ -170,11 +170,16 @@ pub fn user_data(p: &mut Program, native: &NativeProgram) -> usize {
                 continue;
             };
             if !inst.name().starts_with("s_load_dword")
-                || !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128))
+                || !matches!(
+                    soffset,
+                    Operand::Scalar { code: NULL, .. } | Operand::Const(128)
+                )
                 || offset < 0
                 || offset % 4 != 0
                 || !inst.read(Reg::S(base)).is_some_and(|v| lows.contains(&v))
-                || !inst.read(Reg::S(base + 1)).is_some_and(|v| highs.contains(&v))
+                || !inst
+                    .read(Reg::S(base + 1))
+                    .is_some_and(|v| highs.contains(&v))
             {
                 continue;
             }
@@ -339,7 +344,12 @@ mod tests {
         );
         let mut p = ir::build(&n.code, false, 256).unwrap();
         assert_eq!(user_data(&mut p, &n), 2);
-        let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+        let names: Vec<&str> = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|i| i.name())
+            .collect();
         assert!(!names.iter().any(|n| n.starts_with("s_load_")), "{names:?}");
         // The pointer is gone with the loads; byte 0x10 is index 20, the
         // first root constant, and bytes 0-7 are the first root view.

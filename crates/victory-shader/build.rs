@@ -41,7 +41,11 @@ fn main() {
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
-        let rel = p.strip_prefix(&src).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        let rel = p
+            .strip_prefix(&src)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
         let text = std::fs::read(p).unwrap_or_default();
         fnv(&mut state, rel.as_bytes());
         fnv(&mut state, &(text.len() as u64).to_le_bytes());
@@ -59,7 +63,13 @@ fn main() {
             rest = &tail[end..];
         }
     }
-    println!("cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}", state[0], state[1]);
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={:016x}{:016x}",
+        state[0], state[1]
+    );
     let joined: Vec<_> = switches.into_iter().collect();
-    println!("cargo:rustc-env=VICTORY_SHADER_SWITCHES={}", joined.join(","));
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SWITCHES={}",
+        joined.join(",")
+    );
 }

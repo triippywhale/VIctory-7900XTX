@@ -23,7 +23,10 @@ static MOVED: Mutex<Option<HashMap<(u64, u64), Moved>>> = Mutex::new(None);
 /// Offsets `ranges` of the copy of `span` (title address, bytes) went `way`.
 pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (usize, usize)>) {
     let mut all = MOVED.lock().unwrap_or_else(|e| e.into_inner());
-    let m = all.get_or_insert_with(Default::default).entry(span).or_default();
+    let m = all
+        .get_or_insert_with(Default::default)
+        .entry(span)
+        .or_default();
     // (Thousands of runs lie in one piece, one after the other.)
     let mut last = u32::MAX;
     for (from, to) in ranges.filter(|r| r.0 < r.1) {
@@ -38,13 +41,22 @@ pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (
 
 /// For the log, over `frames` frames.
 pub(super) fn line(frames: f64) {
-    let all = MOVED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let all = MOVED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .unwrap_or_default();
     let mut all: Vec<_> = all.into_iter().collect();
     all.sort_by_key(|(_, m)| std::cmp::Reverse(m.bytes[0] + m.bytes[1]));
     let mb = |b: u64| b as f64 / 1e6 / frames.max(1.0);
     let sum = |way: usize| all.iter().map(|(_, m)| m.bytes[way]).sum::<u64>();
     // Copies that only move one way.
-    let only = |way: usize| all.iter().filter(|(_, m)| m.bytes[1 - way] == 0).map(|(_, m)| m.bytes[way]).sum::<u64>();
+    let only = |way: usize| {
+        all.iter()
+            .filter(|(_, m)| m.bytes[1 - way] == 0)
+            .map(|(_, m)| m.bytes[way])
+            .sum::<u64>()
+    };
     tracing::info!(
         "landings in title memory looked at by refreshes per frame (VICTORY_LAND_ECHO=0: sent up): {:.1} MB held already and left, \
          {:.1} MB the title's too",

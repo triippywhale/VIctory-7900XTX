@@ -59,8 +59,8 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
 /// pools are (copies then take only written pages).
 pub(crate) fn reserve(len: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
-        MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
-        PAGE_READWRITE, VirtualAlloc2,
+        MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE,
+        MemExtendedParameterAddressRequirements, PAGE_READWRITE, VirtualAlloc2,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
@@ -94,15 +94,25 @@ impl Upload {
         }
         let n = len.max(1).div_ceil(BLOCK);
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        let found = arenas.iter().enumerate().find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
+        let found = arenas
+            .iter()
+            .enumerate()
+            .find_map(|(a, arena)| Some((a, gap(&arena.taken, n)?)));
         let (a, first) = match found {
             Some(place) => place,
             None => {
                 let blocks = n.max(ARENA / BLOCK);
                 let at = reserve(blocks * BLOCK)?;
                 crate::shadow::register(at, at as u64, (blocks * BLOCK) as u64);
-                tracing::info!(at = format_args!("{at:#x}"), bytes = blocks * BLOCK, "memory for lists' uploads, where shaders reach it by address");
-                arenas.push(Arena { at, taken: vec![false; blocks] });
+                tracing::info!(
+                    at = format_args!("{at:#x}"),
+                    bytes = blocks * BLOCK,
+                    "memory for lists' uploads, where shaders reach it by address"
+                );
+                arenas.push(Arena {
+                    at,
+                    taken: vec![false; blocks],
+                });
                 (arenas.len() - 1, 0)
             }
         };
@@ -126,7 +136,10 @@ impl Drop for Upload {
     fn drop(&mut self) {
         let Kind::Low(at, len) = self.0 else { return };
         let mut arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(arena) = arenas.iter_mut().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&at)) {
+        if let Some(arena) = arenas
+            .iter_mut()
+            .find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&at))
+        {
             let first = (at - arena.at) / BLOCK;
             arena.taken[first..first + len.max(1).div_ceil(BLOCK)].fill(false);
         }
@@ -137,7 +150,9 @@ impl Drop for Upload {
 /// [`BLOCK`]s).
 pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
     let arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
-    let arena = arenas.iter().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&address))?;
+    let arena = arenas
+        .iter()
+        .find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&address))?;
     let first = (address - arena.at) / BLOCK;
     let n = arena.taken[first..].iter().take_while(|t| **t).count();
     (n > 0).then_some((arena.at + first * BLOCK, n * BLOCK))
@@ -161,7 +176,11 @@ mod tests {
         // zeroed either way).
         let mut c = Upload::new(100).unwrap();
         // SAFETY: as above.
-        assert!(unsafe { std::slice::from_raw_parts(c.start(), 100) }.iter().all(|&x| x == 0));
+        assert!(
+            unsafe { std::slice::from_raw_parts(c.start(), 100) }
+                .iter()
+                .all(|&x| x == 0)
+        );
         // More than an arena.
         let mut d = Upload::new(ARENA + 1).unwrap();
         // SAFETY: the bytes were handed out.

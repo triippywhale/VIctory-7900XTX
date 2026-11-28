@@ -20,7 +20,11 @@ enum Op {
     /// These bytes (the low `size` of them).
     Put([u8; 32]),
     /// With a value; `keeps` carry (`inc`, `dec`).
-    Alu { alu: Alu, with: u64, keeps: bool },
+    Alu {
+        alu: Alu,
+        with: u64,
+        keeps: bool,
+    },
     /// With a register, which gets what was there.
     Xchg(Register),
     Xadd(Register),
@@ -90,9 +94,15 @@ impl Register {
     /// Operand `number` of `size` bytes, with or without a REX prefix.
     fn of(number: usize, size: usize, rex: bool) -> Register {
         if size == 1 && !rex && (4..8).contains(&number) {
-            Register { number: number - 4, high: true }
+            Register {
+                number: number - 4,
+                high: true,
+            }
         } else {
-            Register { number, high: false }
+            Register {
+                number,
+                high: false,
+            }
         }
     }
 
@@ -113,13 +123,19 @@ impl Register {
 }
 
 fn mask(size: usize) -> u64 {
-    if size >= 8 { u64::MAX } else { (1 << (size * 8)) - 1 }
+    if size >= 8 {
+        u64::MAX
+    } else {
+        (1 << (size * 8)) - 1
+    }
 }
 
 /// The upper half of vector register `reg`, where the context has it; nothing
 /// in it if the thread used none.
 fn upper(c: &CONTEXT, reg: usize) -> Option<[u8; 16]> {
-    use windows_sys::Win32::System::Diagnostics::Debug::{GetXStateFeaturesMask, LocateXStateFeature};
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        GetXStateFeaturesMask, LocateXStateFeature,
+    };
     const AVX: u32 = 2;
     let mut mask = 0;
     // SAFETY: a context as the system passes it to a handler (the calls
@@ -203,7 +219,11 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
     }
     let wide = rex & 8 != 0;
     let modrm = next()?;
-    let (mode, reg, rm) = (modrm >> 6, (modrm >> 3 & 7) as usize | (rex as usize & 4) << 1, modrm & 7);
+    let (mode, reg, rm) = (
+        modrm >> 6,
+        (modrm >> 3 & 7) as usize | (rex as usize & 4) << 1,
+        modrm & 7,
+    );
     if mode == 3 {
         return None;
     }
@@ -266,7 +286,10 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         _ => None,
     };
     let (op, size) = if long {
-        if !matches!((byte, narrow, repeat), (0x11 | 0x29, _, 0) | (0x7f, true, 0) | (0x7f, false, 0xf3) | (0xe7, true, 0)) {
+        if !matches!(
+            (byte, narrow, repeat),
+            (0x11 | 0x29, _, 0) | (0x7f, true, 0) | (0x7f, false, 0xf3) | (0xe7, true, 0)
+        ) {
             return None;
         }
         let mut bytes = vector_bytes();
@@ -274,7 +297,11 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         (Op::Put(bytes), 32)
     } else if two {
         match (byte, narrow, repeat) {
-            (0x11, _, 0) | (0x29, _, 0) | (0x7f, true, 0) | (0x7f, false, 0xf3) | (0xe7, true, 0) => (Op::Put(vector_bytes()), 16),
+            (0x11, _, 0)
+            | (0x29, _, 0)
+            | (0x7f, true, 0)
+            | (0x7f, false, 0xf3)
+            | (0xe7, true, 0) => (Op::Put(vector_bytes()), 16),
             (0x11, false, 0xf3) => (Op::Put(vector_bytes()), 4),
             (0x11, false, 0xf2) | (0x13, _, 0) | (0xd6, true, 0) => (Op::Put(vector_bytes()), 8),
             (0x17, _, 0) => {
@@ -310,20 +337,37 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         match byte {
             0x88 | 0x89 => (put(of(size).get(c)), size),
             0xc6 | 0xc7 if reg & 7 == 0 => (put(constant(size)?), size),
-            0x00 | 0x01 | 0x08 | 0x09 | 0x20 | 0x21 | 0x28 | 0x29 | 0x30 | 0x31 => {
-                (Op::Alu { alu: alu_of(byte >> 3)?, with: of(size).get(c), keeps: false }, size)
-            }
+            0x00 | 0x01 | 0x08 | 0x09 | 0x20 | 0x21 | 0x28 | 0x29 | 0x30 | 0x31 => (
+                Op::Alu {
+                    alu: alu_of(byte >> 3)?,
+                    with: of(size).get(c),
+                    keeps: false,
+                },
+                size,
+            ),
             0x80 | 0x81 | 0x83 => {
                 let alu = alu_of(reg as u8 & 7)?;
-                (Op::Alu { alu, with: constant(if byte == 0x81 { size } else { 1 })?, keeps: false }, size)
+                (
+                    Op::Alu {
+                        alu,
+                        with: constant(if byte == 0x81 { size } else { 1 })?,
+                        keeps: false,
+                    },
+                    size,
+                )
             }
             0x86 | 0x87 => {
                 locked = true;
                 (Op::Xchg(of(size)), size)
             }
-            0xfe | 0xff if reg & 7 < 2 => {
-                (Op::Alu { alu: if reg & 7 == 0 { Alu::Add } else { Alu::Sub }, with: 1, keeps: true }, size)
-            }
+            0xfe | 0xff if reg & 7 < 2 => (
+                Op::Alu {
+                    alu: if reg & 7 == 0 { Alu::Add } else { Alu::Sub },
+                    with: 1,
+                    keeps: true,
+                },
+                size,
+            ),
             _ => return None,
         }
     };
@@ -335,7 +379,13 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
     if on_rip {
         address = address.wrapping_add(c.Rip).wrapping_add(at as u64);
     }
-    Some(Store { at: address as usize, size, len: at, op, locked })
+    Some(Store {
+        at: address as usize,
+        size,
+        len: at,
+        op,
+        locked,
+    })
 }
 
 const CF: u32 = 1;
@@ -392,7 +442,9 @@ unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -
         // SAFETY (both): by the caller.
         unsafe { std::ptr::copy_nonoverlapping(at as *const u8, bytes.as_mut_ptr(), size) };
         let was = u64::from_le_bytes(bytes);
-        unsafe { std::ptr::copy_nonoverlapping(f(was).to_le_bytes().as_ptr(), at as *mut u8, size) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(f(was).to_le_bytes().as_ptr(), at as *mut u8, size)
+        };
         return Some(was);
     }
     if !at.is_multiple_of(size) {
@@ -401,10 +453,24 @@ unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -
     // SAFETY (all): by the caller, and aligned.
     Some(unsafe {
         match size {
-            1 => u64::from(AtomicU8::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u8)).ok()?),
-            2 => u64::from(AtomicU16::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u16)).ok()?),
-            4 => u64::from(AtomicU32::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u32)).ok()?),
-            _ => AtomicU64::from_ptr(at as *mut _).fetch_update(SeqCst, SeqCst, |v| Some(f(v))).ok()?,
+            1 => u64::from(
+                AtomicU8::from_ptr(at as *mut _)
+                    .fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u8))
+                    .ok()?,
+            ),
+            2 => u64::from(
+                AtomicU16::from_ptr(at as *mut _)
+                    .fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u16))
+                    .ok()?,
+            ),
+            4 => u64::from(
+                AtomicU32::from_ptr(at as *mut _)
+                    .fetch_update(SeqCst, SeqCst, |v| Some(f(v.into()) as u32))
+                    .ok()?,
+            ),
+            _ => AtomicU64::from_ptr(at as *mut _)
+                .fetch_update(SeqCst, SeqCst, |v| Some(f(v)))
+                .ok()?,
         }
     })
 }
@@ -422,11 +488,14 @@ impl Store {
         }
         let mut there = [0u8; 32];
         // SAFETY: by the caller (32 bytes at the most).
-        unsafe { std::ptr::copy_nonoverlapping(self.at as *const u8, there.as_mut_ptr(), self.size) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.at as *const u8, there.as_mut_ptr(), self.size)
+        };
         match self.op {
             Op::Put(bytes) => Some((there[..self.size] == bytes[..self.size], c.EFlags)),
             Op::Alu { alu, with, keeps } => {
-                let was = u64::from_le_bytes(there[..8].try_into().expect("eight bytes")) & mask(self.size);
+                let was = u64::from_le_bytes(there[..8].try_into().expect("eight bytes"))
+                    & mask(self.size);
                 let (value, flags) = arithmetic(alu, was, with, self.size, keeps, c.EFlags);
                 Some((value == was, flags))
             }
@@ -443,7 +512,10 @@ impl Store {
         self.len >= 5
             && match self.op {
                 Op::Alu { alu: Alu::Or, .. } => code[at] == 0x80,
-                Op::Put(_) => matches!(code[0], 0xc4 | 0xc5) && self.size >= 16 || matches!(code[at], 0x89 | 0xc7),
+                Op::Put(_) => {
+                    matches!(code[0], 0xc4 | 0xc5) && self.size >= 16
+                        || matches!(code[at], 0x89 | 0xc7)
+                }
                 _ => false,
             }
     }
@@ -462,7 +534,10 @@ impl Store {
                 // As one, for those the processor stores as one.
                 // SAFETY (all): by the caller, aligned where it must be.
                 unsafe {
-                    let low = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
+                    let low = u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]);
                     match size {
                         1 => (to as *mut u8).write_volatile(bytes[0]),
                         2 if to.is_multiple_of(2) => (to as *mut u16).write_volatile(low as u16),
@@ -474,7 +549,11 @@ impl Store {
             }
             Op::Alu { alu, with, keeps } => {
                 let flags = c.EFlags;
-                let Some(was) = (unsafe { change(to, size, locked, |v| arithmetic(alu, v, with, size, keeps, flags).0) }) else {
+                let Some(was) = (unsafe {
+                    change(to, size, locked, |v| {
+                        arithmetic(alu, v, with, size, keeps, flags).0
+                    })
+                }) else {
                     return false;
                 };
                 c.EFlags = arithmetic(alu, was, with, size, keeps, flags).1;
@@ -488,7 +567,9 @@ impl Store {
             }
             Op::Xadd(register) => {
                 let value = register.get(c);
-                let Some(was) = (unsafe { change(to, size, locked, |v| v.wrapping_add(value) & m) }) else {
+                let Some(was) =
+                    (unsafe { change(to, size, locked, |v| v.wrapping_add(value) & m) })
+                else {
                     return false;
                 };
                 c.EFlags = arithmetic(Alu::Add, was, value, size, false, c.EFlags).1;
@@ -496,13 +577,24 @@ impl Store {
             }
             Op::Cmpxchg(register) => {
                 let (value, expected) = (register.get(c) & m, c.Rax & m);
-                let Some(was) = (unsafe { change(to, size, locked, |v| if v & m == expected { value } else { v }) }) else {
+                let Some(was) = (unsafe {
+                    change(
+                        to,
+                        size,
+                        locked,
+                        |v| if v & m == expected { value } else { v },
+                    )
+                }) else {
                     return false;
                 };
                 let was = was & m;
                 c.EFlags = arithmetic(Alu::Sub, expected, was, size, false, c.EFlags).1;
                 if was != expected {
-                    Register { number: 0, high: false }.put(c, was, size);
+                    Register {
+                        number: 0,
+                        high: false,
+                    }
+                    .put(c, was, size);
                 }
             }
         }
@@ -535,25 +627,52 @@ mod tests {
     #[test]
     fn stores_are_told_by_their_bytes() {
         // mov [rcx+rax+48h], rbx
-        assert_eq!(decoded(&[0x48, 0x89, 0x5c, 0x01, 0x48]), Some((0x10048, 8, 5)));
+        assert_eq!(
+            decoded(&[0x48, 0x89, 0x5c, 0x01, 0x48]),
+            Some((0x10048, 8, 5))
+        );
         // mov [rbx], rdx
         assert_eq!(decoded(&[0x48, 0x89, 0x13]), Some((0x30000, 8, 3)));
         // or byte [r9+9eh], 1
-        assert_eq!(decoded(&[0x41, 0x80, 0x89, 0x9e, 0, 0, 0, 1]), Some((0x9009e, 1, 8)));
+        assert_eq!(
+            decoded(&[0x41, 0x80, 0x89, 0x9e, 0, 0, 0, 1]),
+            Some((0x9009e, 1, 8))
+        );
         // lock dec dword [rcx+10h]
         assert_eq!(decoded(&[0xf0, 0xff, 0x49, 0x10]), Some((0x10010, 4, 4)));
         // lock xadd [r10+r12*8-1], eax
-        assert_eq!(decoded(&[0xf0, 0x43, 0x0f, 0xc1, 0x44, 0xe2, 0xff]), Some((0xa0000 + 0xc0000 * 8 - 1, 4, 7)));
+        assert_eq!(
+            decoded(&[0xf0, 0x43, 0x0f, 0xc1, 0x44, 0xe2, 0xff]),
+            Some((0xa0000 + 0xc0000 * 8 - 1, 4, 7))
+        );
         // mov word [rsp], 1234h
-        assert_eq!(decoded(&[0x66, 0xc7, 0x04, 0x24, 0x34, 0x12]), Some((0x40000, 2, 6)));
+        assert_eq!(
+            decoded(&[0x66, 0xc7, 0x04, 0x24, 0x34, 0x12]),
+            Some((0x40000, 2, 6))
+        );
         // mov [rip+10h], al; mov byte [rip+10h], 5 (counted from its end)
-        assert_eq!(decoded(&[0x88, 0x05, 0x10, 0, 0, 0]), Some((0x7000_0016, 1, 6)));
-        assert_eq!(decoded(&[0xc6, 0x05, 0x10, 0, 0, 0, 5]), Some((0x7000_0017, 1, 7)));
+        assert_eq!(
+            decoded(&[0x88, 0x05, 0x10, 0, 0, 0]),
+            Some((0x7000_0016, 1, 6))
+        );
+        assert_eq!(
+            decoded(&[0xc6, 0x05, 0x10, 0, 0, 0, 5]),
+            Some((0x7000_0017, 1, 7))
+        );
         // mov [12345678h], eax (no base)
-        assert_eq!(decoded(&[0x89, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12]), Some((0x1234_5678, 4, 7)));
+        assert_eq!(
+            decoded(&[0x89, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12]),
+            Some((0x1234_5678, 4, 7))
+        );
         // vmovaps [rsi+10h], xmm4; vmovaps [r12], xmm3; movups [rax], xmm9
-        assert_eq!(decoded(&[0xc5, 0xf8, 0x29, 0x66, 0x10]), Some((0x60010, 16, 5)));
-        assert_eq!(decoded(&[0xc4, 0xc1, 0x78, 0x29, 0x1c, 0x24]), Some((0xc0000, 16, 6)));
+        assert_eq!(
+            decoded(&[0xc5, 0xf8, 0x29, 0x66, 0x10]),
+            Some((0x60010, 16, 5))
+        );
+        assert_eq!(
+            decoded(&[0xc4, 0xc1, 0x78, 0x29, 0x1c, 0x24]),
+            Some((0xc0000, 16, 6))
+        );
         assert_eq!(decoded(&[0x44, 0x0f, 0x11, 0x08]), Some((0, 16, 4)));
         // vmovss [rax], xmm0; movlps, movhps, vmovq, movd
         assert_eq!(decoded(&[0xc5, 0xfa, 0x11, 0x00]), Some((0, 4, 4)));
@@ -576,13 +695,20 @@ mod tests {
     /// What the processor makes of `code` with rax as the address, rcx and
     /// rdx as operands; against [`Store::run`].
     fn against_the_processor(code: &[u8], seed: u64) {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
+        };
         static PLACE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: fresh memory for code.
         let place = *PLACE.get_or_init(|| unsafe {
-            VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            ) as usize
         });
         let spread = |n: u64| {
             let v = (seed + n).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seed << 7;
@@ -602,9 +728,19 @@ mod tests {
         let mut f = vec![0x49, 0x89, 0xcb, 0x4c, 0x89, 0xc0, 0x41, 0x51, 0x9d];
         f.extend(code);
         f.extend([0x9c, 0x41, 0x5a, 0x48, 0x8b, 0x4c, 0x24, 0x28]);
-        f.extend([0x4c, 0x89, 0x11, 0x48, 0x89, 0x51, 0x08, 0x48, 0x89, 0x41, 0x10, 0xc3]);
+        f.extend([
+            0x4c, 0x89, 0x11, 0x48, 0x89, 0x51, 0x08, 0x48, 0x89, 0x41, 0x10, 0xc3,
+        ]);
         type F = unsafe extern "system" fn(*mut u64, u64, u64, u64, *mut [u64; 3]);
-        let (there, operand, compared) = (spread(1), spread(2), if seed.is_multiple_of(3) { spread(1) } else { spread(3) });
+        let (there, operand, compared) = (
+            spread(1),
+            spread(2),
+            if seed.is_multiple_of(3) {
+                spread(1)
+            } else {
+                spread(3)
+            },
+        );
         let flags = 0x202 | (spread(4) & 0x8d5) as u32;
         let (mut memory, mut out) = (there, [0; 3]);
         // SAFETY: the code above, which keeps to the calling convention.
@@ -619,14 +755,26 @@ mod tests {
         let mut padded = code.to_vec();
         padded.resize(15, 0xcc);
         let store = store(&padded, &c).unwrap_or_else(|| panic!("{code:x?}"));
-        assert_eq!((store.at, store.len), (&raw mut ours as usize, code.len()), "{code:x?}");
+        assert_eq!(
+            (store.at, store.len),
+            (&raw mut ours as usize, code.len()),
+            "{code:x?}"
+        );
         // SAFETY: our word.
         assert!(unsafe { store.run(&mut c, &raw mut ours as usize) });
         assert_eq!(ours, memory, "{code:x?} of {there:x} with {operand:x}");
-        assert_eq!((c.Rdx, c.Rax), (out[1], out[2]), "{code:x?} of {there:x} with {operand:x}, {compared:x}");
+        assert_eq!(
+            (c.Rdx, c.Rax),
+            (out[1], out[2]),
+            "{code:x?} of {there:x} with {operand:x}, {compared:x}"
+        );
         // (`and`, `or` and `xor` leave AF as they like.)
         const SEEN: u32 = CF | PF | ZF | SF | OF;
-        assert_eq!(c.EFlags & SEEN, out[0] as u32 & SEEN, "{code:x?} of {there:x} with {operand:x}");
+        assert_eq!(
+            c.EFlags & SEEN,
+            out[0] as u32 & SEEN,
+            "{code:x?} of {there:x} with {operand:x}"
+        );
     }
 
     #[test]
@@ -686,12 +834,31 @@ mod tests {
         let mut c = context();
         c.Rax = 0x1122_3344_5566_7788;
         assert_eq!(Register::of(4, 1, false).get(&c) & 0xff, 0x77, "ah");
-        assert_eq!(Register::of(4, 1, true), Register { number: 4, high: false }, "spl");
-        Register { number: 0, high: true }.put(&mut c, 0xff, 1);
+        assert_eq!(
+            Register::of(4, 1, true),
+            Register {
+                number: 4,
+                high: false
+            },
+            "spl"
+        );
+        Register {
+            number: 0,
+            high: true,
+        }
+        .put(&mut c, 0xff, 1);
         assert_eq!(c.Rax, 0x1122_3344_5566_ff88);
-        Register { number: 0, high: false }.put(&mut c, 0xabcd, 2);
+        Register {
+            number: 0,
+            high: false,
+        }
+        .put(&mut c, 0xabcd, 2);
         assert_eq!(c.Rax, 0x1122_3344_5566_abcd);
-        Register { number: 0, high: false }.put(&mut c, u64::MAX, 4);
+        Register {
+            number: 0,
+            high: false,
+        }
+        .put(&mut c, u64::MAX, 4);
         assert_eq!(c.Rax, 0xffff_ffff);
     }
 }

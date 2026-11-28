@@ -110,7 +110,9 @@ fn split() -> bool {
 #[cfg(windows)]
 pub(crate) fn cuts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
+    waits()
+        && split()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// Whether a present runs what queues still hold (on by default: a wait
@@ -381,10 +383,15 @@ pub(crate) fn release_held(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held
+                                .iter()
+                                .take_while(|h| matches!(h, Held::Value(_)))
+                                .count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held[..waits]
+                                    .iter()
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -607,7 +614,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             if !unmet.is_empty() {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+                    tracing::info!(
+                        kind = queue(this).kind,
+                        ?unmet,
+                        "a submission is held for a memory value"
+                    );
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
                 let mut waiting = lock(&WAITING);
@@ -702,7 +713,10 @@ fn planes_seen(planes: u32, parameters: *const Plane) -> bool {
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
     // Read only the second prefix at the 72-byte retail PresentX stride. A
     // caller using a different layout can still present its base plane safely.
-    let second = parameters.cast::<RetailPlane>().wrapping_add(1).cast::<u8>();
+    let second = parameters
+        .cast::<RetailPlane>()
+        .wrapping_add(1)
+        .cast::<u8>();
     let mut prefix = [0; size_of::<Plane>()];
     if !crate::host::read_into(second, &mut prefix) {
         return None;
@@ -749,7 +763,9 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(crate::fence::FenceRef::new(fence), value)) {
+    if hold(this, || {
+        Held::Signal(crate::fence::FenceRef::new(fence), value)
+    }) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
@@ -782,11 +798,21 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::info!(kind = queue(this).kind, now, value, "a queue is told to wait for a fence");
+                tracing::info!(
+                    kind = queue(this).kind,
+                    now,
+                    value,
+                    "a queue is told to wait for a fence"
+                );
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        crate::capture::op(this as usize, || {
+            format!(
+                "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
+                queue(this).kind
+            )
+        });
         if behind::on() && waits() {
             behind::wait(this, fence, value);
             return S_OK;
@@ -855,7 +881,8 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                let now =
+                    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
                 #[cfg(all(windows, feature = "diagnostics"))]
                 crate::host::spans::stamped(at as usize, now);
                 as_loaded(now, at as usize, gpu_load())
@@ -885,7 +912,10 @@ impl Written {
 fn gpu_load() -> u64 {
     static LOAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LOAD.get_or_init(|| {
-        let ms = std::env::var("VICTORY_GPU_LOAD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        let ms = std::env::var("VICTORY_GPU_LOAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         ms * (TIMESTAMP_FREQUENCY / 1000)
     })
 }
@@ -1010,20 +1040,26 @@ extern "system" fn present(
         };
         let take_copy = |resource: This| {
             crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
                 // (Lists not translated yet leave it in no state yet: the
                 // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                let state = if crate::list::thin::wanted() {
+                    u32::MAX
+                } else {
+                    state
+                };
                 (resource as usize, copy, state)
             })
         };
         let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null() && planes_seen(planes, plane_parameters))
-            .then(|| overlay_resource(plane_parameters))
-            .flatten()
-            .filter(|&over_res| base_res != Some(over_res))
-            .and_then(take_copy);
+        let overlay =
+            (planes > 1 && !plane_parameters.is_null() && planes_seen(planes, plane_parameters))
+                .then(|| overlay_resource(plane_parameters))
+                .flatten()
+                .filter(|&over_res| base_res != Some(over_res))
+                .and_then(take_copy);
         let resource = texture.as_ref().map_or(0, |t| t.0);
         behind::present(
             this,
@@ -1065,7 +1101,10 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown {
+                frame,
+                resource: resource as usize,
+            },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1247,7 +1286,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -1342,8 +1383,14 @@ mod tests {
         };
         let (mut q, mut allocator, mut list) = (null, null, null);
         assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
-        assert_eq!(crate::list::create_allocator(null, 0, iid, &mut allocator), S_OK);
-        assert_eq!(crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list), S_OK);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, iid, &mut list),
+            S_OK
+        );
         crate::descriptor::with_test_view_heap(|title_heap| {
             let host_heap = title_heap.host().expect("a host view heap");
             let free = host_heap.dynamic_free();
@@ -1354,7 +1401,10 @@ mod tests {
             assert!(took, "a dynamic slot");
             assert_eq!(host_heap.dynamic_free(), free - 1);
             // Closed, then submitted with no wait in it: it runs at once.
-            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            assert_eq!(
+                slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+                S_OK
+            );
             submit_split(q, &[list]);
             assert_eq!(host_heap.dynamic_free(), free);
         });
@@ -1420,7 +1470,10 @@ mod tests {
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
         let (start, end) = (0xd_0419_6698, 0xd_0419_6690);
-        assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
+        assert_eq!(
+            as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000),
+            4_000_000
+        );
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);
     }
@@ -1518,7 +1571,8 @@ mod tests {
         let guard = lock(&RELEASING);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let releaser = std::thread::spawn(move || {
-            let left = slot::<extern "system" fn(This) -> u32>(q_addr as This, 0x10)(q_addr as This);
+            let left =
+                slot::<extern "system" fn(This) -> u32>(q_addr as This, 0x10)(q_addr as This);
             let _ = done_tx.send(left);
         });
         assert!(
@@ -1534,6 +1588,9 @@ mod tests {
         assert_eq!(left, 0);
         assert!(!lock(&WAITING).contains(&q_addr));
         releaser.join().unwrap();
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+            0
+        );
     }
 }

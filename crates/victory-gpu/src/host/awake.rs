@@ -39,7 +39,10 @@ const QUIET_MS: u64 = 250;
 
 fn now_ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// When a submission was last sent ([`now_ms`] plus one; 0: never).
@@ -78,7 +81,10 @@ pub(super) fn sent(device: &ID3D12Device) {
     let now = now_ms();
     let before = LAST.swap(now + 1, Ordering::Relaxed);
     if mode() == Mode::ByTurns && before.saturating_sub(1) / TURN_MS != now / TURN_MS {
-        tracing::info!(on = now / TURN_MS % 2 == 1, "the card is kept awake, by turns");
+        tracing::info!(
+            on = now / TURN_MS % 2 == 1,
+            "the card is kept awake, by turns"
+        );
     }
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
@@ -103,7 +109,10 @@ impl Drop for Awake {
 }
 
 /// Keeps the card of `device` busy while `wanted`.
-pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 'static) -> Option<Awake> {
+pub(crate) fn start(
+    device: &ID3D12Device,
+    wanted: impl Fn() -> bool + Send + 'static,
+) -> Option<Awake> {
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let (device, ended) = (device.clone(), stop.clone());
     let thread = std::thread::Builder::new()
@@ -120,21 +129,30 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
     })
 }
 
-fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> windows::core::Result<()> {
-    let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+fn run(
+    device: &ID3D12Device,
+    wanted: &dyn Fn() -> bool,
+    stop: &AtomicBool,
+) -> windows::core::Result<()> {
+    let code = super::compile(
+        COUNT,
+        windows::core::s!("main"),
+        windows::core::s!("cs_5_1"),
+    )?;
     // SAFETY: plain object creation; the code lives through the calls, the
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.
     unsafe {
         let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
-        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: code.as_ptr().cast(),
-                BytecodeLength: code.len(),
-            },
-            ..Default::default()
-        })?;
+        let pso: ID3D12PipelineState =
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })?;
         let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_COMPUTE,
             Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
@@ -153,7 +171,10 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 ..Default::default()
@@ -163,7 +184,8 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             &mut sum,
         )?;
         let sum = sum.ok_or_else(windows::core::Error::empty)?;
-        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)?;
+        let allocator: ID3D12CommandAllocator =
+            device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)?;
         let mut lists = Vec::new();
         for _ in 0..2 {
             let list: ID3D12GraphicsCommandList =
@@ -196,7 +218,10 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             value += 1;
             result = queue.Signal(&fence, value);
         }
-        if result.is_ok() && fence.GetCompletedValue() < value && fence.SetEventOnCompletion(value, event).is_ok() {
+        if result.is_ok()
+            && fence.GetCompletedValue() < value
+            && fence.SetEventOnCompletion(value, event).is_ok()
+        {
             WaitForSingleObject(event, INFINITE);
         }
         let _ = CloseHandle(event);
@@ -234,19 +259,28 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-            let list: ID3D12GraphicsCommandList =
-                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let allocator: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap();
             list.CopyBufferRegion(&seen, 0, &buffer, 0, 4096);
             list.Close().unwrap();
             queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
             let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             queue.Signal(&fence, 1).unwrap();
             // No event: returns when the fence is there.
-            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            fence
+                .SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default())
+                .unwrap();
             std::slice::from_raw_parts(back, 4096).to_vec()
         };
-        assert!(read.iter().enumerate().all(|(i, &b)| b == (i * 7 + i / 251) as u8));
+        assert!(
+            read.iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i * 7 + i / 251) as u8)
+        );
         drop(awake);
     }
 }

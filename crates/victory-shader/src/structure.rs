@@ -857,7 +857,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             wide: self.wide,
             wave_any: self.wave_any,
@@ -1300,7 +1304,11 @@ impl<'a> Lanes<'a> {
                     let e = exec.unwrap_or(Bool::TRUE);
                     let own = self.b.given(m, e);
                     if self.b.implies(m, e)
-                        && self.b.support(own).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                        && self
+                            .b
+                            .support(own)
+                            .iter()
+                            .all(|a| matches!(a, Atom::Uniform(_)))
                     {
                         self.scc_lane.insert(scc, m);
                     }
@@ -1994,8 +2002,15 @@ mod tests {
             .find(|i| i.name() == "s_bcnt1_i32_b32")
             .and_then(|i| i.write(Reg::Scc))
             .expect("s_bcnt1 writes SCC");
-        let &scc_bool = s.scc_some.get(&bcnt_scc).expect("s_bcnt1 tracked in scc_some");
-        assert_ne!(scc_bool, Bool::TRUE, "scc_some must not collapse narrowed EXEC to TRUE");
+        let &scc_bool = s
+            .scc_some
+            .get(&bcnt_scc)
+            .expect("s_bcnt1 tracked in scc_some");
+        assert_ne!(
+            scc_bool,
+            Bool::TRUE,
+            "scc_some must not collapse narrowed EXEC to TRUE"
+        );
         assert!(
             matches!(s.bools.support(scc_bool)[..], [Atom::Lane(_)]),
             "scc_some must preserve the narrowed lane predicate: {:?}",
@@ -2004,7 +2019,11 @@ mod tests {
         let LaneExit::Branch { when, .. } = s.exits[0] else {
             panic!("expected branch exit on block 0");
         };
-        assert_ne!(when, Bool::FALSE, "s_cbranch_scc0 must not become dead (FALSE)");
+        assert_ne!(
+            when,
+            Bool::FALSE,
+            "s_cbranch_scc0 must not become dead (FALSE)"
+        );
         assert!(
             matches!(s.bools.support(when)[..], [Atom::Lane(_)]),
             "branch condition must depend on narrowed EXEC lane predicate: {:?}",

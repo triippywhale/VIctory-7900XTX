@@ -71,7 +71,14 @@ pub(crate) fn note(what: What, a: usize, b: usize, c: u64) {
     }
     // SAFETY: a question about this thread.
     let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
-    let record = Record { at: ticks(), a: a as u64, b: b as u64, c, thread, what: what as u32 };
+    let record = Record {
+        at: ticks(),
+        a: a as u64,
+        b: b as u64,
+        c,
+        thread,
+        what: what as u32,
+    };
     BOOK.lock().unwrap_or_else(|e| e.into_inner()).push(record);
 }
 
@@ -84,9 +91,17 @@ pub(crate) fn frame() {
     static MADE: AtomicU64 = AtomicU64::new(0);
     let began = *BEGAN.get_or_init(std::time::Instant::now);
     let Some((file, times)) = SETTINGS.get_or_init(|| {
-        let file = std::env::var("VICTORY_FAULT_BOOK").ok().filter(|f| !f.is_empty())?;
+        let file = std::env::var("VICTORY_FAULT_BOOK")
+            .ok()
+            .filter(|f| !f.is_empty())?;
         let times = std::env::var("VICTORY_FAULT_BOOK_AT").unwrap_or_else(|_| "150,210,270".into());
-        Some((file, times.split(',').filter_map(|t| t.trim().parse().ok()).collect()))
+        Some((
+            file,
+            times
+                .split(',')
+                .filter_map(|t| t.trim().parse().ok())
+                .collect(),
+        ))
     }) else {
         return;
     };
@@ -100,13 +115,18 @@ pub(crate) fn frame() {
         let file = format!("{file}.{}.bin", MADE.fetch_add(1, Relaxed));
         std::thread::spawn(move || {
             // SAFETY: plain data, every byte of it written.
-            let bytes = unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), size_of_val(&records[..])) };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), size_of_val(&records[..]))
+            };
             match std::fs::write(&file, bytes) {
                 Ok(()) => tracing::info!(file, records = records.len(), "book of faults written"),
                 Err(e) => tracing::warn!(file, %e, "book of faults not written"),
             }
         });
-    } else if times.get(MADE.load(Relaxed) as usize).is_some_and(|&t| began.elapsed().as_secs() >= t) {
+    } else if times
+        .get(MADE.load(Relaxed) as usize)
+        .is_some_and(|&t| began.elapsed().as_secs() >= t)
+    {
         LEFT.store(FRAMES, Relaxed);
         ON.store(true, Relaxed);
     }

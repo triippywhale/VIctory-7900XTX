@@ -8,17 +8,21 @@ pub(super) struct Writer {
 impl Writer {
     pub(super) fn start(flush: impl Fn() + Send + 'static) -> std::io::Result<Self> {
         let (requests, pending) = mpsc::channel::<Sender<()>>();
-        std::thread::Builder::new().name("victory-known".into()).spawn(move || loop {
-            let done = match pending.recv_timeout(Duration::from_secs(2)) {
-                Ok(done) => Some(done),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            };
-            flush();
-            if let Some(done) = done {
-                let _ = done.send(());
-            }
-        })?;
+        std::thread::Builder::new()
+            .name("victory-known".into())
+            .spawn(move || {
+                loop {
+                    let done = match pending.recv_timeout(Duration::from_secs(2)) {
+                        Ok(done) => Some(done),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
+                    flush();
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
+                }
+            })?;
         Ok(Self { requests })
     }
 

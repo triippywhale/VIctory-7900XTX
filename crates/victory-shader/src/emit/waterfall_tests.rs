@@ -258,15 +258,28 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 fn immediate_sampler_chosen_by_control_flow() {
     let s_mov_lit = |dst: u8, lit: u32| [0xBE80_03FF | (dst as u32) << 16, lit];
     let s_mov_zero = |dst: u8| 0xBE80_0380 | (dst as u32) << 16;
-    let s_load_x8 = |dst: u8, base: u8| [0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25];
-    let s_load_x4_off = |dst: u8, base: u8, off: u32| [0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1), 125 << 25 | off];
+    let s_load_x8 = |dst: u8, base: u8| {
+        [
+            0x3D << 26 | 0x03 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25,
+        ]
+    };
+    let s_load_x4_off = |dst: u8, base: u8, off: u32| {
+        [
+            0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25 | off,
+        ]
+    };
     // image_sample_lz v4, v[2:3], s[8:15], s[16:19] dmask:0x1 dim:SQ_RSRC_IMG_2D
     let image_sample_lz: [u32; 2] = [
         0x3C << 26 | 0x21 << 18 | 1 << 8 | 1 << 3, // dmask=1, dim=2D(1)
         (16u32 >> 2) << 21 | (8u32 >> 2) << 16 | 4 << 8 | 2,
     ];
     // buffer_store_dword v4, off, s[20:23], 0
-    let buf_store: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | (20u32 >> 2) << 16 | 4 << 8];
+    let buf_store: [u32; 2] = [
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | (20u32 >> 2) << 16 | 4 << 8,
+    ];
 
     // Two distinct valid immediate sampler descriptors (different wrap/filter bits).
     let samp_a: [u32; 4] = [0x0000_0092, 0x00C0_0000, 0x1850_0000, 0];

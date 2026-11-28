@@ -48,7 +48,13 @@ enum NodeAt {
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
     /// the node's address, for the second half of a 128-byte node, and
     /// whether there is a copy.
-    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
+    Memory {
+        handle: V,
+        byte: V,
+        low: V,
+        high: V,
+        mapped: V,
+    },
 }
 
 /// The ray operands, as floats.
@@ -213,7 +219,8 @@ impl<'a> Lower<'a> {
         let pair = self.s.m.bin(head, Bin::And, pointer, k6);
         let is_box = self.s.m.cmp(head, pred::EQ, pair, k4);
         let is_triangle = self.s.m.cmp(head, pred::IULT, kind, k4);
-        let walk = (crate::emit::bvh_walk() && self.s.threads.is_some()).then(|| self.bvh_walk_count(is_box, is_triangle));
+        let walk = (crate::emit::bvh_walk() && self.s.threads.is_some())
+            .then(|| self.bvh_walk_count(is_box, is_triangle));
         let (box_block, leaf_block) = (self.s.m.new_block(), self.s.m.new_block());
         let (triangle_block, join) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
@@ -301,10 +308,18 @@ impl<'a> Lower<'a> {
                 .collect();
             while let Some(x) = work.pop() {
                 if inside.insert(x) {
-                    work.extend(p.blocks[x].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                    work.extend(
+                        p.blocks[x]
+                            .preds
+                            .iter()
+                            .copied()
+                            .filter(|&q| self.block[q].is_some()),
+                    );
                 }
             }
-            if inside.contains(&b) && best.is_none_or(|(n, first, _)| (inside.len(), h) < (n, first)) {
+            if inside.contains(&b)
+                && best.is_none_or(|(n, first, _)| (inside.len(), h) < (n, first))
+            {
                 best = Some((inside.len(), h, phi));
             }
         }
@@ -322,8 +337,12 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let (entry, i32t) = (self.s.entry, self.s.t.i32);
         let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
-        let x = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
-        let y = self.s.op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
+        let x = self
+            .s
+            .op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+        let y = self
+            .s
+            .op(entry, "threadId.i32", Attr::ReadNone, i32t, 93, &[k1]);
         let (k12, k2) = (self.s.m.i32(12), self.s.m.i32(2));
         let mask = self.s.m.i32(crate::emit::WALK_SLOTS - 1);
         let row = self.s.m.bin(c, Bin::Shl, y, k12);
@@ -335,7 +354,14 @@ impl<'a> Lower<'a> {
         let add = self.s.m.select(c, is_box, one, leaf);
         let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
         let iu = self.s.m.undef(i32t);
-        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, byte, iu, iu, add]);
+        self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, k0, byte, iu, iu, add],
+        );
         byte
     }
 
@@ -350,7 +376,9 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let k0 = self.s.m.i32(0);
         let phi = self.s.m.phi(c, i32t);
-        self.s.m.set_phi(phi, vec![(entered, from[0]), (k0, from[1]), (k0, from[2])]);
+        self.s
+            .m
+            .set_phi(phi, vec![(entered, from[0]), (k0, from[1]), (k0, from[2])]);
         let add = match mapped {
             Some(m) => {
                 let high = self.s.m.i32(0x10000);
@@ -363,7 +391,14 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Add, byte, second);
         let h = self.s.root_uav_handle(crate::emit::SLOT_WALK);
         let iu = self.s.m.undef(i32t);
-        self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, k0, at, iu, iu, add]);
+        self.s.op(
+            c,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, k0, at, iu, iu, add],
+        );
     }
 
     /// Title memory at `low`/`high` for a node's bytes: the raw view of the

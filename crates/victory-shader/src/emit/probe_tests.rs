@@ -12,7 +12,9 @@ use crate::native::{HwStage, RootType};
 #[test]
 #[ignore = "a tool: VICTORY_PROBE=<folder>"]
 fn probe() {
-    let Some(folder) = std::env::var_os("VICTORY_PROBE") else { return };
+    let Some(folder) = std::env::var_os("VICTORY_PROBE") else {
+        return;
+    };
     let host = Host::new(false).expect("a card");
     let mut files: Vec<_> = std::fs::read_dir(folder)
         .expect("the folder")
@@ -21,12 +23,21 @@ fn probe() {
         .collect();
     files.sort();
     for file in files {
-        let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        let name = file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         let shader = HostShader {
             stage: HwStage::Cs,
             dxil: std::fs::read(&file).expect("the file"),
             user_data: (0..4)
-                .map(|n| super::UserData { index: n, slot: 0, root: RootType::Constants, dword: n })
+                .map(|n| super::UserData {
+                    index: n,
+                    slot: 0,
+                    root: RootType::Constants,
+                    dword: n,
+                })
                 .collect(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
@@ -69,6 +80,10 @@ fn probe() {
         run(constants, 64);
         let mut times: Vec<f64> = (0..9).map(|_| run(constants, 4096).1).collect();
         times.sort_by(f64::total_cmp);
-        println!("{name}: {:.2} ms (least {:.2})", times[times.len() / 2], times[0]);
+        println!(
+            "{name}: {:.2} ms (least {:.2})",
+            times[times.len() / 2],
+            times[0]
+        );
     }
 }

@@ -139,9 +139,12 @@ fn vertex_shader() -> HostShader {
 fn the_level_of_detail_of_a_2d_array_takes_no_slice() {
     let ps = pixel_shader().expect("emit");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut ps.dxil.clone()).expect("DXIL validation failed");
+        v.validate(&mut ps.dxil.clone())
+            .expect("DXIL validation failed");
     }
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");

@@ -117,17 +117,31 @@ impl Host {
                 &mut heap,
             )?;
             let heap = heap.ok_or_else(windows::core::Error::empty)?;
-            let back = self.read_back_buffer(16 * SPANS as u64).ok_or_else(windows::core::Error::empty)?;
+            let back = self
+                .read_back_buffer(16 * SPANS as u64)
+                .ok_or_else(windows::core::Error::empty)?;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data))?;
             std::ptr::write_bytes(data.cast::<u8>(), 0, 16 * SPANS);
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let mut lists = Vec::with_capacity(2 * SPANS);
             for i in 0..2 * SPANS as u32 {
-                let list: ID3D12GraphicsCommandList =
-                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
                 list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-                list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, &back, u64::from(i) * 8);
+                list.ResolveQueryData(
+                    &heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    i,
+                    1,
+                    &back,
+                    u64::from(i) * 8,
+                );
                 list.Close()?;
                 lists.push(list.cast()?);
             }
@@ -162,7 +176,11 @@ pub(crate) fn stamped(at: usize, now: u64) {
     s.2 = now;
     if s.3.len() < 64 && !s.3.contains(&at) {
         s.3.push(at);
-        tracing::info!(address = format_args!("{at:#x}"), now, "a GPU timestamp of the title");
+        tracing::info!(
+            address = format_args!("{at:#x}"),
+            now,
+            "a GPU timestamp of the title"
+        );
     }
 }
 
@@ -199,7 +217,13 @@ pub(super) fn line(frames: f64) {
         return;
     };
     let last = spans.sums.last;
-    let s = std::mem::replace(&mut spans.sums, Sums { last, ..Sums::default() });
+    let s = std::mem::replace(
+        &mut spans.sums,
+        Sums {
+            last,
+            ..Sums::default()
+        },
+    );
     let ms = |ticks: u64| ticks as f64 / spans.ticks_per_ms / frames;
     tracing::info!(
         "the card's own stamps per frame: {:.1} submissions, working {:.1} ms, idle between them {:.1} ms, the longest {:.1} ms",
@@ -220,7 +244,10 @@ mod tests {
         s.add(100, 150);
         s.add(140, 200); // began before the last one ended
         s.add(260, 270);
-        assert_eq!((s.count, s.busy, s.between, s.longest, s.last), (3, 110, 60, 50, 270));
+        assert_eq!(
+            (s.count, s.busy, s.between, s.longest, s.last),
+            (3, 110, 60, 50, 270)
+        );
         // Never written, or nonsense: nothing.
         s.add(0, 0);
         s.add(300, 290);

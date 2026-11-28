@@ -80,7 +80,12 @@ pub(crate) fn count(what: usize) {
 pub(crate) enum Seen {
     /// A copy at its place: destination, source, bytes, and whether the card
     /// copies what the CPU takes out of the source at submission.
-    Placed { dst: usize, src: usize, len: usize, from_upload: bool },
+    Placed {
+        dst: usize,
+        src: usize,
+        len: usize,
+        from_upload: bool,
+    },
     /// It writes title memory `[from, to)`, or declares a shader write there.
     Writes(usize, usize),
     /// It may write anywhere.
@@ -94,7 +99,11 @@ pub(crate) enum Seen {
 /// module: the last step that writes any of them is a copy at its place that
 /// holds all of them, copies out of upload memory, is not onto itself, and
 /// nothing after it writes its source.
-pub(crate) fn forwarded(steps: impl Iterator<Item = Seen>, src: usize, len: usize) -> Option<usize> {
+pub(crate) fn forwarded(
+    steps: impl Iterator<Item = Seen>,
+    src: usize,
+    len: usize,
+) -> Option<usize> {
     let to = src.checked_add(len)?;
     if len == 0 {
         return None;
@@ -104,7 +113,12 @@ pub(crate) fn forwarded(steps: impl Iterator<Item = Seen>, src: usize, len: usiz
     let mut later: Vec<(usize, usize)> = Vec::new();
     for step in steps {
         let (from, until) = match step {
-            Seen::Placed { dst, src: from, len: n, from_upload } => {
+            Seen::Placed {
+                dst,
+                src: from,
+                len: n,
+                from_upload,
+            } => {
                 if meet(dst, dst + n, src, to) {
                     let holds = dst <= src && to <= dst + n;
                     let moved = later.iter().any(|&(a, b)| meet(a, b, from, from + n));
@@ -128,7 +142,10 @@ pub(crate) fn forwarded(steps: impl Iterator<Item = Seen>, src: usize, len: usiz
 /// The port's line of the frame lines, per frame: printed with the switch on
 /// or with something counted.
 pub(crate) fn line(frames: f64) {
-    let n: Vec<f64> = COUNTS.iter().map(|c| c.swap(0, Relaxed) as f64 / frames).collect();
+    let n: Vec<f64> = COUNTS
+        .iter()
+        .map(|c| c.swap(0, Relaxed) as f64 / frames)
+        .collect();
     if on() || n.iter().any(|&v| v > 0.0) {
         tracing::info!(
             "renderer port RT (VICTORY_PORT_RT={}) per frame: submissions with a copy at its place over what the card brings: \
@@ -153,7 +170,12 @@ mod tests {
     use super::{Seen, forwarded};
 
     fn placed(dst: usize, src: usize, len: usize) -> Seen {
-        Seen::Placed { dst, src, len, from_upload: true }
+        Seen::Placed {
+            dst,
+            src,
+            len,
+            from_upload: true,
+        }
     }
 
     /// Last first, as a list's steps are walked.
@@ -164,11 +186,22 @@ mod tests {
     #[test]
     fn a_fill_behind_a_copy_that_holds_it_reads_the_copys_source() {
         // The case of the runs: 0xb0 bytes copied, then read as constants.
-        assert_eq!(walk(&[placed(0x1000, 0x8000, 0xb0)], 0x1000, 0xb0), Some(0x8000));
+        assert_eq!(
+            walk(&[placed(0x1000, 0x8000, 0xb0)], 0x1000, 0xb0),
+            Some(0x8000)
+        );
         // Part of it, at its offset.
-        assert_eq!(walk(&[placed(0x1000, 0x8000, 0x100)], 0x1040, 0x20), Some(0x8040));
+        assert_eq!(
+            walk(&[placed(0x1000, 0x8000, 0x100)], 0x1040, 0x20),
+            Some(0x8040)
+        );
         // Steps that touch neither range between them change nothing.
-        let between = [placed(0x1000, 0x8000, 0xb0), Seen::Nothing, Seen::Writes(0x9000, 0x9100), placed(0x3000, 0x4000, 16)];
+        let between = [
+            placed(0x1000, 0x8000, 0xb0),
+            Seen::Nothing,
+            Seen::Writes(0x9000, 0x9100),
+            placed(0x3000, 0x4000, 16),
+        ];
         assert_eq!(walk(&between, 0x1000, 0xb0), Some(0x8000));
     }
 
@@ -180,18 +213,52 @@ mod tests {
         assert_eq!(walk(&[], 0x1000, 0xb0), None);
         assert_eq!(walk(&[placed(0x2000, 0x8000, 0xb0)], 0x1000, 0xb0), None);
         // The card copies a host copy shaders write, not what the CPU took.
-        assert_eq!(walk(&[Seen::Placed { dst: 0x1000, src: 0x8000, len: 0xb0, from_upload: false }], 0x1000, 0xb0), None);
+        assert_eq!(
+            walk(
+                &[Seen::Placed {
+                    dst: 0x1000,
+                    src: 0x8000,
+                    len: 0xb0,
+                    from_upload: false
+                }],
+                0x1000,
+                0xb0
+            ),
+            None
+        );
         // Onto itself.
         assert_eq!(walk(&[placed(0x1000, 0x1040, 0x100)], 0x1000, 0x40), None);
         // A later write of the destination (a CPU copy, a shader), of the
         // source, or a step of ours.
-        for after in [Seen::Writes(0x10a0, 0x10b0), Seen::Writes(0x8010, 0x8020), Seen::Anything] {
-            assert_eq!(walk(&[placed(0x1000, 0x8000, 0xb0), after], 0x1000, 0xb0), None, "{after:?}");
+        for after in [
+            Seen::Writes(0x10a0, 0x10b0),
+            Seen::Writes(0x8010, 0x8020),
+            Seen::Anything,
+        ] {
+            assert_eq!(
+                walk(&[placed(0x1000, 0x8000, 0xb0), after], 0x1000, 0xb0),
+                None,
+                "{after:?}"
+            );
         }
         // The last writer is another copy that holds only part of it.
-        assert_eq!(walk(&[placed(0x1000, 0x8000, 0xb0), placed(0x1000, 0x9000, 0x10)], 0x1000, 0xb0), None);
+        assert_eq!(
+            walk(
+                &[placed(0x1000, 0x8000, 0xb0), placed(0x1000, 0x9000, 0x10)],
+                0x1000,
+                0xb0
+            ),
+            None
+        );
         // The last writer is the copy that holds it: the one before is behind.
-        assert_eq!(walk(&[placed(0x1000, 0x9000, 0x10), placed(0x1000, 0x8000, 0xb0)], 0x1000, 0xb0), Some(0x8000));
+        assert_eq!(
+            walk(
+                &[placed(0x1000, 0x9000, 0x10), placed(0x1000, 0x8000, 0xb0)],
+                0x1000,
+                0xb0
+            ),
+            Some(0x8000)
+        );
         // Empty, or past the end of the address space.
         assert_eq!(walk(&[placed(0x1000, 0x8000, 0xb0)], 0x1000, 0), None);
         assert_eq!(walk(&[placed(0x1000, 0x8000, 0xb0)], usize::MAX, 2), None);

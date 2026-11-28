@@ -89,7 +89,9 @@ fn with<R>(f: impl FnOnce(&mut Meter) -> R) -> R {
 
 /// A checksum that shows a change of content (FNV-1a, 64 bits).
 fn sum(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Title memory read through the kernel: `None` if a page is not there.
@@ -174,7 +176,9 @@ pub fn ring_read(ring: u64, record: u64, ok: bool) {
         match (read_u64(record), read_u64(record + 0x18)) {
             (Some(cpu), Some(bytes)) => {
                 let bytes = (bytes & 0xffff_ffff) as usize;
-                (cpu != 0 && bytes != 0).then(|| read(cpu, bytes.min(LOOK_MOST))).flatten()
+                (cpu != 0 && bytes != 0)
+                    .then(|| read(cpu, bytes.min(LOOK_MOST)))
+                    .flatten()
             }
             _ => None,
         }
@@ -183,7 +187,10 @@ pub fn ring_read(ring: u64, record: u64, ok: bool) {
     };
     let looked = held.as_ref().map(|v| (sum(v), v.iter().all(|&b| b == 0)));
     with(|m| {
-        let r = m.rings.entry(ring).or_insert(Ring { site: 0, last: None });
+        let r = m.rings.entry(ring).or_insert(Ring {
+            site: 0,
+            last: None,
+        });
         let before = r.last;
         if let Some((s, _)) = looked {
             r.last = Some(s);

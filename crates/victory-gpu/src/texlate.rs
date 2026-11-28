@@ -32,7 +32,22 @@ pub(crate) enum Kind {
 
 const KINDS: usize = 6;
 /// Upper bounds of the buckets, in ms (the last is open).
-const BOUNDS: [u64; 14] = [16, 33, 66, 100, 166, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, u64::MAX];
+const BOUNDS: [u64; 14] = [
+    16,
+    33,
+    66,
+    100,
+    166,
+    250,
+    500,
+    1000,
+    2000,
+    4000,
+    8000,
+    16000,
+    32000,
+    u64::MAX,
+];
 
 static COUNTS: [[AtomicU64; BOUNDS.len()]; KINDS] =
     [const { [const { AtomicU64::new(0) }; BOUNDS.len()] }; KINDS];
@@ -44,14 +59,18 @@ pub(crate) fn note(kind: Kind, since: u64) {
         return;
     }
     let ms = crate::host::now_ms().saturating_sub(since);
-    let bucket = BOUNDS.iter().position(|&b| ms < b).unwrap_or(BOUNDS.len() - 1);
+    let bucket = BOUNDS
+        .iter()
+        .position(|&b| ms < b)
+        .unwrap_or(BOUNDS.len() - 1);
     COUNTS[kind as usize][bucket].fetch_add(1, Relaxed);
     SUMS[kind as usize].fetch_add(ms, Relaxed);
 }
 
 /// Textures viewed from a level other than 0 so far: since when, and from
 /// which level.
-static PARTLY: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+static PARTLY: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> =
+    std::sync::Mutex::new(None);
 
 /// A view of placed texture `texture` from level `first` is made.
 pub(crate) fn viewed(texture: usize, first: u32) {
@@ -69,7 +88,11 @@ pub(crate) fn viewed(texture: usize, first: u32) {
 /// Texture `texture`'s larger levels were copied from the store (the list
 /// that did it has been sent): shown whole from now on.
 pub(crate) fn whole(texture: usize) {
-    let since = PARTLY.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|p| p.remove(&texture));
+    let since = PARTLY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|p| p.remove(&texture));
     if let Some(since) = since {
         note(Kind::Full, since);
     }

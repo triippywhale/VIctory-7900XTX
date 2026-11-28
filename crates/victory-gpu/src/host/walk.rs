@@ -47,22 +47,40 @@ unsafe impl Send for Buffers {}
 // SAFETY: as above.
 unsafe impl Sync for Buffers {}
 
-fn buffer(device: &ID3D12Device, heap: D3D12_HEAP_TYPE, uav: bool, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
-    let props = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+fn buffer(
+    device: &ID3D12Device,
+    heap: D3D12_HEAP_TYPE,
+    uav: bool,
+    state: D3D12_RESOURCE_STATES,
+) -> Option<ID3D12Resource> {
+    let props = D3D12_HEAP_PROPERTIES {
+        Type: heap,
+        ..Default::default()
+    };
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: BYTES,
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        Flags: if uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+        Flags: if uav {
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_FLAG_NONE
+        },
         ..Default::default()
     };
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: plain creation; committed buffers start zeroed.
-    unsafe { device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made) }.ok()?;
+    unsafe {
+        device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)
+    }
+    .ok()?;
     made
 }
 
@@ -97,10 +115,19 @@ pub(crate) type Taken = Mutex<Vec<(Arc<str>, ID3D12Resource)>>;
 pub(crate) fn after(taken: &Taken, list: &ID3D12GraphicsCommandList, name: &str) {
     let name: Arc<str> = Arc::from(name);
     let Some(b) = buffers() else { return };
-    let back = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop().or_else(|| {
-        let device = &super::host()?.device;
-        buffer(device, D3D12_HEAP_TYPE_READBACK, false, D3D12_RESOURCE_STATE_COPY_DEST)
-    });
+    let back = SPARE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop()
+        .or_else(|| {
+            let device = &super::host()?.device;
+            buffer(
+                device,
+                D3D12_HEAP_TYPE_READBACK,
+                false,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )
+        });
     let Some(back) = back else { return };
     let transition = |before, after| D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -117,13 +144,25 @@ pub(crate) fn after(taken: &Taken, list: &ID3D12GraphicsCommandList, name: &str)
     };
     // SAFETY: an open list; our buffers, in the states named.
     unsafe {
-        list.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        list.ResourceBarrier(&[transition(
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
         list.CopyResource(&back, &b.counts);
-        list.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.ResourceBarrier(&[transition(
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
         list.CopyResource(&b.counts, &b.zeros);
-        list.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        list.ResourceBarrier(&[transition(
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
     }
-    taken.lock().unwrap_or_else(|e| e.into_inner()).push((name, back));
+    taken
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name, back));
 }
 
 /// Per program since the last line: dispatches, threads that tested a node,
@@ -199,9 +238,13 @@ pub(crate) fn reset(taken: &Taken) {
         // SAFETY: a read-back buffer the finished list copied into.
         if unsafe { back.Map(0, None, Some(&mut data)) }.is_ok() {
             // SAFETY: the mapping holds 2 * WALK_SLOTS dwords.
-            let counts = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 2 * WALK_SLOTS as usize) };
+            let counts =
+                unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 2 * WALK_SLOTS as usize) };
             let mut sums = SUMS.lock().unwrap_or_else(|e| e.into_inner());
-            let s = sums.get_or_insert_with(HashMap::new).entry(name).or_default();
+            let s = sums
+                .get_or_insert_with(HashMap::new)
+                .entry(name)
+                .or_default();
             s.add(counts);
             // SAFETY: mapped above.
             unsafe { back.Unmap(0, None) };
@@ -215,7 +258,9 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let Some(sums) = SUMS.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some(sums) = SUMS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
     let frames = frames.max(1.0);
     let mut sums: Vec<_> = sums.into_iter().collect();
     sums.sort_by_key(|(_, s)| std::cmp::Reverse(s.boxes + s.triangles));
@@ -284,8 +329,14 @@ mod tests {
         counts[detail + 9] = 3;
         let mut s = Sums::default();
         s.add(&counts);
-        assert_eq!((s.dispatches, s.threads, s.boxes, s.triangles), (1, 2, 4100, 2));
+        assert_eq!(
+            (s.dispatches, s.threads, s.boxes, s.triangles),
+            (1, 2, 4100, 2)
+        );
         assert_eq!((s.entered, s.lost, s.lost_threads), (8015, 4, 1));
-        assert_eq!((s.cut, s.cut_lost, s.cut_entered, s.cut_boxes), (1, 1, 8000, 4090));
+        assert_eq!(
+            (s.cut, s.cut_lost, s.cut_entered, s.cut_boxes),
+            (1, 1, 8000, 4090)
+        );
     }
 }
