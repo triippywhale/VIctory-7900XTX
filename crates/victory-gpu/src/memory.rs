@@ -356,8 +356,9 @@ struct Stats {
     mirrored: u64,
     /// Arrays of geometry records builder dispatches were given; pages that
     /// came for what they point to when the dispatch was recorded, and at
-    /// its submission ([`Memory::land_geometry`]).
-    geometry: [u64; 3],
+    /// its submission ([`Memory::land_geometry`]); ranges in title buffers
+    /// whose copies were brought up to date.
+    geometry: [u64; 4],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -1349,7 +1350,7 @@ impl Memory {
              {} gone with the title's memory, {} named by a list since; per frame {:.1} not the title's ({:.1} of them below 4 GiB), \
              {:.1} over the frame's limit, {:.1} without room, {:.1} left by the builder; \
              pages wanted above 4 GiB: {} since the last line, {} in all; geometry records given to the builder {} times, \
-             pages for what they point to {} when recorded and {} at submission",
+             pages for what they point to {} when recorded and {} at submission, ranges in buffers brought up to date {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -1397,7 +1398,8 @@ impl Memory {
             wanted[0],
             s.geometry[0],
             s.geometry[1],
-            s.geometry[2]
+            s.geometry[2],
+            s.geometry[3]
         );
         // Where the copies shaders walk lie: a read of the PC's memory
         // crosses the bus.
@@ -1866,6 +1868,17 @@ pub(crate) fn ready(
                 let before = held(m);
                 for &(start, len) in &ranges {
                     m.ready(start, len);
+                    // In a title buffer the directory points at the buffer's
+                    // copy, which is brought up to date only by a draw or
+                    // view that names it: streamed-in geometry is unpacked
+                    // before anything draws with it (as a draw's vertex
+                    // buffers are brought up to date).
+                    if crate::shadow::in_buffer(start, len).is_some()
+                        && let Some(shadow) = crate::shadow::find(start, len)
+                    {
+                        shadow.refresh(list, start, len);
+                        m.stats.geometry[3] += 1;
+                    }
                 }
                 m.stats.geometry[1] += held(m).saturating_sub(before);
                 list.defer_host(move || {

@@ -144,8 +144,14 @@ dispatches, faults and what came.
   views that read as geometry records have what they point to made ready when
   it is recorded, and pages still without a copy, or that came lately, are
   taken again at its submission. The 10 s memory line counts it ("geometry
-  records given to the builder"). Whether that mends the picture is to be seen
-  in a run.
+  records given to the builder"). Run rtcheck3 (10 min, b1ebafd): structure
+  nodes reached twice in the dump fell from 78,009 to 3,197 and the builder
+  found pages without a copy only in the first 2.5 minutes; no page was still
+  without one at submission. What is left may be geometry in title buffers:
+  the directory points at the buffer's copy, which only a draw or view that
+  names it brings up to date, and streamed-in geometry is unpacked before
+  anything draws with it. Those ranges' copies are now brought up to date too
+  (counted as "ranges in buffers brought up to date").
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
