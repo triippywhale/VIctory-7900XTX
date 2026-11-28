@@ -803,7 +803,48 @@ fn bury(finished: u64) {
             }
             retired.drain(..n).collect()
         };
-        drop(done);
+        if bury_aside() {
+            bury_on_a_thread(done);
+        } else {
+            drop(done);
+        }
+    }
+}
+
+/// Whether what [`bury`] lets go of is dropped by a thread of its own
+/// (`VICTORY_BURY_ASIDE=0`: by the caller, as before).
+///
+/// The caller is the thread that lands flights, between telling the title
+/// and taking the flights off the line: run wg1 had 13.4 ms a frame there
+/// (the landing's "rest", 0.1 ms for the read-backs and the telling
+/// themselves), with the submitting thread waiting 28 ms a frame for the
+/// line and the card idle 6.5 ms a frame behind it. The objects are named by
+/// nothing by then ([`bury_lag`]); the host's objects may be released on any
+/// thread.
+fn bury_aside() -> bool {
+    crate::toggled!("VICTORY_BURY_ASIDE")
+}
+
+/// [`bury_aside`]: `done` is dropped on the thread kept for it, here if
+/// there is none.
+fn bury_on_a_thread(done: Vec<(u64, Retired)>) {
+    static TO: OnceLock<Option<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>> = OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                while let Ok(done) = from.recv() {
+                    let _dropping = crate::timeline::span("helper: objects let go of dropped");
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| to)
+    });
+    if let Some(to) = to {
+        // (A send that fails gives the objects back, and they drop here.)
+        let _ = to.send(done);
     }
 }
 
