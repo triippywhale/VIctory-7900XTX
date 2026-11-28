@@ -5090,6 +5090,14 @@ impl Host {
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
+        // (`crate::left`, `VICTORY_SKIP_WC_BACK=3`) The copies on the card
+        // asked for since the last submission, of what shaders wrote and
+        // was left there to the copies of the same pages at other
+        // addresses: their holders' CPU sides are brought in line now,
+        // before the sends are taken (what the title stored since goes up
+        // with them, behind the copies), and with no lock of the queue's
+        // order held (a fetch under way is waited for).
+        let forwards = crate::left::forward_step();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5103,11 +5111,24 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && forwards.is_empty() {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        // A holder with hashes of its pieces has those of the pieces given
+        // it hashed again, with what is sent up: the bytes are another
+        // copy's shaders', and its own compare is not to take them for its
+        // own shaders'.
+        let mut given: Vec<(usize, (usize, usize))> = Vec::new();
+        for forward in &forwards {
+            if forward.to.card_sides().is_some_and(|(_, before, _)| before.is_some()) {
+                given.push((Arc::as_ptr(&forward.to) as usize, (forward.at, forward.at + forward.bytes)));
+                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, &forward.to)) {
+                    dirty.push((forward.to.clone(), Vec::new()));
+                }
+            }
+        }
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -5130,6 +5151,64 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        if !forwards.is_empty() {
+            // In a list of their own, run ahead of the sends: what the
+            // title stored since the shaders wrote goes up behind them, to
+            // writer and holder alike. On the queue that draws, in the
+            // order of everything else: behind every flight sent so far
+            // (whose shaders wrote the bytes, or may still), ahead of this
+            // submission's lists. Nothing waits for it.
+            let Some(copies) = work.sync.pop().or_else(|| self.make_prelude()) else {
+                fail(format_args!("no host list for the copies on the card to other addresses (VICTORY_SKIP_WC_BACK=3)"));
+            };
+            let (allocator, list) = &copies;
+            // SAFETY: the list's last run finished (it ran ahead of a
+            // submission that was waited for, and came back after that);
+            // live buffers (held by `forwards`, which the plan keeps), and
+            // the ranges lie in them (`Shadow::forwarded_from`).
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    // A buffer comes to a list in the common state and
+                    // takes the first state asked of it by itself; another
+                    // one after that is asked for (a copy that is one
+                    // piece's writer and another's holder). All of them
+                    // are common again when the list has run.
+                    let mut states: Vec<(*mut std::ffi::c_void, D3D12_RESOURCE_STATES)> = Vec::new();
+                    for forward in &forwards {
+                        for (buffer, state) in [
+                            (&forward.from.buffer, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                            (&forward.to.buffer, D3D12_RESOURCE_STATE_COPY_DEST),
+                        ] {
+                            let raw = buffer.as_raw();
+                            match states.iter_mut().find(|s| s.0 == raw) {
+                                Some(known) if known.1 != state => {
+                                    list.ResourceBarrier(&[transition(buffer, known.1, state)]);
+                                    known.1 = state;
+                                }
+                                Some(_) => {}
+                                None => states.push((raw, state)),
+                            }
+                        }
+                        list.CopyBufferRegion(
+                            &forward.to.buffer,
+                            forward.at as u64,
+                            &forward.from.buffer,
+                            forward.lo as u64,
+                            forward.bytes as u64,
+                        );
+                    }
+                    list.Close()?;
+                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("the copies on the card to other addresses could not be sent ({e}, VICTORY_SKIP_WC_BACK=3)"));
+            }
+            used.push((false, copies));
+        }
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -5231,7 +5310,9 @@ impl Host {
                             // (In order: the next of the same piece, of the
                             // tens of thousands there are, says nothing.)
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            // (And the pieces a copy on the card just gave it.)
+                            let given = given.iter().filter(|g| g.0 == Arc::as_ptr(shadow) as usize).map(|g| g.1);
+                            for run in ranges.iter().copied().chain(given).map(|(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
                                     Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
                                     _ => runs.push(run),
@@ -5261,7 +5342,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty.into_iter().map(|(shadow, _)| shadow).chain(forwards.into_iter().flat_map(|f| [f.from, f.to])).collect(),
             lists: used,
             sent_as,
             looks,

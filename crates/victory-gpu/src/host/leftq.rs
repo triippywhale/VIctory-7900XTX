@@ -1,7 +1,7 @@
 //! The fetch of pieces left on the card that something is about to read
 //! (`crate::left::before_take`; after PalmVI 06edf544f, `left.rs` there).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -9,7 +9,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 use super::{Host, QUEUE_ORDER, fail};
-use crate::shadow::Shadow;
+use crate::left::Piece;
 
 /// A list, fence and event of this module's own, a copy queue, and the
 /// memory the pieces come down to.
@@ -66,9 +66,10 @@ fn waited(w: &Waited) -> String {
     )
 }
 
-/// What the card wrote in `pieces` (copy, offsets) and was left there is
-/// fetched now and merged into title memory as copy-back merges
-/// (`Shadow::fetched_left`). On a copy queue of its own, which does not
+/// What the card wrote in `pieces` (copy, offsets, and the title address the
+/// copy's first byte is merged at) and was left there is fetched now and
+/// merged into title memory as copy-back merges (`Shadow::fetched_left`).
+/// On a copy queue of its own, which does not
 /// wait for the card's other work (the flights that wrote these pieces
 /// have landed), unless bytes the title changed went up to one of the
 /// copies and may not be there yet: then on the host's queue, behind every
@@ -87,7 +88,7 @@ fn waited(w: &Waited) -> String {
 ///
 /// The wait for the card is never without end and without a word: every
 /// `crate::left::STEP` of it is said in the log ([`waited`]).
-pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
+pub(crate) fn fetch(host: &Host, pieces: &[Piece]) {
     if pieces.is_empty() {
         return;
     }
@@ -142,7 +143,7 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
             "no copy queue to fetch pieces left on the card (VICTORY_SKIP_WC_BACK)"
         ));
     };
-    let total: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
+    let total: u64 = pieces.iter().map(|p| (p.hi - p.lo) as u64).sum();
     if r.buffer.as_ref().is_none_or(|b| b.2 < total) {
         let size = total.next_multiple_of(1 << 20);
         r.buffer = host
@@ -157,7 +158,7 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
     let ordered = !crate::shadow::relay()
         || pieces
             .iter()
-            .any(|(shadow, lo, hi)| shadow.sends_noted(*lo, *hi));
+            .any(|piece| piece.copy.sends_noted(piece.lo, piece.hi));
     r.sent += 1;
     let (fence, event, sent) = (r.fence.clone(), r.event, r.sent);
     let (allocator, list) = match ordered {
@@ -171,9 +172,10 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
             allocator.Reset()?;
             list.Reset(&allocator, None)?;
             let mut at = 0u64;
-            for (shadow, lo, hi) in pieces {
-                list.CopyBufferRegion(&buffer, at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
-                at += (*hi - *lo) as u64;
+            for piece in pieces {
+                let bytes = (piece.hi - piece.lo) as u64;
+                list.CopyBufferRegion(&buffer, at, &piece.copy.buffer, piece.lo as u64, bytes);
+                at += bytes;
             }
             list.Close()?;
             let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -243,12 +245,15 @@ pub(crate) fn fetch(host: &Host, pieces: &[(Arc<Shadow>, usize, usize)]) {
     };
     let mut title = Vec::new();
     let mut at = 0usize;
-    for (shadow, lo, hi) in pieces {
+    for piece in pieces {
+        let bytes = piece.hi - piece.lo;
         // SAFETY: the mapping of the fetched bytes, `total` of them; the
         // copy into it has run, and the next waits for this lock.
-        let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, hi - lo) };
-        shadow.fetched_left(*lo, gpu, after, &mut title);
-        at += hi - lo;
+        let gpu = unsafe { std::slice::from_raw_parts((data + at) as *const u8, bytes) };
+        piece
+            .copy
+            .fetched_left(piece.base, piece.lo, gpu, after, &mut title);
+        at += bytes;
     }
 }
 

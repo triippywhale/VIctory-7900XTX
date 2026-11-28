@@ -1123,6 +1123,41 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     differs != 0
 }
 
+/// (`Shadow::forwarded_from`) `held` is the CPU side of a copy that is about
+/// to be given, on the card, the bytes of another copy of the same title
+/// memory; `reference` is that other copy's CPU side: the title bytes the
+/// card's bytes were written over. `held` becomes the reference, but for
+/// the dwords the title holds otherwise by now (`title(offset, into)` reads
+/// title memory there; false: not readable): those the title stored after
+/// the reference was taken, so `held` takes the title's, and they are
+/// returned, as (offset, bytes) in order, to go up behind the copy on the
+/// card. Title memory is read only where the two sides differ: where they
+/// are alike nothing is known that the reference does not hold.
+///
+/// So after the copy on the card and the sends of what is returned, the
+/// card's side is to `held` what the other copy's card side is to its CPU
+/// side, and a later refresh, which sends where title memory differs from
+/// `held`, sends what the title stored since and nothing older.
+fn forward_sync(at: usize, reference: &[u8], held: &mut [u8], mut title: impl FnMut(usize, &mut [u8]) -> bool) -> Vec<(usize, usize)> {
+    let mut again = Vec::new();
+    let mut now = Vec::new();
+    for (from, n) in dword_runs(at, reference, held, 0) {
+        let was = &reference[from..from + n];
+        now.clear();
+        now.resize(n, 0);
+        let readable = title(from, &mut now);
+        held[from..from + n].copy_from_slice(was);
+        if !readable {
+            continue;
+        }
+        for (a, len) in dword_runs(at + from, was, &now, 0) {
+            held[from + a..from + a + len].copy_from_slice(&now[a..a + len]);
+            again.push((from + a, len));
+        }
+    }
+    again
+}
+
 /// `[from, to)` without the ranges of `skip`, in order.
 fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
@@ -3628,6 +3663,25 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // (`crate::left`, `VICTORY_SKIP_WC_BACK=3`) Where this copy holds
+        // bytes another copy's shaders wrote, given it on the card, that
+        // piece is fetched into title memory first, and the copy takes it
+        // from there: from here on its own shaders write these bytes, and
+        // two copies' writes of one piece are put in order in title memory
+        // only. Held until the range is noted, so that no piece is given
+        // to the copy in between.
+        let _declaring = if self.card.is_some() && crate::left::forwards() {
+            loop {
+                match crate::left::declaring(self.id, address, address + len) {
+                    Ok(held) => break Some(held),
+                    Err(crate::left::Fetched) => {
+                        self.update(address, len);
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -5110,7 +5164,14 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
-        let start = self.start as usize;
+        self.card_merge_relay_at(self.start as usize, at, gpu, fetched_after, title)
+    }
+
+    /// [`Shadow::card_merge_relay`] with the title address of the copy's
+    /// first byte given: the copy's own, or, for a piece left on the card
+    /// whose address the title has let go of while it still shows the pages
+    /// elsewhere (`crate::left`, a stranded piece), that other address.
+    fn card_merge_relay_at(&self, start: usize, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let Some(card) = &self.card else {
             return 0;
         };
@@ -5159,9 +5220,73 @@ impl Shadow {
     /// with this copy's landings and title bytes put in under shader
     /// writes kept out meanwhile (they write the CPU side too). The caller
     /// keeps out this copy's refreshes there (`crate::left`'s gate).
-    pub(crate) fn fetched_left(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+    ///
+    /// `base` is the title address the copy's first byte is merged at: the
+    /// copy's own start, but for a stranded piece (`crate::left`).
+    pub(crate) fn fetched_left(&self, base: u64, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-        self.card_merge_relay(at, gpu, fetched_after, title)
+        self.card_merge_relay_at(base as usize, at, gpu, fetched_after, title)
+    }
+
+    /// Whether this copy and `other` are in one host buffer.
+    pub(crate) fn same_buffer(&self, other: &Shadow) -> bool {
+        windows::core::Interface::as_raw(&self.buffer) == windows::core::Interface::as_raw(&other.buffer)
+    }
+
+    /// (`crate::left`, `VICTORY_SKIP_WC_BACK=3`) The card is about to copy
+    /// what it holds at offsets `[lo, lo + n)` of `from`'s card side to
+    /// offsets `[at, at + n)` of this copy's: the same title bytes, shown at
+    /// another address. This copy's CPU side there becomes what `from`'s is,
+    /// the reference the card's bytes are newer than, so that this copy's
+    /// refreshes send up exactly what `from`'s would: the dwords the title
+    /// stored after `from` last took them.
+    ///
+    /// What the copy on the card does not bring is noted to go up behind
+    /// it ([`forward_sync`]): title bytes this copy took and `from` did not
+    /// yet, and those `from` took and has not sent. What this copy had still
+    /// to send there is dropped: it is older than the reference, or among
+    /// the former.
+    ///
+    /// Under both CPU sides' locks, `from`'s first (a landing or a fetch
+    /// merges into a CPU side under its own). The caller keeps refreshes of
+    /// both copies out (it is the submitting thread, between a submission's
+    /// refreshes and its sends) and holds `crate::left`'s gate. Returns the
+    /// bytes noted to go up behind the copy because the title stored them
+    /// since; `None` if the offsets are not in the copies: nothing was done.
+    pub(crate) fn forwarded_from(&self, from: &Shadow, lo: usize, at: usize, n: usize) -> Option<u64> {
+        let (Some(card), Some(theirs)) = (&self.card, &from.card) else {
+            return None;
+        };
+        if n == 0 || lo + n > from.len as usize || at + n > self.len as usize || std::ptr::eq(self, from) {
+            return None;
+        }
+        let _theirs = from.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _mine = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let unsent: Vec<(usize, usize)> = theirs
+            .dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, b)| a < lo + n && b > lo)
+            .map(|&(a, b)| (a.max(lo) - lo + at, b.min(lo + n) - lo + at))
+            .collect();
+        // SAFETY: inside the two mappings (checked above), which are not
+        // the same copy's; what else writes either CPU side there is kept
+        // out by the locks held and by the caller.
+        let (reference, held) =
+            unsafe { (std::slice::from_raw_parts(from.data.add(lo).cast_const(), n), std::slice::from_raw_parts_mut(self.data.add(at), n)) };
+        let title_at = self.start as usize + at;
+        let again = forward_sync(title_at, reference, held, |offset, into| crate::host::read_into((title_at + offset) as *const u8, into));
+        self.changed(at, at + n);
+        {
+            let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let kept: Vec<(usize, usize)> =
+                dirty.drain(..).flat_map(|(a, b)| [(a, b.min(at)), (a.max(at + n), b)]).filter(|r| r.0 < r.1).collect();
+            *dirty = kept;
+        }
+        let stored = again.iter().map(|r| r.1 as u64).sum();
+        self.card_changed_runs(again.into_iter().map(|(a, len)| (at + a, at + a + len)).chain(unsent));
+        Some(stored)
     }
 
     /// Whether title bytes went up to the card's side in offsets `[lo, hi)`
@@ -5734,6 +5859,19 @@ pub(crate) fn holders(at: u64, end: u64, not: u64) -> Vec<Arc<Shadow>> {
     drop(loose);
     let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     out.extend(exact.1.range((at.saturating_sub(64 << 20), 0)..(end, 0)).filter(|(_, (s, _))| held(s)).map(|(_, (s, _))| s.clone()));
+    out
+}
+
+/// For the audit of [`holders`] (`crate::left`, `VICTORY_CENSUS=1`): every
+/// copy other than copy `not` that holds any of `[at, end)`, by its number,
+/// found by walking all of the tables (slow: diagnostics only).
+pub(crate) fn holders_all(at: u64, end: u64, not: u64) -> Vec<u64> {
+    let held = |s: &Arc<Shadow>| s.id != not && s.start < end && s.start + s.len > at;
+    let mut out: Vec<u64> = buffers_read().values().filter_map(|e| e.shadow.as_ref().filter(|s| held(s)).map(|s| s.id)).collect();
+    out.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().filter(|s| held(s)).map(|s| s.id));
+    out.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().filter(|(s, _)| held(s)).map(|(s, _)| s.id));
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -6627,5 +6765,289 @@ mod holding_tests {
         for i in 0..128usize {
             unregister(100 + i, base + (i as u64) * 0x1000);
         }
+    }
+}
+
+/// The order of what reaches a card copy that is given another copy's bytes
+/// on the card (`crate::left`, `VICTORY_SKIP_WC_BACK=3`), modelled without a
+/// device.
+#[cfg(test)]
+mod forward_tests {
+    use super::{Shadow, dword_runs, forward_sync};
+
+    /// A model of a copy in the card's memory: the card's side, the CPU's
+    /// side, and the offsets still to go up.
+    struct Side {
+        card: Vec<u8>,
+        cpu: Vec<u8>,
+        dirty: Vec<(usize, usize)>,
+    }
+
+    impl Side {
+        fn new(bytes: &[u8]) -> Side {
+            Side {
+                card: bytes.to_vec(),
+                cpu: bytes.to_vec(),
+                dirty: Vec::new(),
+            }
+        }
+
+        /// A refresh over a piece left on the card, as `Shadow::take`
+        /// makes it: the dwords where title memory differs from the CPU's
+        /// side are taken, and noted to go up.
+        fn refresh(&mut self, title: &[u8]) {
+            for (at, n) in dword_runs(0, &self.cpu, title, 0) {
+                self.cpu[at..at + n].copy_from_slice(&title[at..at + n]);
+                self.dirty.push((at, at + n));
+            }
+        }
+
+        /// The sends of a submission (`Host::card_before`).
+        fn send(&mut self) {
+            for (a, b) in self.dirty.drain(..) {
+                self.card[a..b].copy_from_slice(&self.cpu[a..b]);
+            }
+        }
+    }
+
+    /// Everything memory holds in the title's view: title memory, and
+    /// what the console's memory would hold, where shaders write the same
+    /// bytes.
+    struct World {
+        title: Vec<u8>,
+        truth: Vec<u8>,
+    }
+
+    impl World {
+        /// The title's CPU stores `value` at `[at, at + 4)`.
+        fn store(&mut self, at: usize, value: u8) {
+            self.title[at..at + 4].fill(value);
+            self.truth[at..at + 4].fill(value);
+        }
+
+        /// Shaders write `value` at `[from, to)` of `copy`'s card side, and
+        /// the piece is left there: title memory keeps what it had.
+        fn shade(&mut self, copy: &mut Side, from: usize, to: usize, value: u8) {
+            copy.card[from..to].fill(value);
+            self.truth[from..to].fill(value);
+        }
+    }
+
+    /// What the next submission does for a piece of `writer` left with
+    /// `holder`: the holder's CPU side is brought in line
+    /// (`Shadow::forwarded_from`), the copy on the card runs, and the
+    /// sends of both follow it.
+    fn forward(writer: &mut Side, holder: &mut Side, title: &[u8]) {
+        let again = forward_sync(0, &writer.cpu, &mut holder.cpu, |at, into| {
+            into.copy_from_slice(&title[at..at + into.len()]);
+            true
+        });
+        holder.dirty.clear();
+        holder.dirty.extend(again.iter().map(|&(at, n)| (at, at + n)));
+        holder.dirty.extend(writer.dirty.iter().copied());
+        holder.card.copy_from_slice(&writer.card);
+        writer.send();
+        holder.send();
+    }
+
+    const N: usize = 64;
+
+    fn start() -> (World, Side, Side) {
+        let bytes: Vec<u8> = (0..N as u32).map(|i| (i * 3 + 1) as u8 & 0x0f).collect();
+        (
+            World {
+                title: bytes.clone(),
+                truth: bytes.clone(),
+            },
+            Side::new(&bytes),
+            Side::new(&bytes),
+        )
+    }
+
+    /// (b) of the port: a store the title made before the shader's write,
+    /// which the holder had not seen, or had taken and not sent, does not
+    /// go up over the card's newer bytes after the copy on the card.
+    #[test]
+    fn a_store_older_than_the_shader_write_never_goes_up_behind_the_copy() {
+        for holder_took_it in [false, true] {
+            let (mut world, mut writer, mut holder) = start();
+            world.store(8, 0x11);
+            // The writer's submission takes the store and sends it; the
+            // holder is not refreshed, or takes it and does not send.
+            writer.refresh(&world.title);
+            writer.send();
+            if holder_took_it {
+                holder.refresh(&world.title);
+            }
+            world.shade(&mut writer, 4, 16, 0xa0);
+            // What the copy alone would do, with the holder's CPU side
+            // left as it is: its next refresh, or its pending send, puts
+            // the store over the shader's bytes.
+            {
+                let mut naive = Side {
+                    card: writer.card.clone(),
+                    cpu: holder.cpu.clone(),
+                    dirty: holder.dirty.clone(),
+                };
+                naive.refresh(&world.title);
+                naive.send();
+                assert_eq!(naive.card[8..12], [0x11; 4], "the hazard is no longer modelled");
+            }
+            forward(&mut writer, &mut holder, &world.title);
+            assert_eq!(holder.card, world.truth, "holder took it: {holder_took_it}");
+            // Refreshes later find nothing to send: title memory is the
+            // reference there.
+            holder.refresh(&world.title);
+            assert!(holder.dirty.is_empty(), "holder took it: {holder_took_it}");
+            holder.send();
+            writer.refresh(&world.title);
+            writer.send();
+            assert_eq!(holder.card, world.truth);
+            assert_eq!(writer.card, world.truth);
+            assert_eq!(holder.cpu, writer.cpu);
+        }
+    }
+
+    /// What the title stored after the shader's write is not lost to the
+    /// holder by the copy: bytes the holder had on its card side already
+    /// (the writer not yet) are there again when the submission's lists
+    /// run, and bytes the writer took and has not sent reach both.
+    #[test]
+    fn a_store_newer_than_the_shader_write_is_on_the_holder_behind_the_copy() {
+        let (mut world, mut writer, mut holder) = start();
+        world.shade(&mut writer, 4, 16, 0xa0);
+        // The holder took and sent this one; the writer has not seen it.
+        world.store(20, 0x22);
+        holder.refresh(&world.title);
+        holder.send();
+        // The writer took this one and has not sent it; the holder has
+        // not seen it.
+        world.store(28, 0x33);
+        writer.refresh(&world.title);
+        assert_eq!(writer.dirty, vec![(20, 24), (28, 32)]);
+        writer.dirty.retain(|r| r.0 == 28);
+        writer.cpu[20..24].copy_from_slice(&writer.card[20..24]);
+        // Neither has seen this one, over bytes the shader wrote.
+        world.store(4, 0x44);
+        forward(&mut writer, &mut holder, &world.title);
+        // With no refresh in between: what this submission's lists read.
+        assert_eq!(holder.card[20..24], [0x22; 4]);
+        assert_eq!(holder.card[28..32], [0x33; 4]);
+        assert_eq!(holder.card[4..16], writer.card[4..16]);
+        // And with the refreshes that see the rest, both are what the
+        // console's memory would be.
+        for side in [&mut writer, &mut holder] {
+            side.refresh(&world.title);
+            side.send();
+            assert_eq!(side.card, world.truth);
+        }
+    }
+
+    /// The writer's shaders write the piece again, the title stores in
+    /// between: every copy on the card leaves the holder with what the
+    /// writer has.
+    #[test]
+    fn a_piece_left_again_is_given_again() {
+        let (mut world, mut writer, mut holder) = start();
+        for round in 0..6u8 {
+            world.store(((round as usize) * 12) % 48, 0x50 + round);
+            if round % 2 == 0 {
+                writer.refresh(&world.title);
+                writer.send();
+            } else {
+                holder.refresh(&world.title);
+            }
+            world.shade(&mut writer, 8 + round as usize * 4, 24 + round as usize * 4, 0xa0 + round);
+            world.store(40, 0x70 + round);
+            if round % 3 == 0 {
+                holder.refresh(&world.title);
+                holder.send();
+            }
+            forward(&mut writer, &mut holder, &world.title);
+            let mut after = Side {
+                card: holder.card.clone(),
+                cpu: holder.cpu.clone(),
+                dirty: Vec::new(),
+            };
+            after.refresh(&world.title);
+            after.send();
+            let mut reference = Side {
+                card: writer.card.clone(),
+                cpu: writer.cpu.clone(),
+                dirty: Vec::new(),
+            };
+            reference.refresh(&world.title);
+            reference.send();
+            assert_eq!(after.card, reference.card, "round {round}");
+        }
+    }
+
+    /// Title memory that cannot be read: the holder's CPU side is the
+    /// reference whole, and nothing is sent behind the copy.
+    #[test]
+    fn the_reference_is_taken_whole_where_title_memory_is_not_there() {
+        let reference: Vec<u8> = (0..N as u8).collect();
+        let mut held = vec![0u8; N];
+        let again = forward_sync(0x1000, &reference, &mut held, |_, _| false);
+        assert!(again.is_empty());
+        assert_eq!(held, reference);
+        // Alike already: title memory is not read at all.
+        let again = forward_sync(0x1000, &reference, &mut held, |_, _| panic!("read where the sides are alike"));
+        assert!(again.is_empty());
+    }
+
+    /// `Shadow::forwarded_from` on two copies: the holder's CPU side, and
+    /// what it has to send, over the piece and beside it.
+    #[test]
+    fn the_holder_sends_what_the_copy_on_the_card_does_not_bring() {
+        const LEN: usize = 4096;
+        const PIECE: usize = 2048;
+        // (Title memory on a dword's boundary, as the title's is.)
+        let mut words = vec![0u32; LEN / 4];
+        // SAFETY: the words' own bytes, for as long as they live.
+        let title = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), LEN) };
+        for (i, byte) in title.iter_mut().enumerate() {
+            *byte = (i * 7 + i / 251) as u8 & 0x7f;
+        }
+        let mut theirs = title.to_vec();
+        let mut mine = title.to_vec();
+        // A store the writer took and the holder did not; one the holder
+        // took and the writer did not (title memory holds both).
+        title[64..68].fill(0xe1);
+        theirs[64..68].fill(0xe1);
+        title[128..132].fill(0xe2);
+        mine[128..132].fill(0xe2);
+        let writer = Shadow::unbacked(0x7000_0000, theirs.as_mut_ptr(), LEN as u64, true);
+        let holder = Shadow::unbacked(title.as_ptr() as u64, mine.as_mut_ptr(), LEN as u64, true);
+        // What the holder had still to send: in the piece, across its end,
+        // beside it.
+        holder.card_changed(60, 70);
+        holder.card_changed(120, 136);
+        holder.card_changed(2040, 2060);
+        holder.card_changed(3000, 3100);
+        // What the writer has still to send.
+        writer.card_changed(500, 520);
+        writer.card_changed(2040, 2100);
+        assert_eq!(holder.forwarded_from(&writer, 0, 0, PIECE), Some(4));
+        let mut expected = theirs[..PIECE].to_vec();
+        expected[128..132].fill(0xe2);
+        assert_eq!(&mine[..PIECE], &expected[..]);
+        assert_eq!(&mine[PIECE..], &title[PIECE..]);
+        let mut dirty = holder.take_dirty();
+        dirty.sort_unstable();
+        assert_eq!(dirty, vec![(128, 132), (500, 520), (2040, 2048), (2048, 2060), (3000, 3100)]);
+        // The writer's notes are its own still.
+        let mut dirty = writer.take_dirty();
+        dirty.sort_unstable();
+        assert_eq!(dirty, vec![(500, 520), (2040, 2100)]);
+        // Offsets outside either copy, or a copy in the PC's memory:
+        // nothing is done.
+        assert_eq!(holder.forwarded_from(&writer, LEN - 16, 0, 32), None);
+        assert_eq!(holder.forwarded_from(&writer, 0, LEN - 16, 32), None);
+        assert_eq!(holder.forwarded_from(&writer, 0, 0, 0), None);
+        let mut plain = title.to_vec();
+        let in_pc = Shadow::unbacked(title.as_ptr() as u64, plain.as_mut_ptr(), LEN as u64, false);
+        assert_eq!(in_pc.forwarded_from(&writer, 0, 0, PIECE), None);
+        assert_eq!(holder.forwarded_from(&in_pc, 0, 0, PIECE), None);
     }
 }
