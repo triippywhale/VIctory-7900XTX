@@ -77,6 +77,7 @@ Ports 1 and 5 are on by default (`=0` turns either off): in ray-traced A/B runs 
 | Switch | What it does |
 |---|---|
 | `VICTORY_PORT_CONSTANTS` (on at level 3; `=1` all buffers in place; `=0` off) | Constant buffers in the title's 174 MB graphics heap are read by the card where the title writes them: no uploads, no fills; every other buffer in it stays a host copy. `=1`: every buffer of the heap is read in place |
+| `VICTORY_SKIP_WC_BACK` (on at mode 2; `=0` off) | What shaders write to card copies of write-combining title memory stays on the card where no other copy holds it, and is fetched before anything else reads it: about 80 MB a frame is not copied back. `VICTORY_CENSUS=1` audits it (both counts must be 0) |
 | `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
 | `VICTORY_PORT_CBV` (on; `=0` off) | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
 | `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |

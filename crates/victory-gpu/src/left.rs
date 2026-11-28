@@ -1,5 +1,5 @@
 //! What shaders wrote to card copies of write-combining title memory, left
-//! on the card (`VICTORY_SKIP_WC_BACK=2`, off by default; after PalmVI
+//! on the card (`VICTORY_SKIP_WC_BACK`, mode 2 by default, `=0` off; after PalmVI
 //! 06edf544f), and its audit (`VICTORY_CENSUS=1`).
 //!
 //! The title reserves some of its memory write-combining: memory its CPU
@@ -121,17 +121,22 @@ const PIECE: u64 = 64 << 10;
 /// where, how long, and the copy that wrote them.
 const SAY_FIRST: u64 = 64;
 
-/// `VICTORY_SKIP_WC_BACK`: 2 leaves pieces on the card (see the file);
-/// unset or 0: off. Other values are not modes of this build: off.
+/// `VICTORY_SKIP_WC_BACK`: 2 (the default, and when unset) leaves pieces on
+/// the card (see the file); 0: off. Other values are not modes of this
+/// build: off. (One run of 3.5 minutes in the world on an RX 7900 XT: no
+/// stall, the census 0 throughout, 77 to 93 MB a frame left on the card.)
+/// In this crate's unit tests unset is off, so that tests of copy-back see
+/// every piece fetched and merged unless they ask otherwise.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let asked = std::env::var("VICTORY_SKIP_WC_BACK").unwrap_or_default();
         match asked.trim() {
-            "" | "0" => 0,
-            "2" => {
+            "0" => 0,
+            "" if cfg!(test) => 0,
+            "" | "2" => {
                 tracing::info!(
-                    "VICTORY_SKIP_WC_BACK=2: what shaders write to card copies of write-combining title memory stays on the card where no other copy holds it, fetched before anything else reads it"
+                    "VICTORY_SKIP_WC_BACK=2 (the default; =0 turns it off): what shaders write to card copies of write-combining title memory stays on the card where no other copy holds it, fetched before anything else reads it"
                 );
                 2
             }
