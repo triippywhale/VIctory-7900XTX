@@ -636,7 +636,7 @@ pub(crate) struct Spans {
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
-    sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    sizes: std::collections::HashMap<[u32; 14], Option<u64>, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.

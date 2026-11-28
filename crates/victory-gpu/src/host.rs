@@ -2844,7 +2844,7 @@ struct Deferred {
     textures: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// By host texture (a view placed in the memory of a texture the card
     /// writes): the last card-written source the list copied into it.
-    texture_aliases: std::collections::HashMap<usize, usize>,
+    texture_aliases: ByCopy<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5474,7 +5474,7 @@ impl Host {
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = Pieces::default();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
@@ -5861,7 +5861,7 @@ impl Host {
         &self,
         plan: &CardPlan,
         submitted: &mut u64,
-        seen: &mut std::collections::HashSet<(usize, usize, usize)>,
+        seen: &mut Pieces,
     ) {
         if plan.ranges.is_empty() {
             return;
@@ -6238,7 +6238,7 @@ impl Host {
                 release_completed_tables(&mut items, unsafe { self.fence.GetCompletedValue() });
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
-                let mut seen = std::collections::HashSet::new();
+                let mut seen = Pieces::default();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
@@ -6776,7 +6776,7 @@ impl Host {
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
-            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            self.card_back(card, &mut submitted, &mut Pieces::default());
         }
         let back = crate::picked::with(declared, &picked.written);
         hand_back(&back);
@@ -8592,6 +8592,10 @@ fn next_epoch() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The pieces of copies fetched from the card since it was last waited for:
+/// copy, first byte, end ([`Host::card_back`]).
+type Pieces = std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>;
+
 /// A table by a copy's address.
 pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
 
@@ -8605,9 +8609,20 @@ impl std::hash::Hasher for AddressHash {
     fn finish(&self) -> u64 {
         self.0
     }
+    /// Eight bytes at a time, and what is left of them with its length: the
+    /// words of a record or of a description are a key's bytes here (a
+    /// multiplication for every byte made such keys slower than the
+    /// standard library's hash).
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_usize(usize::from(b));
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_le_bytes(word));
+        }
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            last[7] = rest.len() as u8;
+            self.write_u64(u64::from_le_bytes(last));
         }
     }
     fn write_usize(&mut self, n: usize) {
@@ -8619,6 +8634,45 @@ impl std::hash::Hasher for AddressHash {
     }
     fn write_u32(&mut self, n: u32) {
         self.write_usize(n as usize);
+    }
+}
+
+#[cfg(test)]
+mod address_hash_tests {
+    use super::AddressHash;
+    use std::hash::{BuildHasher, BuildHasherDefault};
+
+    /// Keys of bytes (a record's words, a resource description) that differ
+    /// in one bit anywhere, in their length or in zeros at their end hash
+    /// apart: whole words and what is left of them.
+    #[test]
+    fn keys_of_bytes_that_differ_hash_apart() {
+        let hash = BuildHasherDefault::<AddressHash>::default();
+        let mut seen = std::collections::HashSet::new();
+        let description: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        assert!(seen.insert(hash.hash_one(description)));
+        for word in 0..14 {
+            for bit in 0..32 {
+                let mut other = description;
+                other[word] ^= 1 << bit;
+                assert!(seen.insert(hash.hash_one(other)), "word {word} bit {bit}");
+            }
+        }
+        let record: [u32; 3] = [0x4549_5676, 7, 1];
+        assert!(seen.insert(hash.hash_one(record)));
+        for word in 0..3 {
+            for bit in 0..32 {
+                let mut other = record;
+                other[word] ^= 1 << bit;
+                assert!(seen.insert(hash.hash_one(other)), "word {word} bit {bit}");
+            }
+        }
+        // Zeros of every length up to three words.
+        for len in 0..=24 {
+            assert!(seen.insert(hash.hash_one(&[0u8; 24][..len])), "{len} zeros");
+        }
+        // The same key hashes the same.
+        assert_eq!(hash.hash_one(description), hash.hash_one(description));
     }
 }
 
