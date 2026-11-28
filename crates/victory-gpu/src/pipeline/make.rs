@@ -27,7 +27,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
-use super::host::{GraphicsState, HostPipeline};
+use super::host::{GraphicsState, HostPipeline, TargetFormats};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -65,6 +65,13 @@ pub(crate) struct Pending {
     /// same 3,000-4,000 draws. `VICTORY_PIPELINE_RESOLVE_WAIT=1`: waited for
     /// and queued as any other pipeline, as before.
     no_wait: bool,
+    /// The formats its state declares for what a draw draws into (zeros
+    /// without a graphics state).
+    pub(crate) formats: TargetFormats,
+    /// The same shaders and state for other formats, bound at a draw
+    /// ([`for_formats`]): a chain from the title's pipeline, one link per
+    /// set of formats met, never shortened.
+    variant: OnceLock<Arc<Pending>>,
 }
 
 /// Dispatches dropped because their resolve was still being made
@@ -101,6 +108,8 @@ impl Pending {
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             no_wait: is_resolve(&shaders) && !resolves_wait(),
+            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
+            variant: OnceLock::new(),
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
@@ -493,6 +502,61 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     p.made.get()?.as_ref()
+}
+
+/// Pipelines made again for the formats bound at a draw, since the start.
+static VARIANTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a draw into views of other formats than its pipeline declares
+/// gets a host pipeline for those formats ([`for_formats`]). On by
+/// default: such a draw is an invalid call on the host.
+/// `VICTORY_TARGET_VARIANTS=0` sends it with the title's pipeline, as
+/// before.
+fn variants_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host pipeline for a draw with `p` into views of the formats
+/// `bound`, which `p` does not declare (`host::formats_differ`): that of
+/// the same shaders and state for those formats. It is a pipeline like the
+/// title's own: queued at its first draw, made by a worker, waited for
+/// within the frame's budget, and the draw is dropped while it is not
+/// there ([`ready`]). (After PalmVI 933e130d, fxceless a35c55739.)
+#[cold]
+pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
+    match p.graphics.as_deref() {
+        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
+        _ => ready(p),
+    }
+}
+
+/// The pipeline of `p`'s shaders and its state `g` for the formats
+/// `bound`: found in the chain that starts at `p`, or added to it (logged
+/// then: once per pipeline and set of formats).
+fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
+    let mut at = p;
+    // (`bound` is what `host::formats_for` gives, and a state made for it
+    // declares exactly it, so the walk ends at the link made for it; the
+    // count is a bound all the same: past it the title's own pipeline.)
+    for _ in 0..64 {
+        let next = at.variant.get_or_init(|| {
+            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                pipeline = ?p.shaders,
+                declared = ?p.formats,
+                bound = ?bound,
+                so_far,
+                "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
+            );
+            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+        });
+        if next.formats == *bound {
+            return next;
+        }
+        at = next;
+    }
+    p
 }
 
 /// Whether a dispatch waits for its compute pipeline until it is made,
@@ -1283,6 +1347,30 @@ mod tests {
         p.make();
         assert!(matches!(p.made.get(), Some(None)));
         assert!(SKIPPED_BAD.load(Ordering::Relaxed) > before);
+    }
+
+    /// A draw into other formats than its pipeline declares finds the
+    /// pipeline for them, which exists once per set of formats and is
+    /// queued by its first draw like any other.
+    #[test]
+    fn a_pipeline_for_bound_formats_is_made_once() {
+        // The title's pipeline declares one render target, format 24.
+        let p = Arc::new(Pending::new(Vec::new(), Some(Box::new(GraphicsState::declaring(24)))));
+        assert_eq!(p.formats, [24, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let g = p.graphics.as_deref().unwrap();
+        let (a, b) = ([26, 0, 0, 0, 0, 0, 0, 0, 0], [28, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let first = variant(&p, g, &a);
+        assert_eq!(first.formats, a);
+        assert_ne!(first.key, p.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        let second = variant(&p, g, &b);
+        assert_eq!(second.formats, b);
+        assert!(!Arc::ptr_eq(first, second));
+        assert_ne!(second.key, first.key);
+        assert!(Arc::ptr_eq(first, variant(&p, g, &a)));
+        assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
+        assert_eq!(first.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
     }
 
     #[test]

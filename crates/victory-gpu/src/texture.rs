@@ -546,6 +546,9 @@ pub(crate) fn let_go_idle() {
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
+    // Those that go, dropped after the look (`crate::host::drop_in_sweep`):
+    // out of the table under its lock, so no list can come to hold one.
+    let mut gone: Vec<Arc<Staging>> = Vec::new();
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
             || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
@@ -554,9 +557,13 @@ pub(crate) fn let_go_idle() {
             LET_GO[1].fetch_add(s.bytes, Relaxed);
             went += 1;
             bytes += s.bytes;
+            gone.push(s.clone());
         }
         keep
     });
+    if !gone.is_empty() {
+        crate::host::drop_in_sweep(gone);
+    }
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }

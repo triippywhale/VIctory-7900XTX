@@ -1376,6 +1376,96 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
 const DS_WRITE_B32: u8 = 0x0D;
 const DS_READ_B32: u8 = 0x36;
 
+/// `v_fma_f16` rounds once, to nearest even, as the console's fused multiply-add does: the
+/// sums below land on or next to the midpoint of two halves, where an f32 sum rounded again
+/// to 16 bits gives the other half (cases from upstream VIctory #1387).
+#[test]
+fn a_fused_16_bit_multiply_add_rounds_once() {
+    let cases: [([u32; 3], u32); 9] = [
+        ([0x3E00, 0x6C03, 0x0400], 0x6E05), // 1.5 * 4108 + 2^-14
+        ([0x3E00, 0x6C01, 0x8400], 0x6E01), // 1.5 * 4100 - 2^-14
+        ([0x3E00, 0x4000, 0x3C00], 0x4400), // 1.5 * 2 + 1
+        ([0x3E00, 0x6C03, 0], 0x6E04),      // an exact tie, to the lower even
+        ([0x3E00, 0x6C01, 0], 0x6E02),      // an exact tie, to the upper even
+        ([0xBE00, 0x6C03, 0x8400], 0xEE05), // a negative one past the midpoint
+        ([0x0400, 0x1000, 0], 0),           // a tie at half the least subnormal
+        ([0x0400, 0x1000, 1], 2),           // a tie between subnormals
+        ([0x7BFF, 0x3C00, 0x4C00], 0x7C00), // past the largest half: infinity
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for ([a, b, c], want) in cases {
+        let words = [
+            0x7E0E_02FF,
+            a, // v_mov_b32 v7, a
+            0x7E0C_02FF,
+            b, // v_mov_b32 v6, b
+            0x7E0A_02FF,
+            c, // v_mov_b32 v5, c
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xD74B_0000,
+            0x0416_0D07, // v_fma_f16 v0, v7, v6, v5
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ];
+        let native = native_of(&words, false, 32);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_fma_f16"));
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Some(got) = on_the_card(&shader, [0, 0]) else {
+            return;
+        };
+        eprintln!("v_fma_f16 {a:#x} * {b:#x} + {c:#x}: {:#x}, the console's {want:#x}", got & 0xFFFF);
+        assert_eq!(got & 0xFFFF, want, "{a:#x} * {b:#x} + {c:#x}");
+    }
+}
+
+/// With `VICTORY_LDS_BOUNDS=1`, a write past the program's LDS (512 bytes here) is dropped
+/// and a read there gives 0, as on the console: dword 0 keeps what was written to it, and
+/// the sum of the two reads is that.
+#[test]
+fn lds_past_the_allocation_reads_zero_when_bounded() {
+    let mut words = vec![
+        0x7E02_02FF,
+        0x1234_5678, // v_mov_b32 v1, 0x12345678
+        0x7E06_02FF,
+        0x0BAD_F00D, // v_mov_b32 v3, 0x0badf00d
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E08_02FF,
+        512, // v_mov_b32 v4, 512
+    ];
+    words.extend(ds(DS_WRITE_B32, 0, 2, 1)); // ds_write_b32 v2, v1: dword 0
+    words.extend(ds(DS_WRITE_B32, 0, 4, 3)); // ds_write_b32 v4, v3: past the end
+    words.extend(ds(DS_READ_B32, 5, 2, 0)); // ds_read_b32 v5, v2
+    words.extend(ds(DS_READ_B32, 6, 4, 0)); // ds_read_b32 v6, v4
+    words.extend([
+        0x4A00_0D05, // v_add_nc_u32 v0, v5, v6
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    let mut native = native_of(&words, false, 32);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let was = lower::TEST_LDS_BOUNDS.replace(Some(true));
+    let shader = lowered(&native, &p, &HashSet::new());
+    lower::TEST_LDS_BOUNDS.set(was);
+    let shader = shader.expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Some(got) = on_the_card(&shader, [0, 0]) else {
+        return;
+    };
+    assert_eq!(got, 0x1234_5678, "{got:#x}");
+}
+
 /// The wave size `native` lowers to on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {
     let p = crate::spill::build(native).expect("build");

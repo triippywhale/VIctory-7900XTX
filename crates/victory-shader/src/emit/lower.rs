@@ -1681,6 +1681,46 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_LDS_BOUNDS=1`: a compute program's LDS accesses past what it allocates read 0
+/// and drop their writes, as the console's do; the host index never leaves the group-shared
+/// array, and the translation's own dwords past the program's are not reachable. Off by
+/// default, as at the source: every LDS access gets a compare, and every write a branch.
+/// The switch is part of the shader cache's key. (After PalmVI 787a2762, 37bf76ce and
+/// 5cac9c03; upstream VIctory eabb6b850 #1949, uiliannn/VItoriaBr a13a7195 and 40beb26.)
+fn lds_bounds_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_BOUNDS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_BOUNDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`lds_bounds_on`], for its thread only.
+    pub(super) static TEST_LDS_BOUNDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_NAN_SCRUB=1`: a float colour a pixel program exports is 0 where it is NaN or an
+/// infinity ([`Lower::scrub_nan`]). Off by default: the console passes such values on. The
+/// switch is part of the shader cache's key. (After PalmVI 0b7a6d19, from
+/// trustno1-coder/VIctory-NVIDIA 77e13a974.)
+fn nan_scrub_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_NAN_SCRUB.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`nan_scrub_on`], for its thread only.
+    pub(super) static TEST_NAN_SCRUB: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -2038,6 +2078,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            s.lds_own = s.lds_dwords;
             // The scatter's scratch: a dword per lane of every console wave
             // in the group, past the program's LDS. (The zero-initialized
             // `tmp` of the ISA's ds_permute_b32; see its lowering in `ds`.)
@@ -4583,6 +4624,103 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// A 32-bit denormal as the console's float mode reads it: a zero of its sign, decided
+    /// on the bits (the host's own denormal mode varies: AMD keeps them, WARP flushes).
+    /// (After PalmVI 787a2762, upstream VIctory 77053a0c5.)
+    fn ftz(&mut self, f: V) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let (exp, sign, zero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0x8000_0000), self.s.m.i32(0));
+        let e = self.s.m.bin(c, Bin::And, x, exp);
+        let den = self.s.m.cmp(c, pred::EQ, e, zero);
+        let s = self.s.m.bin(c, Bin::And, x, sign);
+        let r = self.s.m.select(c, den, s, x);
+        self.as_float(r)
+    }
+
+    /// A fused f16 multiply-add (`v_fma_f16`, `v_fmac_f16`) with the one rounding to nearest
+    /// even the console gives it, whatever the host's `f32tof16` does: the product of two
+    /// halves is exact in f32, and TwoSum recovers the error of the f32 sum, which settles a
+    /// sum that lands on the midpoint of two halves. The half is packed here (the host's
+    /// conversion may round toward zero); a NaN goes through that conversion. `clamp`
+    /// saturates the sum first (it moves it to an end, never onto a midpoint).
+    /// (After PalmVI 787a2762, upstream VIctory c4ee3d246, #1387.)
+    fn fma_f16(&mut self, a: V, b: V, addend: V, clamp: bool) -> V {
+        let c = self.cur;
+        let m = &mut self.s.m;
+        let product = m.bin(c, Bin::Mul, a, b);
+        let sum = m.bin(c, Bin::Add, product, addend);
+        let addend_hi = m.bin(c, Bin::Sub, sum, product);
+        let product_hi = m.bin(c, Bin::Sub, sum, addend_hi);
+        let product_lo = m.bin(c, Bin::Sub, product, product_hi);
+        let addend_lo = m.bin(c, Bin::Sub, addend, addend_hi);
+        let error = m.bin(c, Bin::Add, product_lo, addend_lo);
+        let sum = if clamp { self.unary(7, sum) } else { sum };
+        let bits = self.as_int(sum);
+        let error_bits = self.as_int(error);
+        let m = &mut self.s.m;
+        let sign_mask = m.i32(0x8000_0000);
+        let sign = m.bin(c, Bin::And, bits, sign_mask);
+        let magnitude = m.bin(c, Bin::Xor, bits, sign);
+        // (the error as seen from the magnitude: positive is away from zero)
+        let error_bits = m.bin(c, Bin::Xor, error_bits, sign);
+        let error = self.as_float(error_bits);
+        let m = &mut self.s.m;
+        let (one, zero) = (m.i32(1), m.i32(0));
+        let k23 = m.i32(23);
+        let exponent = m.bin(c, Bin::LShr, magnitude, k23);
+        let min_normal = m.i32(113);
+        let normal = m.cmp(c, pred::IUGE, exponent, min_normal);
+        // f32 exponent of 2^-25, half the least subnormal half
+        let min_midpoint = m.i32(102);
+        let tiny = m.cmp(c, pred::IULT, exponent, min_midpoint);
+        let bounded = m.select(c, tiny, min_midpoint, exponent);
+        let subnormal_base = m.i32(126);
+        let subnormal_shift = m.bin(c, Bin::Sub, subnormal_base, bounded);
+        let k13 = m.i32(13);
+        let shift = m.select(c, normal, k13, subnormal_shift);
+        let bias = m.i32(112 << 23);
+        let normal_bits = m.bin(c, Bin::Sub, magnitude, bias);
+        let fraction_mask = m.i32(0x007F_FFFF);
+        let fraction = m.bin(c, Bin::And, magnitude, fraction_mask);
+        let hidden_bit = m.i32(0x0080_0000);
+        let subnormal_bits = m.bin(c, Bin::Or, fraction, hidden_bit);
+        let significand = m.select(c, normal, normal_bits, subnormal_bits);
+        let lower = m.bin(c, Bin::LShr, significand, shift);
+        let unit = m.bin(c, Bin::Shl, one, shift);
+        let mask = m.bin(c, Bin::Sub, unit, one);
+        let remainder = m.bin(c, Bin::And, significand, mask);
+        let midpoint = m.bin(c, Bin::LShr, unit, one);
+        let above = m.cmp(c, pred::IUGT, remainder, midpoint);
+        let at_midpoint = m.cmp(c, pred::EQ, remainder, midpoint);
+        let odd = m.bin(c, Bin::And, lower, one);
+        let odd = m.cmp(c, pred::NE, odd, zero);
+        let fzero = m.f32(0);
+        let away = m.cmp(c, pred::OGT, error, fzero);
+        let exact = m.cmp(c, pred::OEQ, error, fzero);
+        let even_tie = m.bin(c, Bin::And, exact, odd);
+        let round_up = m.bin(c, Bin::Or, away, even_tie);
+        let round_up = m.bin(c, Bin::And, at_midpoint, round_up);
+        let round_up = m.bin(c, Bin::Or, above, round_up);
+        let round_up = m.cast(c, Cast::ZExt, round_up, self.s.t.i32);
+        let m = &mut self.s.m;
+        let rounded = m.bin(c, Bin::Add, lower, round_up);
+        let rounded = m.select(c, tiny, zero, rounded);
+        // 65536: anything smaller that overflows rounds up past the largest half
+        let limit = m.i32(0x4780_0000);
+        let overflow = m.cmp(c, pred::IUGE, magnitude, limit);
+        let infinity = m.i32(0x7C00);
+        let rounded = m.select(c, overflow, infinity, rounded);
+        let k16 = m.i32(16);
+        let sign = m.bin(c, Bin::LShr, sign, k16);
+        let rounded = m.bin(c, Bin::Or, sign, rounded);
+        let f32_infinity = m.i32(0x7F80_0000);
+        let nan = m.cmp(c, pred::IUGT, magnitude, f32_infinity);
+        let i32t = self.s.t.i32;
+        let fallback = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum]);
+        self.s.m.select(c, nan, fallback, rounded)
+    }
+
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
     /// conversion, one step back toward zero where it rounded away (which
     /// also turns an overflow to infinity into the largest finite half).
@@ -6168,16 +6306,49 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as dword-aligned, and in bounds unless
+        // `VICTORY_LDS_BOUNDS=1` ([`lds_bounds_on`]; out-of-bounds console accesses read 0
+        // and drop writes).
+        let bound = (lds_bounds_on() && self.s.lds_own > 0).then_some(self.s.lds_own);
+        // Each dword comes with whether it lies inside the program's LDS (with a bound); the
+        // address is `addr + offset` in 32 bits, and wraps. Outside, the host's pointer is
+        // dword 0's, so it stays inside the array.
+        let dword = |l: &mut Self, bytes: u32| -> (V, Option<V>) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let (index, inside) = match bound {
+                Some(n) => {
+                    let n = l.s.m.i32(n);
+                    let inside = l.s.m.cmp(c, pred::IULT, index, n);
+                    let zero = l.s.m.i32(0);
+                    (l.s.m.select(c, inside, index, zero), Some(inside))
+                }
+                None => (index, None),
+            };
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
+        };
+        // A read: 0 outside.
+        let read = |l: &mut Self, p: V, inside: Option<V>| -> V {
+            let x = l.s.m.load(l.cur, p);
+            match inside {
+                Some(inside) => {
+                    let zero = l.s.m.i32(0);
+                    l.s.m.select(l.cur, inside, x, zero)
+                }
+                None => x,
+            }
+        };
+        // A write's guard: the lane's, and the dword inside.
+        let on = |l: &mut Self, inside: Option<V>| -> Option<V> {
+            match (guard, inside) {
+                (Some(g), Some(i)) => Some(l.s.m.bin(l.cur, Bin::And, g, i)),
+                (g, None) => g,
+                (None, i) => i,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -6211,7 +6382,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -6220,7 +6391,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.s.m.load(c, p);
+                let w = read(self, p, inside);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -6262,7 +6433,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
-                self.lds_merge(p, keep, x, guard);
+                let g = on(self, inside);
+                self.lds_merge(p, keep, x, g);
             }
             return Ok(());
         }
@@ -6278,8 +6450,8 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let (p, inside) = dword(self, off + 4 * k);
+                    let x = read(self, p, inside);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -6301,12 +6473,23 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
-                self.s.m.store(self.cur, p, x);
+            if bound.is_none() {
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let (p, _) = dword(self, off);
+                    self.s.m.store(self.cur, p, x);
+                }
+                self.end_guarded(at, &[]);
+            } else {
+                // each dword under its own guard: one past the end is dropped alone
+                for (off, x) in stores {
+                    let (p, inside) = dword(self, off);
+                    let g = on(self, inside);
+                    let at = self.begin_guarded(g);
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(at, &[]);
+                }
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -6339,7 +6522,18 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inside) = dword(self, offset);
+        // What a lane the atomic leaves out gets back: a lane the guard leaves out keeps
+        // its register, a running lane outside the LDS reads 0 like any LDS read there.
+        let outside = match (inside, guard) {
+            (None, _) => outside,
+            (Some(_), Some(g)) => {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, g, zero, outside)
+            }
+            (Some(_), None) => self.s.m.i32(0),
+        };
+        let guard = on(self, inside);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
@@ -9355,8 +9549,12 @@ impl<'a> Lower<'a> {
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
-                // else x.
+                // else x. Denormal coordinates read as zeros of their sign, as the
+                // console's float mode reads them: picked and negated as they are,
+                // they would come out as the host's (AMD keeps denormals). (After
+                // PalmVI 787a2762, upstream VIctory 77fd81959, #1766.)
                 let (x, y, z) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (x, y, z) = (self.ftz(x), self.ftz(y), self.ftz(z));
                 let (ax, ay, az) = (self.unary(6, x), self.unary(6, y), self.unary(6, z));
                 let zx = self.s.m.cmp(c, pred::OGE, az, ax);
                 let zy = self.s.m.cmp(c, pred::OGE, az, ay);
@@ -10903,9 +11101,14 @@ impl<'a> Lower<'a> {
             } else {
                 self.half_fsrc(inst, 2)?
             };
+            if matches!(name, "v_fma_f16" | "v_fmac_f16") && v.omod == 0 {
+                // Fused: rounded once, as the console does ([`Self::fma_f16`]).
+                let half = self.fma_f16(a, b, acc, v.clamp);
+                return self.write_half(inst, half, guard);
+            }
             let r = match name {
-                // shortcut: fused f16 multiply-adds as FMad in f32 (the
-                // product is exact; the sum rounds twice).
+                // shortcut: unfused f16 multiply-adds (and a fused one with an output
+                // modifier) as FMad in f32 (the product is exact; the sum rounds twice).
                 "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
@@ -13785,6 +13988,20 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// `f`, or 0 where it is NaN or an infinity (`|f| >= inf`, unordered, so NaN too), with
+    /// `VICTORY_NAN_SCRUB=1`. For the colours pixel programs export: one NaN that reaches a
+    /// title's bloom, blur or temporal passes spreads into black patches that stay in their
+    /// history, and an infinity through bloom or exposure can turn the whole picture white.
+    /// Not what the console does, hence a switch.
+    fn scrub_nan(&mut self, f: V) -> V {
+        let c = self.cur;
+        let a = self.unary(6, f); // |f|
+        let inf = self.s.m.f32(0x7F80_0000);
+        let bad = self.s.m.cmp(c, pred::UGE, a, inf);
+        let zero = self.s.m.f32(0);
+        self.s.m.select(c, bad, zero, f)
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -13970,6 +14187,10 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // A colour a pixel program exports, scrubbed of NaN and infinities
+        // (`VICTORY_NAN_SCRUB=1`). Only float elements below: integer targets keep their
+        // bits.
+        let scrub = self.s.pixel && matches!(e.target, Target::Color(_)) && nan_scrub_on();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -13988,13 +14209,12 @@ impl<'a> Lower<'a> {
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
-                        Some(&f) => f,
-                        None => self.as_float(x),
+                        Some(&f) if half.is_none() => f,
+                        _ => self.as_float(x),
                     };
-                    (".f32", f)
+                    (".f32", if scrub { self.scrub_nan(f) } else { f })
                 }
                 _ => (".i32", x),
             };
