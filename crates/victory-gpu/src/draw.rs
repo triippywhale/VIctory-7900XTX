@@ -493,6 +493,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The formats of the views [`State::set_targets`] last named for the
+    /// host list: a draw's pipeline is one for them
+    /// ([`State::draw_pipeline`]).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// The render target views and the depth view the host list has, once
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
@@ -1491,6 +1495,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         // (The host takes at most eight targets; more is an invalid call.)
         for &h in handles.iter().take(D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT as usize) {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -1511,6 +1517,7 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    formats[views.len()] = desc.Format.0 as u32;
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
@@ -1519,7 +1526,9 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
+            let desc = record.desc();
+            formats[views.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            views.push((Some(texture), desc));
             keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
@@ -1527,7 +1536,9 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            let desc = record.depth_desc();
+            self.depth_state = depth_state(texture, desc.as_ref());
+            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1535,6 +1546,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1862,12 +1874,21 @@ impl State {
         true
     }
 
+    /// The host pipeline of the bound pipeline for a draw into the targets
+    /// set: the title's, or the one of the same shaders and state for the
+    /// bound formats if a render target has another format than the title's
+    /// pipeline declares (`crate::pipeline::host_pipeline_for`). A compute
+    /// pipeline declares no formats and is the title's always.
+    fn draw_pipeline<'a>(&self) -> Option<&'a HostPipeline> {
+        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+    }
+
     fn prepare_for_once(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.draw_pipeline() else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -3572,7 +3593,12 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let p = if compute {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            self.draw_pipeline()
+        };
+        let Some(p) = p else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -3831,7 +3857,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    if let Some(p) = self.draw_pipeline() {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3841,7 +3867,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, self.draw_pipeline());
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -4524,7 +4550,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, self.draw_pipeline());
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4537,13 +4563,13 @@ impl State {
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+        self.draw_pipeline().is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = self.draw_pipeline() else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -4629,7 +4655,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, self.draw_pipeline());
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4766,7 +4792,8 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        // (A dispatch's compute pipeline declares no formats: the title's.)
+        let Some(p) = self.draw_pipeline() else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -5086,6 +5113,17 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
+    }
+}
+
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
     }
 }
 
