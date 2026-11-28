@@ -5810,6 +5810,19 @@ pub(crate) fn holders(at: u64, end: u64, not: u64) -> Vec<Arc<Shadow>> {
     out
 }
 
+/// For the audit of [`holders`] (`crate::left`, `VICTORY_CENSUS=1`): every
+/// copy other than copy `not` that holds any of `[at, end)`, by its number,
+/// found by walking all of the tables (slow: diagnostics only).
+pub(crate) fn holders_all(at: u64, end: u64, not: u64) -> Vec<u64> {
+    let held = |s: &Arc<Shadow>| s.id != not && s.start < end && s.start + s.len > at;
+    let mut out: Vec<u64> = buffers_read().values().filter_map(|e| e.shadow.as_ref().filter(|s| held(s)).map(|s| s.id)).collect();
+    out.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().filter(|s| held(s)).map(|s| s.id));
+    out.extend(EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.values().filter(|(s, _)| held(s)).map(|(s, _)| s.id));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).

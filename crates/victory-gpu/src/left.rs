@@ -1,7 +1,7 @@
 //! What shaders wrote to card copies of write-combining title memory, left
 //! on the card (`VICTORY_SKIP_WC_BACK`, mode 2 by default, `=0` off; after PalmVI
 //! 06edf544f; `=3` also where the title shows the pages at other addresses,
-//! after PalmVI 5eed56798), and its audit (`VICTORY_CENSUS=1`).
+//! after PalmVI 5eed56798 and d4e90ed7c), and its audit (`VICTORY_CENSUS=1`).
 //!
 //! The title reserves some of its memory write-combining: memory its CPU
 //! writes and does not read. What shaders write to a copy of such memory in
@@ -62,11 +62,12 @@
 //! card side to its own ([`Forward`], `Host::card_before`).
 //!
 //! PalmVI notes the piece left for each holder too and sends the copies on
-//! a copy queue of their own, each waited for by the host's queue. Here a copy's refresh compares title memory with its CPU
+//! a copy queue of their own, 64 lists in the air, each waited for by the
+//! host's queue. Here a copy's refresh compares title memory with its CPU
 //! side, and its compare on the card with hashes of its pieces, so more
 //! must hold, and the copies go on the host's own queue, in a list ahead
 //! of the next submission's: nothing waits for them, on the card or off
-//! it.
+//! it, and there is no count of lists to run out of.
 //!
 //! What holds, for a piece P of writer W with holder H (W's offsets
 //! `[lo, hi)`, H's the same title bytes at the other address):
@@ -141,7 +142,8 @@
 //!
 //! `VICTORY_CENSUS=1` counts with mode 3 also the title bytes of pieces
 //! left that are read at another address of their pages by other than a
-//! holder (must be 0).
+//! holder (must be 0), and checks the quick search for holders against a
+//! walk of every table (misses must be 0).
 //!
 //! `VICTORY_SKIP_WC_BACK=1` (every piece of such memory, no fetch) is not
 //! in this build: it gave a black world and lost room lighting on an RTX
@@ -915,6 +917,11 @@ static REFUSED: [AtomicU64; REFUSALS.len()] = [const { AtomicU64::new(0) }; REFU
 /// sides in line; bytes sent up again behind the copies; pieces stranded.
 static FORWARD_STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
+/// With [`census`] and mode 3, since the last frame line: pieces whose
+/// holders were checked against a walk of every table, holders the walk
+/// found, and of those the ones the quick search missed.
+static HOLDERS_CHECKED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Mode 3: held while a landing decides whether a piece is left with
 /// copies on the card to its holders, and while a copy's shader writes are
 /// declared (`Shadow::writing`, [`declaring`]): a copy is made a holder
@@ -1201,6 +1208,18 @@ fn judge(writer: &Arc<Shadow>, start: u64, end: u64) -> Verdict {
             return Verdict::Refuse(KIND);
         }
         let holders = crate::shadow::holders(at, at + bytes, writer.id());
+        if census() {
+            // The check of the holders found: every copy of every table,
+            // walked whole.
+            let all = crate::shadow::holders_all(at, at + bytes, writer.id());
+            let missed = all
+                .iter()
+                .filter(|id| !holders.iter().any(|h| h.id() == **id))
+                .count();
+            HOLDERS_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+            HOLDERS_CHECKED[1].fetch_add(all.len() as u64, Ordering::Relaxed);
+            HOLDERS_CHECKED[2].fetch_add(missed as u64, Ordering::Relaxed);
+        }
         for holder in holders {
             if targets
                 .iter()
@@ -1765,6 +1784,16 @@ pub(crate) fn log(frames: f64) {
              other copies, {others:.2} MB by other readers (both must be 0); of them {elsewhere:.2} MB at another address of the \
              pages, where copies on the card go (must be 0)"
         );
+        if forwards() {
+            let [pieces, holders, missed] = HOLDERS_CHECKED
+                .each_ref()
+                .map(|s| s.swap(0, Ordering::Relaxed));
+            tracing::info!(
+                "census audit of the copies on the card (VICTORY_SKIP_WC_BACK=3): the holders at {pieces} other addresses of pieces' \
+                 pages checked against a walk of every table: {holders} holders there, {missed} of them missed by the quick search \
+                 (must be 0)"
+            );
+        }
     }
 }
 
